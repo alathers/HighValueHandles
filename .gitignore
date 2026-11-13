@@ -1,0 +1,32 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+*.pyc
+build/
+dist/
+wheels/
+*.egg-info/
+*.egg-info
+.mypy_cache/
+
+# Virtual environments
+.venv
+venv/
+
+# Project-specific
+processed/
+.specify_config.toml
+hints.md
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+
+# Universal
+.DS_Store
+Thumbs.db
+*.tmp
+*.swp
+.vscode/
+.idea/
+
