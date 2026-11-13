@@ -242,7 +242,7 @@
 - [ ] T133 [P] Update pyproject.toml to include pytest as dev dependency and configure pytest with tests/ directory
 - [ ] T134 [P] Run pytest —co to verify all test files discovered and no syntax/import errors
 - [X] T135 [P] Run pytest to execute unit tests, verify all pass (or document expected failures for integration tests requiring Ollama)
-- [ ] T136 [P] Create Git worktree for this feature branch per constitution (TODO from Plan Phase: verify worktree-based development)
+- [X] T136 [P] Create Git worktree for this feature branch per constitution (TODO from Plan Phase: verify worktree-based development)
 - [ ] T137 [P] Commit all work with message "feat: bourbon image processor - AI-powered bolt bottle metadata extraction" including attribution line
 - [ ] T138 [P] Verify git worktree path, branch name, base commit, and sync status per constitution reporting requirements
 

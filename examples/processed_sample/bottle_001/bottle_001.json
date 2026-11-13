@@ -1,0 +1,18 @@
+{
+  "name": "Blanton's Single Barrel",
+  "distillery": "Buffalo Trace Distillery",
+  "msrp": 59.99,
+  "proof": "93 Proof",
+  "age": "No Age Statement",
+  "batch_number": null,
+  "specific_release": "Original Single Barrel",
+  "tasting_notes": "Caramel, vanilla, and honey on the nose. Rich amber color with legs that coat the glass. The palate delivers notes of toasted oak, caramel, and leather, leading to a long, warm finish with hints of spice.",
+  "full_text": "BLANTON'S SINGLE BARREL BOURBON WHISKEY\n\nBuffalo Trace Distillery\nFrankfort, Kentucky\n\n93 Proof\n\nWe select and hand-fill our barrels individually, ensuring each barrel meets high standards. The result is a rich, full-bodied bourbon with complex character.\n\nWARNING: Government Warning: (1) According to the Surgeon General, women should not drink alcoholic beverages during pregnancy because of the risk of birth defects. (2) Consumption of alcoholic beverages impairs your ability to drive a car or operate machinery, and may cause health problems.",
+  "source_images": [
+    "/path/to/bottle_photos/IMG_0001.jpg",
+    "/path/to/bottle_photos/IMG_0002.jpg",
+    "/path/to/bottle_photos/detail_label.jpg"
+  ],
+  "extracted_at": "2026-11-13T10:30:00-05:00",
+  "model_used": "qwen3-vl:32b"
+}
