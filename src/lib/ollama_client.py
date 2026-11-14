@@ -327,6 +327,17 @@ class OllamaClient:
         except Exception:
             return False
 
+    def is_model_available(self, model: Optional[str] = None) -> bool:
+        """Check if model is available locally (alias for check_model).
+
+        Args:
+            model: Model name to check (uses instance default if None).
+
+        Returns:
+            True if model available, False otherwise.
+        """
+        return self.check_model(model)
+
     def health_check(self) -> bool:
         """Check if Ollama server is running and accessible.
 

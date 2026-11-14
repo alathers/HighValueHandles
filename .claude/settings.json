@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(chmod +x scripts/install.sh)"
+      "Bash(chmod +x scripts/install.sh)",
+      "Bash(git -C /Users/alathers/src/BourbonInventory/HighValueRoom commit -m \"chore: mark implementation tasks T137-T138 complete\" -m \"Co-Authored-By: Claude Code <noreply@anthropic.com>\")",
+      "Bash(git -C /Users/alathers/src/BourbonInventory/HighValueRoom rev-parse --show-toplevel)"
     ]
   }
 }

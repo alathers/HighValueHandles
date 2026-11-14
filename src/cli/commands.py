@@ -213,6 +213,42 @@ def pre_flight_checks(args: argparse.Namespace) -> int:
     Returns:
         Exit code: 0 if checks pass, non-zero if checks fail.
     """
+    # Validate argument values first
+    if args.command == "process":
+        # Validate batch_size: integer >= 1 OR literal 'all'
+        batch_size = args.batch_size
+        if batch_size.lower() != "all":
+            try:
+                batch_int = int(batch_size)
+                if batch_int < 1:
+                    logger.error("Invalid --batch-size: must be >= 1 or 'all', got '%s'", batch_size)
+                    return 1
+            except ValueError:
+                logger.error("Invalid --batch-size: must be integer or 'all', got '%s'", batch_size)
+                return 1
+
+        # Validate lookahead: integer 0-10
+        if args.lookahead < 0 or args.lookahead > 10:
+            logger.error("Invalid --lookahead: must be between 0 and 10, got '%s'", args.lookahead)
+            return 1
+
+        # Validate concurrency: integer 1-10
+        if args.concurrency < 1 or args.concurrency > 10:
+            logger.error("Invalid --concurrency: must be between 1 and 10, got '%s'", args.concurrency)
+            return 1
+
+        # Validate ollama_url format
+        from urllib.parse import urlparse
+
+        try:
+            parsed = urlparse(args.ollama_url)
+            if not parsed.scheme or not parsed.netloc:
+                logger.error("Invalid --ollama-url: must be valid URL, got '%s'", args.ollama_url)
+                return 1
+        except Exception as e:
+            logger.error("Invalid --ollama-url: %s", e)
+            return 1
+
     # Check input folder exists
     if not args.image_folder.exists():
         logger.error("Input folder does not exist: %s", args.image_folder)
