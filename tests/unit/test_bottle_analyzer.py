@@ -501,7 +501,7 @@ class TestBottleAnalyzerAnalyzeWithVisionModel:
     def test_analyze_with_vision_model_success(self):
         """Test successful vision model analysis."""
         mock_ollama_client = Mock(spec=OllamaClient)
-        mock_ollama_client.generate_vision.return_value = (
+        mock_ollama_client.image_to_text.return_value = (
             "name: Blanton's\n"
             "distillery: Buffalo Trace\n"
             "msrp: $59.99\n"
@@ -525,7 +525,7 @@ class TestBottleAnalyzerAnalyzeWithVisionModel:
     def test_analyze_with_vision_model_fallback_on_error(self):
         """Test falls back to OCR-only on vision model error."""
         mock_ollama_client = Mock(spec=OllamaClient)
-        mock_ollama_client.generate_vision.side_effect = Exception("API error")
+        mock_ollama_client.image_to_text.side_effect = Exception("API error")
 
         analyzer = BottleAnalyzer(ollama_client=mock_ollama_client)
 
@@ -541,7 +541,7 @@ class TestBottleAnalyzerAnalyzeWithVisionModel:
     def test_analyze_with_vision_model_custom_model(self):
         """Test custom vision model is used."""
         mock_ollama_client = Mock(spec=OllamaClient)
-        mock_ollama_client.generate_vision.return_value = "name: Test Model"
+        mock_ollama_client.image_to_text.return_value = "name: Test Model"
 
         analyzer = BottleAnalyzer(ollama_client=mock_ollama_client)
 
@@ -550,8 +550,8 @@ class TestBottleAnalyzerAnalyzeWithVisionModel:
         )
 
         # Verify custom model was used
-        mock_ollama_client.generate_vision.assert_called_once()
-        call_kwargs = mock_ollama_client.generate_vision.call_args.kwargs
+        mock_ollama_client.image_to_text.assert_called_once()
+        call_kwargs = mock_ollama_client.image_to_text.call_args.kwargs
         assert call_kwargs["model"] == "qwen3-vl:32b"
 
 
@@ -638,8 +638,9 @@ class TestBottleAnalyzerEstimateQuantityFromImages:
 
         images = [Image(path=f"/img{i}.jpg", category="BOTTLE") for i in range(3)]
 
-        quantity = analyzer._estimate_quantity_from_images(images, duplicate_detector=mock_detector)
-        assert quantity == 1
+        with patch("image_processor.bottle_analyzer.DuplicateDetector", return_value=mock_detector):
+            quantity = analyzer._estimate_quantity_from_images(images)
+            assert quantity == 1
 
     def test_estimate_quantity_duplicate_hashes_high_count(self):
         """Test many duplicate hashes suggests multiple bottles."""
@@ -651,9 +652,11 @@ class TestBottleAnalyzerEstimateQuantityFromImages:
 
         images = [Image(path=f"/img{i}.jpg", category="BOTTLE") for i in range(6)]
 
-        quantity = analyzer._estimate_quantity_from_images(images, duplicate_detector=mock_detector)
-        # 6 // 4 + 1 = 2 bottles
-        assert quantity == 2
+        # Mock DuplicateDetector inside the method
+        with patch("image_processor.bottle_analyzer.DuplicateDetector", return_value=mock_detector):
+            quantity = analyzer._estimate_quantity_from_images(images)
+            # 6 // 4 + 1 = 2 bottles
+            assert quantity == 2
 
     def test_estimate_quantity_hash_error_returns_one(self):
         """Test hash generation errors return quantity 1."""
@@ -663,8 +666,9 @@ class TestBottleAnalyzerEstimateQuantityFromImages:
 
         images = [Image(path="/img.jpg", category="BOTTLE")]
 
-        quantity = analyzer._estimate_quantity_from_images(images, duplicate_detector=mock_detector)
-        assert quantity == 1
+        with patch("image_processor.bottle_analyzer.DuplicateDetector", return_value=mock_detector):
+            quantity = analyzer._estimate_quantity_from_images(images)
+            assert quantity == 1
 
     def test_estimate_quantity_empty_images_returns_one(self):
         """Test empty image list returns quantity 1."""
@@ -683,9 +687,10 @@ class TestBottleAnalyzerEstimateQuantityFromImages:
 
         images = [Image(path=f"/img{i}.jpg", category="BOTTLE") for i in range(4)]
 
-        quantity = analyzer._estimate_quantity_from_images(images, duplicate_detector=mock_detector)
-        # Max count is 2, within limit, returns 1
-        assert quantity == 1
+        with patch("image_processor.bottle_analyzer.DuplicateDetector", return_value=mock_detector):
+            quantity = analyzer._estimate_quantity_from_images(images)
+            # Max count is 2, within limit, returns 1
+            assert quantity == 1
 
 
 class TestBottleAnalyzerBuildBottleDict:

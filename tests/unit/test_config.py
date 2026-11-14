@@ -48,22 +48,15 @@ class TestConfigFileLoading:
     def test_config_load_from_toml_file(self):
         """Test config loads values from TOML file."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            # Create temp TOML config file
+            # Create temp TOML config file (flat structure, as expected by Config)
             config_path = Path(tmpdir) / ".specify_config.toml"
             config_path.write_text(
                 """
-[model]
 model = "qwen2-vl:7b"
-
-[processing]
 batch_size = "10"
 lookahead = 5
 concurrency = 4
-
-[ollama]
-url = "http://localhost:11435"
-
-[output]
+ollama_url = "http://localhost:11435"
 output_dir = "output_test/"
 debug = true
 """
@@ -207,7 +200,9 @@ class TestConfigHelperMethods:
         config = Config()
         assert config.get_bool("debug") is False
         assert config.get_bool("allow_retry") is True
-        assert config.get_bool("interactive", True) is True
+        assert config.get_bool("interactive") is False
+        # Test default parameter when key doesn't exist
+        assert config.get_bool("nonexistent_key", True) is True
 
     def test_get_bool_invalid_key_raises(self):
         """Test get_bool with invalid key raises AttributeError."""

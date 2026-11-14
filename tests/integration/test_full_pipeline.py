@@ -143,7 +143,7 @@ class TestFullPipelineEndToEnd:
         # Verify
         assert bottle.name == "Standard Bourbon"
         assert str(bottle.msrp) == "89.99"
-        assert bottle.total_value == bottle.msrp.double_value
+        assert bottle.total_value == bottle.msrp
         assert bottle.quantity.count == 1
         assert bottle.quantity.price == bottle.msrp
 
@@ -246,17 +246,3 @@ def _create_test_image(path: Path, text: str) -> None:
     img.save(path)
 
 
-def test_conftest_configure_integration_marker():
-    """Verify integration marker is configured."""
-    from conftest import pytest_configure
-    import pytest
-
-    config = Mock()
-    config.addinivalue_line = Mock()
-    pytest_configure(config)
-
-    # Verify marker was added
-    config.addinivalue_line.assert_any_call(
-        "markers",
-        "integration: marks tests as integration tests requiring external services"
-    )

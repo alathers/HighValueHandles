@@ -20,7 +20,7 @@ from models.bottle import (
     Bottle,
     ExtractedMetadata,
 )
-from lib.error_handling import ErrorReport
+from lib.error_handling import ErrorReport, ErrorType
 
 
 class TestBottleMarkdownOutput:
@@ -298,9 +298,10 @@ class TestErrorReportJSONSchema:
     def test_error_report_required_fields(self):
         """Test error report has required fields."""
         report = ErrorReport(
-            error_type="OCRFailure",
+            error_type=ErrorType.OCR_FAILURE,
             file_path="/path/to/image.jpg",
-            message="Failed to extract text"
+            message="Failed to extract text",
+            details="OCR call returned empty results"
         )
         data = report.to_dict()
 
@@ -312,43 +313,46 @@ class TestErrorReportJSONSchema:
     def test_error_report_optional_fields(self):
         """Test error report optional fields."""
         report = ErrorReport(
-            error_type="OCRFailure",
+            error_type=ErrorType.OCR_FAILURE,
             file_path="/path/to/image.jpg",
             message="Failed to extract text",
-            details={"line": 42, "function": "extract_text"},
+            details="Traceback (most recent call last):\n  File \"extract.py\", line 42, in extract_text",
             retry_count=3,
             hint="Try adjusting image contrast",
         )
         data = report.to_dict()
 
-        assert data["details"]["line"] == 42
+        assert "Traceback" in data["details"]
+        assert "extract_text" in data["details"]
         assert data["retry_count"] == 3
         assert data["hint"] == "Try adjusting image contrast"
 
     def test_error_report_timestamp_iso_format(self):
         """Test error report timestamp is ISO format."""
-        now = datetime.now()
+        now_dt = datetime.now()
+        now_iso = now_dt.isoformat()
         report = ErrorReport(
-            error_type="Test",
+            error_type=ErrorType.UNKNOWN,
             file_path="/path/to/file.jpg",
             message="Test message",
-            timestamp=now,
+            details="Test details",
+            timestamp=now_iso,
         )
         data = report.to_dict()
 
         # Should parse as valid ISO 8601
         parsed_time = datetime.fromisoformat(data["timestamp"])
-        assert parsed_time.year == now.year
+        assert parsed_time.year == now_dt.year
 
     def test_error_report_roundtrip(self):
         """Test error report can serialize and deserialize."""
         original = ErrorReport(
-            error_type="OllamaConnectionError",
-            file_path="/tmp/bottle.jpg",
+            error_type=ErrorType.NETWORK_ERROR,
+            file_path=Path("/tmp/bottle.jpg"),
             message="Connection refused",
-            details={"url": "http://localhost:11434"},
+            details="Connection refused at http://localhost:11434",
             retry_count=2,
-            timestamp=datetime(2026, 11, 13, 10, 30, 0),
+            timestamp=datetime(2026, 11, 13, 10, 30, 0).isoformat(),
         )
 
         data = original.to_dict()
@@ -459,9 +463,10 @@ class TestOutputFilePersistence:
         """Test error report can be written and read back."""
         with tempfile.TemporaryDirectory() as tmpdir:
             report = ErrorReport(
-                error_type="TestError",
+                error_type=ErrorType.UNKNOWN,
                 file_path="/test/path.jpg",
                 message="Test error message",
+                details="Test error details"
             )
 
             # Write to file
@@ -470,6 +475,6 @@ class TestOutputFilePersistence:
 
             # Read and verify
             data = json.loads(output_file.read_text())
-            assert data["error_type"] == "TestError"
+            assert data["error_type"] == "UNKNOWN"
             assert data["file_path"] == "/test/path.jpg"
             assert data["message"] == "Test error message"

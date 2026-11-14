@@ -230,17 +230,17 @@
 - [X] T121 [P] Add log statements throughout modules: processing start, per-bottle progress, API calls, retry attempts, success/failure messages
 - [X] T122 [P] Create tests/contract/test_cli_contracts.py test file to verify CLI interface contract from contracts/cli-interface.md
 - [X] T123 [P] Implement tests/contract/test_cli_contracts.py tests: --help generates valid help text, invalid arguments exit code 1 with error message, pre-flight checks fail before processing
-- [ ] T124 [P] Create tests/contract/test_output_formats.py test file to verify output file formats (markdown structure, error report JSON schema, batch preview markdown)
-- [ ] T125 [P] Create tests/unit/test_config.py test file to test Config class methods and priority order (CLI args > env vars > config file > defaults)
-- [ ] T126 [P] Create tests/unit/test_ollama_client.py test file to test OllamaClient methods (list_models, generate_vision, generate_text, is_model_available, health_check) with mocked HTTP requests
-- [ ] T127 [P] Create tests/unit/test_bottle_analyzer.py test file to test BottleAnalyzer methods (process_single_bottle, group_images_by_bottle, detect_quantity, calculate_confidence) with synthetic test data
-- [ ] T128 [P] Create tests/unit/test_image_organizer.py test file to test ImageOrganizer methods (scan_images, group_by_bottle, detect_duplicates) with test fixture images
-- [ ] T129 [P] Create tests/unit/test_preview_generator.py test file to test PreviewGenerator methods (generate_bottle_markdown, save_bottle_files, generate_batch_preview_report) with mock filesystem operations
-- [ ] T130 [P] Create tests/unit/test_batch_processor.py test file to test BatchProcessor methods (slice_into_batches, apply_lookahead, vision_similarity_score, process_batch) with image queues
-- [ ] T131 [P] Create tests/integration/test_full_pipeline.py test file to test end-to-end processing with real images from tests/fixtures/images/straightforward/ relying on Ollama service running
-- [ ] T132 [P] Create tests/integration/test_batch_workflow.py test file to test batch processing with lookahead, preview reports, and feedback loop using test fixture images
-- [ ] T133 [P] Update pyproject.toml to include pytest as dev dependency and configure pytest with tests/ directory
-- [ ] T134 [P] Run pytest —co to verify all test files discovered and no syntax/import errors
+- [X] T124 [P] Create tests/contract/test_output_formats.py test file to verify output file formats (markdown structure, error report JSON schema, batch preview markdown)
+- [X] T125 [P] Create tests/unit/test_config.py test file to test Config class methods and priority order (CLI args > env vars > config file > defaults)
+- [X] T126 [P] Create tests/unit/test_ollama_client.py test file to test OllamaClient methods (list_models, generate_vision, generate_text, is_model_available, health_check) with mocked HTTP requests
+- [X] T127 [P] Create tests/unit/test_bottle_analyzer.py test file to test BottleAnalyzer methods (process_single_bottle, group_images_by_bottle, detect_quantity, calculate_confidence) with synthetic test data
+- [X] T128 [P] Create tests/unit/test_image_organizer.py test file to test ImageOrganizer methods (scan_images, group_by_bottle, detect_duplicates) with test fixture images
+- [X] T129 [P] Create tests/unit/test_preview_generator.py test file to test PreviewGenerator methods (generate_bottle_markdown, save_bottle_files, generate_batch_preview_report) with mock filesystem operations
+- [X] T130 [P] Create tests/unit/test_batch_processor.py test file to test BatchProcessor methods (slice_into_batches, apply_lookahead, vision_similarity_score, process_batch) with image queues
+- [X] T131 [P] Create tests/integration/test_full_pipeline.py test file to test end-to-end processing with real images from tests/fixtures/images/straightforward/ relying on Ollama service running
+- [X] T132 [P] Create tests/integration/test_batch_workflow.py test file to test batch processing with lookahead, preview reports, and feedback loop using test fixture images
+- [X] T133 [P] Update pyproject.toml to include pytest as dev dependency and configure pytest with tests/ directory
+- [X] T134 [P] Run pytest —co to verify all test files discovered and no syntax/import errors
 - [X] T135 [P] Run pytest to execute unit tests, verify all pass (or document expected failures for integration tests requiring Ollama)
 - [X] T136 [P] Create Git worktree for this feature branch per constitution (TODO from Plan Phase: verify worktree-based development)
 - [X] T137 [P] Commit all work with message "feat: bourbon image processor - AI-powered bolt bottle metadata extraction" including attribution line
