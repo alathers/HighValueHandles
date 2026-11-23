@@ -6,7 +6,6 @@ from image_processor.bottle_identity import (
     identity_conflicts,
     names_match,
     normalize_text,
-    same_identity,
     token_set_ratio,
 )
 from models.bottle import ExtractedMetadata
@@ -70,31 +69,30 @@ class TestIdentityConflicts:
         a = meta(**STAGG, batch_number="23A")
         b = meta(**STAGG, batch_number="Batch 23C")
         assert identity_conflicts(a, b) == ["batch_number"]
-        assert not same_identity(a, b)
 
     def test_batch_missing_on_one_side_is_a_wildcard(self):
-        assert same_identity(meta(**STAGG, batch_number="23A"), meta(**STAGG))
+        assert identity_conflicts(meta(**STAGG, batch_number="23A"), meta(**STAGG)) == []
 
     def test_batch_spelling_variants_match(self):
-        assert same_identity(meta(**STAGG, batch_number="Batch No. 23-A"), meta(**STAGG, batch_number="23a"))
+        assert identity_conflicts(meta(**STAGG, batch_number="Batch No. 23-A"), meta(**STAGG, batch_number="23a")) == []
 
     def test_proof_tolerance(self):
-        assert same_identity(meta(name="X", proof="135.4 Proof"), meta(name="X", proof="135"))
+        assert identity_conflicts(meta(name="X", proof="135.4 Proof"), meta(name="X", proof="135")) == []
         assert identity_conflicts(meta(name="X", proof="135.4"), meta(name="X", proof="130.0")) == ["proof"]
-        assert same_identity(meta(name="X", proof="135.4"), meta(name="X"))
+        assert identity_conflicts(meta(name="X", proof="135.4"), meta(name="X")) == []
 
     def test_age_in_years_or_months(self):
-        assert same_identity(meta(name="X", age="8 Years Old"), meta(name="X", age="96 months"))
+        assert identity_conflicts(meta(name="X", age="8 Years Old"), meta(name="X", age="96 months")) == []
         assert identity_conflicts(meta(name="X", age="8 Year"), meta(name="X", age="10 Year")) == ["age"]
 
     def test_release_compared_like_names(self):
         a = meta(name="Old Forester", specific_release="1920 Prohibition Style")
         b = meta(name="Old Forester", specific_release="1910 Old Fine Whisky")
         assert identity_conflicts(a, b) == ["specific_release"]
-        assert same_identity(a, meta(name="Old Forester"))
+        assert identity_conflicts(a, meta(name="Old Forester")) == []
 
     def test_name_missing_on_one_side(self):
-        assert same_identity(meta(distillery="Buffalo Trace", proof="90"), meta(name="Weller", proof="90 Proof"))
+        assert identity_conflicts(meta(distillery="Buffalo Trace", proof="90"), meta(name="Weller", proof="90 Proof")) == []
 
     def test_several_conflicts_listed(self):
         a = meta(name="Weller Special Reserve", proof="90")
@@ -109,9 +107,9 @@ class TestIdentityConflicts:
 
     def test_subset_name_matches_documented_limitation(self):
         """Documented limitation: a subset name matches; only another field read on both sides separates."""
-        assert same_identity(meta(name="Stagg"), meta(name="Stagg Jr"))
+        assert identity_conflicts(meta(name="Stagg"), meta(name="Stagg Jr")) == []
         assert identity_conflicts(meta(name="Stagg", proof="130"), meta(name="Stagg Jr", proof="128")) == ["proof"]
 
     def test_sibling_without_distinguishing_field_is_merged(self):
         """Documented limitation: identical-label siblings compare equal."""
-        assert same_identity(meta(name="Elmer T. Lee", proof="90"), meta(name="Elmer T. Lee", proof="90 Proof"))
+        assert identity_conflicts(meta(name="Elmer T. Lee", proof="90"), meta(name="Elmer T. Lee", proof="90 Proof")) == []

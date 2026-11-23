@@ -1,6 +1,6 @@
 """Generate preview reports and output files for bourbon bottles.
 
-Creates markdown output, saves images, generates error reports,
+Creates markdown output, saves images, writes per-bottle failure reports,
 and provides preview for user review.
 """
 
@@ -17,16 +17,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from image_processor.image_organizer import OUTPUT_MARKER
-from lib.error_handling import ErrorReport, ErrorType, create_error_report, save_error_reports
-from lib.exceptions import (
-    AIModelError,
-    BourbonException,
-    ConfigurationError,
-    FileSystemError,
-    ImageProcessingError,
-    OCRError,
-    ValidationError,
-)
+from lib.error_handling import create_error_report
+from lib.exceptions import FileSystemError
 from models.bottle import Bottle, ExtractedMetadata, format_money, parse_money
 
 logger = logging.getLogger(__name__)
@@ -94,16 +86,16 @@ class PreviewGenerator:
         output_dir: Base output directory for processed bottles.
     """
 
-    def __init__(self, output_dir: Optional[Path] = None, mark_output_dir: bool = True):
+    def __init__(self, output_dir: Path, *, mark_output_dir: bool = True):
         """Initialize preview generator.
 
         Args:
-            output_dir: Base output directory (default: "processed").
+            output_dir: Base output directory (required; created if missing).
             mark_output_dir: Write the output marker into ``output_dir`` so
                 later scans skip it. Off when ``output_dir`` contains the
                 photos being processed (each bottle folder is still marked).
         """
-        self.output_dir = Path(output_dir) if output_dir else Path("processed")
+        self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.mark_output_dir = mark_output_dir
 
@@ -427,85 +419,6 @@ class PreviewGenerator:
             final = new_final
         raise FileExistsError(f"No free output name for '{stem}' in {final.parent}")
 
-    def generate_error_report(
-        self,
-        bottle_id: str,
-        images: List[str],
-        error: Exception,
-        retry_attempts: int = 0,
-    ) -> ErrorReport:
-        """Generate error report for failed processing.
-
-        Args:
-            bottle_id: Bottle identifier.
-            images: List of image paths that failed.
-            error: Exception that occurred.
-            retry_attempts: Number of retry attempts made.
-
-        Returns:
-            ErrorReport instance.
-        """
-        # Determine error type and suggested fix
-        if isinstance(error, OCRError):
-            suggested_fix = "Check image quality and try re-scanning with higher resolution."
-            hint_topic = ErrorType.OCR_FAILURE
-        elif isinstance(error, AIModelError):
-            suggested_fix = "Verify Ollama service is running and model is available."
-            hint_topic = ErrorType.AI_MODEL_FAILURE
-        elif isinstance(error, (ImageProcessingError, ConfigurationError, FileSystemError, ValidationError)):
-            suggested_fix = "Review error details and check system configuration."
-            hint_topic = ErrorType.UNKNOWN
-        elif isinstance(error, BourbonException):
-            error_msg = str(error).lower()
-            if "model" in error_msg or "ollama" in error_msg:
-                suggested_fix = "Verify Ollama service is running and model is available."
-                hint_topic = ErrorType.AI_MODEL_FAILURE
-            elif "ocr" in error_msg or "tesseract" in error_msg:
-                suggested_fix = "Check image quality and try re-scanning with higher resolution."
-                hint_topic = ErrorType.OCR_FAILURE
-            else:
-                suggested_fix = "Review error details and check system configuration."
-                hint_topic = ErrorType.UNKNOWN
-        else:
-            suggested_fix = "Check system logs and verify all dependencies are installed."
-            hint_topic = ErrorType.UNKNOWN
-
-        return ErrorReport(
-            error_type=hint_topic,
-            file_path=Path(images[0]) if images else None,
-            message=str(error),
-            details=f"Bottle ID: {bottle_id}\nImages: {images}",
-            timestamp=datetime.now(UTC).isoformat(),
-            retry_count=retry_attempts,
-            hint=suggested_fix,
-        )
-
-    def save_error_report(
-        self,
-        error_report: ErrorReport,
-        output_dir: Optional[Path] = None,
-    ) -> Path:
-        """Save error report to file.
-
-        Args:
-            error_report: ErrorReport instance.
-            output_dir: Optional output directory (default: output_dir).
-
-        Returns:
-            Path to saved error report file.
-        """
-        base_dir = output_dir or self.output_dir
-
-        # Generate filename from timestamp
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        report_path = base_dir / f"error_report_{timestamp}.json"
-
-        # Save error report
-        save_error_reports([error_report], report_path)
-
-        logger.info(f"Saved error report to {report_path}")
-        return report_path
-
     def generate_batch_preview_report(
         self,
         bottle_dicts: List[Dict],
@@ -627,25 +540,25 @@ class PreviewGenerator:
         # Feedback instructions
         lines.append("## Feedback Instructions\n")
         lines.append("Review the batch grouping and metadata above. To provide feedback:\n\n")
-        lines.append(
-            "1. **Interactive Mode:** Use the [A]ccept/[R]eject/[M]erge/[S]plit/[E]dit options\n"
-        )
+        lines.append("1. **Interactive Mode:** Use the [A]ccept/[R]eject/[E]dit/[Q]uit options\n")
         lines.append("   - **A** - Accept the grouping and metadata as-is\n")
         lines.append("   - **R** - Reject this bottle for re-processing\n")
-        lines.append("   - **M** - Merge multiple bottles into one\n")
-        lines.append("   - **S** - Split a single proposed bottle into multiple bottles\n")
-        lines.append("   - **E** - Edit specific fields (name, distillery, MSRP, etc.)\n\n")
+        lines.append("   - **E** - Edit specific fields (name, distillery, MSRP, etc.)\n")
+        lines.append("   - **Q** - Quit the review (remaining bottles are kept as-is)\n\n")
         lines.append(
-            "2. **Separate Feedback Command:** Use the `feedback` command with a JSON corrections file\n"
+            "2. **Separate Feedback Command:** Use the `feedback` command with a JSON corrections "
+            "file: a list of `{bottle_id, field_name, original_value, corrected_value}`\n"
         )
         lines.append("   ```\n")
-        lines.append("   python -m bourbon_cli feedback --batch 1 --corrections feedback.json\n")
+        lines.append(
+            f"   bourbon-process feedback --batch {batch_id} --corrections corrections.json\n"
+        )
         lines.append("   ```\n\n")
         lines.append(
             "3. **Retry Failed Items:** Use the `retry` command with an error report file\n"
         )
         lines.append("   ```\n")
-        lines.append("   python -m bourbon_cli retry --report error_report.json\n")
+        lines.append("   bourbon-process retry --report error_report_<bottle_id>.json\n")
         lines.append("   ```\n")
 
         return "\n".join(lines)
@@ -822,27 +735,6 @@ class PreviewGenerator:
         finally:
             tmp.unlink(missing_ok=True)
 
-    def save_batch_preview_report(
-        self,
-        bottle_dicts: List[Dict],
-        metadata_list: List[ExtractedMetadata],
-        output_path: Optional[Path] = None,
-    ) -> Path:
-        """Save batch preview report to file (legacy method, uses default name).
-
-        Args:
-            bottle_dicts: List of bottle dictionaries.
-            metadata_list: List of ExtractedMetadata
-            output_path: Optional output path (default: output_dir/batch_preview.md).
-
-        Returns:
-            Path to saved preview report.
-        """
-        logger.warning(
-            "save_batch_preview_report() is deprecated, use save_batch_preview() with batch_id for batch-specific naming"
-        )
-        return self.save_batch_preview(bottle_dicts, metadata_list, batch_id=1, output_path=output_path)
-
     def interactive_prompt(
         self,
         bottle_dicts: List[Dict],
@@ -851,7 +743,10 @@ class PreviewGenerator:
         """Prompt user interactively for corrections after batch processing.
 
         Displays each bottle's key information and waits for user input.
-        Supports [A]ccept, [R]eject, [M]erge, [S]plit, [E]dit, and [Q]uit actions.
+        Supports [A]ccept, [R]eject, [E]dit, and [Q]uit actions. Edits are
+        returned as correction dicts carrying the bottle's ``bottle_id``; the
+        bottle dicts themselves are not changed here (apply the corrections
+        with :func:`image_processor.corrections.apply_corrections`).
 
         Args:
             bottle_dicts: List of bottle dictionaries.
@@ -859,11 +754,10 @@ class PreviewGenerator:
 
         Returns:
             Tuple of (corrections, rejected_bottles) where:
-                - corrections: List of correction dicts (field_name, original_value, corrected_value)
+                - corrections: List of correction dicts (bottle_id, field_name,
+                  original_value, corrected_value, corrected_at)
                 - rejected_bottles: List of bottle identifiers marked for rejection
         """
-        from datetime import datetime
-
         corrections = []
         rejected_bottles = []
 
@@ -871,7 +765,7 @@ class PreviewGenerator:
         print("BATCH PROCESSING - INTERACTIVE REVIEW")
         print("=" * 70)
         print(f"\nProcessing {len(bottle_dicts)} bottles in this batch")
-        print("Actions: [A]ccept | [R]eject | [M]erge | [S]plit | [E]dit | [Q]uit\n")
+        print("Actions: [A]ccept | [R]eject | [E]dit | [Q]uit\n")
 
         for i, (bottle_dict, metadata) in enumerate(zip(bottle_dicts, metadata_list), 1):
             # Display bottle identifier
@@ -905,15 +799,16 @@ class PreviewGenerator:
             image_count = len(metadata.source_images)
             print(f"Images:      {image_count}")
 
-            # Check for low confidence
-            key_fields = ["name", "distillery", "msrp", "proof", "age"]
-            filled_fields = sum(1 for field in key_fields if bottle_dict.get(field))
-            confidence = "HIGH" if filled_fields >= 4 else "MEDIUM" if filled_fields >= 2 else "LOW"
-            print(f"Confidence:  {confidence}")
+            # The extraction confidence recorded for this bottle (not re-derived).
+            print(f"Confidence:  {bottle_dict.get('confidence') or 'Unknown'}")
 
-            # Wait for user input
-            print("\nAction [A/R/M/S/E/Q]? ", end="", flush=True)
+            # Wait for a recognised action: a stray key (or a bare Enter) must
+            # never count as accepting a bottle someone has not looked at.
+            print("\nAction [A/R/E/Q]? ", end="", flush=True)
             action = input().strip().upper()
+            while action not in ("A", "R", "E", "Q"):
+                print(f"⚠ Unknown action '{action}'; enter A, R, E or Q: ", end="", flush=True)
+                action = input().strip().upper()
 
             # Handle user action
             if action == "Q":
@@ -924,57 +819,28 @@ class PreviewGenerator:
             elif action == "R":
                 rejected_bottles.append(bottle_id)
                 print(f"✗ Rejected bottle {i}: {bottle_id}")
-            elif action == "M":
-                # Merge with previous bottle
-                if i > 1:
-                    prev_id = i - 1
-                    print(f"→ Merging bottle {i} with bottle {prev_id}")
-                    corrections.append(
-                        {
-                            "field_name": "grouping",
-                            "original_value": f"separate_{i}",
-                            "corrected_value": f"merge_with_{prev_id}",
-                            "bottle_id": bottle_id,
-                        }
-                    )
-                else:
-                    print(f"⚠ Cannot merge first bottle (no previous bottle to merge with)")
-            elif action == "S":
-                # Split this bottle (indicates grouping is too aggressive)
-                print(f"→ Splitting bottle {i} into separate items")
-                corrections.append(
-                    {
-                        "field_name": "grouping",
-                        "original_value": f"grouped_{i}",
-                        "corrected_value": "split",
-                        "bottle_id": bottle_id,
-                    }
-                )
             elif action == "E":
                 # Edit specific fields
                 print(f"\nEditing bottle {i}: {bottle_dict.get('name', 'Unknown')}")
                 print("Press Enter to keep current value for each field\n")
 
                 for field in ["name", "distillery", "msrp", "proof", "age", "specific_release"]:
-                    current = bottle_dict.get(field, "")
+                    raw = bottle_dict.get(field)
+                    current = "" if raw is None else str(raw)
                     label = field.replace("_", " ").title()
                     new_value = input(f"{label:14} [{current}]: ").strip()
 
-                    if new_value and new_value != current:
+                    if new_value and new_value != current.strip():
                         corrections.append(
                             {
                                 "field_name": field,
-                                "original_value": str(current),
+                                "original_value": current,
                                 "corrected_value": new_value,
                                 "bottle_id": bottle_id,
                                 "corrected_at": datetime.now(UTC).isoformat(),
                             }
                         )
-                        # Update bottle dict for display
-                        bottle_dict[field] = new_value
-                        print(f"  Updated: {field} = {new_value}")
-            else:
-                print(f"⚠ Unknown action '{action}', treating as [A]ccept")
+                        print(f"  Will update: {field} = {new_value}")
 
         # Summary
         print("\n" + "=" * 70)
@@ -987,76 +853,3 @@ class PreviewGenerator:
         print("=" * 70)
 
         return corrections, rejected_bottles
-
-    def handle_interactive_choice(
-        self,
-        choice: str,
-        bottle_dict: Dict,
-        bottle_id: str,
-        bottle_index: int,
-    ) -> Optional[Dict[str, str]]:
-        """Parse user interactive choice and return appropriate action.
-
-        Handles A/R/M/S/E choices and returns a correction dict for actions
-        that require processing (Reject, Merge, Split, Edit).
-
-        Args:
-            choice: User input choice (A/R/M/S/E/Q).
-            bottle_dict: Bottle dictionary for this bottle.
-            bottle_id: Bottle identifier.
-            bottle_index: Index within batch (1-based).
-
-        Returns:
-            Correction dict if action requires processing, None otherwise.
-            Returns None for Accept actions (no correction needed).
-        """
-        action = choice.strip().upper()
-
-        if action == "A":
-            # Accept - no correction needed
-            return None
-        elif action == "R":
-            # Reject - mark for deletion
-            return {
-                "field_name": "grouping",
-                "original_value": "accepted",
-                "corrected_value": "rejected",
-                "bottle_id": bottle_id,
-                "corrected_at": datetime.now(UTC).isoformat(),
-            }
-        elif action == "M":
-            # Merge with previous bottle
-            if bottle_index > 1:
-                prev_id = bottle_index - 1
-                return {
-                    "field_name": "grouping",
-                    "original_value": f"separate_{bottle_index}",
-                    "corrected_value": f"merge_with_{prev_id}",
-                    "bottle_id": bottle_id,
-                    "corrected_at": datetime.now(UTC).isoformat(),
-                }
-            else:
-                logger.warning("Cannot merge first bottle (no previous bottle to merge with)")
-                return None
-        elif action == "S":
-            # Split this bottle
-            return {
-                "field_name": "grouping",
-                "original_value": f"grouped_{bottle_index}",
-                "corrected_value": "split",
-                "bottle_id": bottle_id,
-                "corrected_at": datetime.now(UTC).isoformat(),
-            }
-        elif action == "E":
-            # Edit - requires additional context (field-specific)
-            # This returns a marker that indicates edit mode should be entered
-            return {
-                "field_name": "edit",
-                "original_value": "",
-                "corrected_value": "enter_edit_mode",
-                "bottle_id": bottle_id,
-                "corrected_at": datetime.now(UTC).isoformat(),
-            }
-        else:
-            logger.warning("Unknown choice '%s', treating as Accept", choice)
-            return None

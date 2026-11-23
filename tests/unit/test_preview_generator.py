@@ -6,27 +6,20 @@ Tests markdown generation, file operations, and interactive feedback handling.
 import json
 from decimal import Decimal
 from pathlib import Path
-from unittest.mock import MagicMock, Mock, patch
-from datetime import datetime
+from unittest.mock import Mock, patch
 
 import pytest
 
 from image_processor.preview_generator import PreviewGenerator
-from lib.error_handling import ErrorReport, ErrorType
-from lib.exceptions import BourbonException, OCRError
 from models.bottle import Bottle, ExtractedMetadata, Correction, ReferenceLink, Quantity
 
 
 class TestPreviewGeneratorInitialization:
     """Test PreviewGenerator initialization."""
 
-    @patch("pathlib.Path.mkdir")
-    def test_init_default_output_dir(self, mock_mkdir):
-        """Test initialization with default output directory."""
-        generator = PreviewGenerator()
-
-        assert generator.output_dir == Path("processed")
-        mock_mkdir.assert_called_once_with(parents=True, exist_ok=True)
+    def test_output_dir_is_required(self):
+        with pytest.raises(TypeError):
+            PreviewGenerator()  # type: ignore[call-arg]
 
     @patch("pathlib.Path.mkdir")
     def test_init_custom_output_dir(self, mock_mkdir):
@@ -50,7 +43,7 @@ class TestPreviewGeneratorInitialization:
 class TestPreviewGeneratorMarkdownGeneration:
     """Test markdown generation for individual bottles."""
 
-    def test_generate_bottle_markdown_basic(self):
+    def test_generate_bottle_markdown_basic(self, tmp_path):
         """Test basic markdown generation for a bottle."""
         metadata = ExtractedMetadata(
             full_text="Sample OCR text",
@@ -66,7 +59,7 @@ class TestPreviewGeneratorMarkdownGeneration:
         )
         # Add abv attribute dynamically to work around Bottle model limitation
         bottle.abv = None
-        generator = PreviewGenerator()
+        generator = PreviewGenerator(tmp_path)
 
         markdown = generator.generate_bottle_markdown(bottle)
 
@@ -79,7 +72,7 @@ class TestPreviewGeneratorMarkdownGeneration:
         assert "image1.jpg" in markdown
         assert "image2.jpg" in markdown
 
-    def test_generate_bottle_markdown_with_all_fields(self):
+    def test_generate_bottle_markdown_with_all_fields(self, tmp_path):
         """Test markdown with all optional fields populated."""
         metadata = ExtractedMetadata(
             full_text="OCR text",
@@ -101,6 +94,7 @@ class TestPreviewGeneratorMarkdownGeneration:
             quantity=Quantity(count=2, price=Decimal("149.99")),
             corrections=[
                 Correction(
+                    bottle_id="IMG_1",
                     field_name="age",
                     original_value="10 years",
                     corrected_value="12 years",
@@ -108,7 +102,7 @@ class TestPreviewGeneratorMarkdownGeneration:
             ],
             metadata=metadata,
         )
-        generator = PreviewGenerator()
+        generator = PreviewGenerator(tmp_path)
 
         markdown = generator.generate_bottle_markdown(bottle)
 
@@ -124,7 +118,7 @@ class TestPreviewGeneratorMarkdownGeneration:
         assert "## Corrections" in markdown
         assert "**age**" in markdown
 
-    def test_generate_bottle_markdown_without_optional_fields(self):
+    def test_generate_bottle_markdown_without_optional_fields(self, tmp_path):
         """Test markdown generation when optional fields are missing."""
         metadata = ExtractedMetadata(
             full_text="OCR text",
@@ -139,7 +133,7 @@ class TestPreviewGeneratorMarkdownGeneration:
             metadata=metadata,
         )
         bottle.abv = None
-        generator = PreviewGenerator()
+        generator = PreviewGenerator(tmp_path)
 
         markdown = generator.generate_bottle_markdown(bottle)
 
@@ -150,7 +144,7 @@ class TestPreviewGeneratorMarkdownGeneration:
         # Verify required sections are present
         assert "## Quantity" in markdown
 
-    def test_generate_bottle_markdown_with_single_quantity(self):
+    def test_generate_bottle_markdown_with_single_quantity(self, tmp_path):
         """Test quantity section shows correctly when quantity is 1."""
         metadata = ExtractedMetadata(
             full_text="Text",
@@ -166,7 +160,7 @@ class TestPreviewGeneratorMarkdownGeneration:
             metadata=metadata,
         )
         bottle.abv = None
-        generator = PreviewGenerator()
+        generator = PreviewGenerator(tmp_path)
 
         markdown = generator.generate_bottle_markdown(bottle)
 
@@ -174,7 +168,7 @@ class TestPreviewGeneratorMarkdownGeneration:
         assert "Value per bottle" not in markdown
         assert "Total value: $75.00" in markdown
 
-    def test_generate_bottle_markdown_with_multiple_quantity(self):
+    def test_generate_bottle_markdown_with_multiple_quantity(self, tmp_path):
         """Test quantity section shows per-bottle value when quantity > 1."""
         metadata = ExtractedMetadata(
             full_text="Text",
@@ -190,7 +184,7 @@ class TestPreviewGeneratorMarkdownGeneration:
             metadata=metadata,
         )
         bottle.abv = None
-        generator = PreviewGenerator()
+        generator = PreviewGenerator(tmp_path)
 
         markdown = generator.generate_bottle_markdown(bottle)
 
@@ -220,9 +214,9 @@ class TestPreviewGeneratorMarkdownGeneration:
         assert data["msrp"] is None
         assert data["total_value"] is None
 
-    def test_extracted_timestamp_has_offset(self):
+    def test_extracted_timestamp_has_offset(self, tmp_path):
         bottle = Bottle.from_analysis({"name": "X"})
-        markdown = PreviewGenerator().generate_bottle_markdown(bottle)
+        markdown = PreviewGenerator(tmp_path).generate_bottle_markdown(bottle)
         line = next(line for line in markdown.splitlines() if line.startswith("- **Extracted**"))
         # e.g. 2026-11-22T21:38:09-06:00 (local time with its offset)
         assert line[-6] in "+-" and line[-3] == ":"
@@ -642,116 +636,10 @@ class TestSaveFailureReport:
         MockManager.return_value.ensure_running.assert_called_once()
 
 
-class TestPreviewGeneratorErrorReport:
-    """Test error report generation and saving."""
-
-    def test_generate_error_report_for_ocr_error(self):
-        """Test error report generation for OCR failures."""
-        error = OCRError("OCR processing failed")
-        generator = PreviewGenerator()
-
-        report = generator.generate_error_report(
-            bottle_id="bottle123",
-            images=["image1.jpg", "image2.jpg"],
-            error=error,
-            retry_attempts=2,
-        )
-
-        assert report.error_type == ErrorType.OCR_FAILURE
-        assert report.retry_count == 2
-        assert "image quality" in report.hint.lower()
-
-    def test_generate_error_report_for_model_error(self):
-        """Test error report generation for model unavailability."""
-        error = BourbonException("Model not available: qwen2-vl")
-        generator = PreviewGenerator()
-
-        report = generator.generate_error_report(
-            bottle_id="bottle456",
-            images=["image.jpg"],
-            error=error,
-            retry_attempts=1,
-        )
-
-        assert report.error_type == ErrorType.AI_MODEL_FAILURE
-        assert "Ollama service" in report.hint
-
-    def test_generate_error_report_for_general_bourbon_exception(self):
-        """Test error report for general BourbonException."""
-        error = BourbonException("General processing error")
-        generator = PreviewGenerator()
-
-        report = generator.generate_error_report(
-            bottle_id="bottle789",
-            images=["image.jpg"],
-            error=error,
-        )
-
-        assert report.error_type == ErrorType.UNKNOWN
-        assert "system configuration" in report.hint.lower()
-
-    def test_generate_error_report_for_unexpected_exception(self):
-        """Test error report for non-BourbonException errors."""
-        error = ValueError("Unexpected error")
-        generator = PreviewGenerator()
-
-        report = generator.generate_error_report(
-            bottle_id="bottle999",
-            images=["image.jpg"],
-            error=error,
-        )
-
-        assert report.error_type == ErrorType.UNKNOWN
-        assert "system logs" in report.hint.lower()
-
-    @patch("image_processor.preview_generator.save_error_reports")
-    @patch("image_processor.preview_generator.datetime")
-    def test_save_error_report_default_dir(self, mock_datetime, mock_save):
-        """Test saving error report to default directory."""
-        # Mock fixed timestamp for predictable filename
-        mock_datetime.now.return_value.strftime.return_value = "20261113_120000"
-
-        error_report = ErrorReport(
-            error_type=ErrorType.OCR_FAILURE,
-            file_path=Path("image.jpg"),
-            message="Test error",
-            details="Details",
-            retry_count=0,
-            hint="Fix it",
-        )
-        generator = PreviewGenerator()
-        result_path = generator.save_error_report(error_report)
-
-        assert result_path == Path("processed/error_report_20261113_120000.json")
-        mock_save.assert_called_once()
-
-    @patch("image_processor.preview_generator.save_error_reports")
-    @patch("image_processor.preview_generator.datetime")
-    def test_save_error_report_custom_dir(self, mock_datetime, mock_save):
-        """Test saving error report to custom directory."""
-        # Mock fixed timestamp for predictable filename
-        mock_datetime.now.return_value.strftime.return_value = "20261113_120000"
-
-        error_report = ErrorReport(
-            error_type=ErrorType.OCR_FAILURE,
-            file_path=Path("image.jpg"),
-            message="Test error",
-            details="Details",
-            retry_count=0,
-            hint="Fix it",
-        )
-        generator = PreviewGenerator()
-        custom_dir = Path("/custom")
-        result_path = generator.save_error_report(error_report, output_dir=custom_dir)
-
-        assert result_path == Path("/custom/error_report_20261113_120000.json")
-        mock_save.assert_called_once()
-
-
-class TestPreviewGeneratorBatchPreviewReport:
+class TestPreviewGeneratorBatchReport:
     """Test batch preview report generation."""
 
-    def test_generate_batch_preview_report_basic(self):
+    def test_generate_batch_preview_report_basic(self, tmp_path):
         """Test basic batch preview report generation."""
         metadata1 = ExtractedMetadata(
             full_text="Bottle 1 text",
@@ -780,7 +668,7 @@ class TestPreviewGeneratorBatchPreviewReport:
         ]
         metadata_list = [metadata1, metadata2]
 
-        generator = PreviewGenerator()
+        generator = PreviewGenerator(tmp_path)
         markdown = generator.generate_batch_preview_report(
             bottle_dicts, metadata_list, batch_id=1
         )
@@ -791,7 +679,7 @@ class TestPreviewGeneratorBatchPreviewReport:
         assert "| Bottle Name | Quantity | Images | Confidence |" in markdown
         assert "## Extracted Metadata Details" in markdown
 
-    def test_generate_batch_preview_report_confidence_calculation(self):
+    def test_generate_batch_preview_report_confidence_calculation(self, tmp_path):
         """Test confidence calculation based on filled fields."""
         metadata = ExtractedMetadata(
             full_text="Text",
@@ -818,7 +706,7 @@ class TestPreviewGeneratorBatchPreviewReport:
         # Low confidence (<2 fields): only msrp = 1 field
         bottle_low = {"msrp": "99.99"}
 
-        generator = PreviewGenerator()
+        generator = PreviewGenerator(tmp_path)
 
         markdown_high = generator.generate_batch_preview_report(
             [bottle_high], [metadata], batch_id=1
@@ -835,7 +723,7 @@ class TestPreviewGeneratorBatchPreviewReport:
         )
         assert "| LOW |" in markdown_low
 
-    def test_generate_batch_preview_report_with_rejected_bottles(self):
+    def test_generate_batch_preview_report_with_rejected_bottles(self, tmp_path):
         """Test batch preview includes rejected bottles."""
         metadata = ExtractedMetadata(
             full_text="Text",
@@ -846,7 +734,7 @@ class TestPreviewGeneratorBatchPreviewReport:
         metadata_list = [metadata]
         rejected_bottles = ["bottle1", "bottle2"]
 
-        generator = PreviewGenerator()
+        generator = PreviewGenerator(tmp_path)
         markdown = generator.generate_batch_preview_report(
             bottle_dicts,
             metadata_list,
@@ -860,7 +748,7 @@ class TestPreviewGeneratorBatchPreviewReport:
         assert "- bottle1" in markdown
         assert "- bottle2" in markdown
 
-    def test_generate_batch_preview_report_low_confidence_section(self):
+    def test_generate_batch_preview_report_low_confidence_section(self, tmp_path):
         """Test low-confidence bottles are highlighted."""
         metadata = ExtractedMetadata(
             full_text="Text",
@@ -871,7 +759,7 @@ class TestPreviewGeneratorBatchPreviewReport:
         bottle_dicts = [{"msrp": "99.99"}]
         metadata_list = [metadata]
 
-        generator = PreviewGenerator()
+        generator = PreviewGenerator(tmp_path)
         markdown = generator.generate_batch_preview_report(
             bottle_dicts, metadata_list, batch_id=1
         )
@@ -880,7 +768,7 @@ class TestPreviewGeneratorBatchPreviewReport:
         assert "**Low Confidence:**" in markdown
         assert "- Bottle 1" in markdown
 
-    def test_generate_batch_preview_report_with_ocr_preview(self):
+    def test_generate_batch_preview_report_with_ocr_preview(self, tmp_path):
         """Test OCR text preview is included and truncated."""
         # Create text longer than 300 characters to trigger truncation
         long_text = "This is a long OCR text that exceeds the preview limit but will be truncated. " * 10
@@ -894,7 +782,7 @@ class TestPreviewGeneratorBatchPreviewReport:
         bottle_dicts = [{"name": "Test Bottle", "distillery": "Dist", "msrp": "99.99"}]
         metadata_list = [metadata]
 
-        generator = PreviewGenerator()
+        generator = PreviewGenerator(tmp_path)
         markdown = generator.generate_batch_preview_report(
             bottle_dicts, metadata_list, batch_id=1
         )
@@ -906,7 +794,7 @@ class TestPreviewGeneratorBatchPreviewReport:
         # Full text should not be present
         assert len(long_text) > 400  # Longer than what's in preview
 
-    def test_generate_batch_preview_report_feedack_instructions(self):
+    def test_generate_batch_preview_report_feedack_instructions(self, tmp_path):
         """Test feedback instructions are included in report."""
         metadata = ExtractedMetadata(
             full_text="Text",
@@ -916,7 +804,7 @@ class TestPreviewGeneratorBatchPreviewReport:
         bottle_dicts = [{"name": "Test", "distillery": "Dist", "msrp": "99.99"}]
         metadata_list = [metadata]
 
-        generator = PreviewGenerator()
+        generator = PreviewGenerator(tmp_path)
         markdown = generator.generate_batch_preview_report(
             bottle_dicts, metadata_list, batch_id=1
         )
@@ -924,13 +812,15 @@ class TestPreviewGeneratorBatchPreviewReport:
         assert "## Feedback Instructions" in markdown
         assert "**A** - Accept" in markdown
         assert "**R** - Reject" in markdown
-        assert "**M** - Merge" in markdown
-        assert "**S** - Split" in markdown
         assert "**E** - Edit" in markdown
+        assert "**Q** - Quit" in markdown
+        assert "Merge" not in markdown and "Split" not in markdown
+        assert "bourbon-process feedback --batch 1" in markdown
+        assert "bottle_id" in markdown
         assert "feedback command" in markdown.lower()
         assert "retry failed" in markdown.lower()
 
-    def test_generate_batch_preview_report_populates_optional_fields(self):
+    def test_generate_batch_preview_report_populates_optional_fields(self, tmp_path):
         """Test optional fields are added when present."""
         metadata = ExtractedMetadata(
             full_text="Text",
@@ -949,7 +839,7 @@ class TestPreviewGeneratorBatchPreviewReport:
         ]
         metadata_list = [metadata]
 
-        generator = PreviewGenerator()
+        generator = PreviewGenerator(tmp_path)
         markdown = generator.generate_batch_preview_report(
             bottle_dicts, metadata_list, batch_id=1
         )
@@ -963,7 +853,7 @@ class TestPreviewGeneratorSaveBatchPreview:
     """Test saving batch preview reports."""
 
     @patch("builtins.open")
-    def test_save_batch_preview_default_path(self, mock_open):
+    def test_save_batch_preview_default_path(self, mock_open, tmp_path):
         """Test saving batch preview to default path."""
         mock_open.return_value.__enter__ = Mock()
         mock_open.return_value.__exit__ = Mock()
@@ -976,14 +866,14 @@ class TestPreviewGeneratorSaveBatchPreview:
         bottle_dicts = [{"name": "Test", "distillery": "Dist", "msrp": "99.99"}]
         metadata_list = [metadata]
 
-        generator = PreviewGenerator()
+        generator = PreviewGenerator(tmp_path)
         result_path = generator.save_batch_preview(bottle_dicts, metadata_list, batch_id=2)
 
         # Default path should be {output_dir}/batch_2_preview.md
-        assert str(result_path) == "processed/batch_2_preview.md"
+        assert result_path == tmp_path / "batch_2_preview.md"
 
     @patch("builtins.open")
-    def test_save_batch_preview_custom_path(self, mock_open):
+    def test_save_batch_preview_custom_path(self, mock_open, tmp_path):
         """Test saving batch preview to custom path."""
         mock_open.return_value.__enter__ = Mock()
         mock_open.return_value.__exit__ = Mock()
@@ -996,7 +886,7 @@ class TestPreviewGeneratorSaveBatchPreview:
         bottle_dicts = [{"name": "Test", "distillery": "Dist", "msrp": "99.99"}]
         metadata_list = [metadata]
 
-        generator = PreviewGenerator()
+        generator = PreviewGenerator(tmp_path)
         custom_path = Path("/custom/custom_preview.md")
         result_path = generator.save_batch_preview(
             bottle_dicts, metadata_list, batch_id=1, output_path=custom_path
@@ -1031,7 +921,7 @@ class TestPreviewGeneratorInteractivePrompt:
 
     @patch("builtins.input")
     @patch("builtins.print")
-    def test_interactive_prompt_accept_all(self, mock_print, mock_input):
+    def test_interactive_prompt_accept_all(self, mock_print, mock_input, tmp_path):
         """Test accepting all bottles in interactive mode."""
         mock_input.return_value = "A"
 
@@ -1046,7 +936,7 @@ class TestPreviewGeneratorInteractivePrompt:
         ]
         metadata_list = [metadata, metadata]
 
-        generator = PreviewGenerator()
+        generator = PreviewGenerator(tmp_path)
         corrections, rejected = generator.interactive_prompt(
             bottle_dicts, metadata_list
         )
@@ -1057,7 +947,7 @@ class TestPreviewGeneratorInteractivePrompt:
 
     @patch("builtins.input")
     @patch("builtins.print")
-    def test_interactive_prompt_reject_bottle(self, mock_print, mock_input):
+    def test_interactive_prompt_reject_bottle(self, mock_print, mock_input, tmp_path):
         """Test rejecting bottles in interactive mode."""
         mock_input.return_value = "R"
 
@@ -1071,7 +961,7 @@ class TestPreviewGeneratorInteractivePrompt:
         ]
         metadata_list = [metadata]
 
-        generator = PreviewGenerator()
+        generator = PreviewGenerator(tmp_path)
         corrections, rejected = generator.interactive_prompt(
             bottle_dicts, metadata_list
         )
@@ -1082,63 +972,7 @@ class TestPreviewGeneratorInteractivePrompt:
 
     @patch("builtins.input")
     @patch("builtins.print")
-    def test_interactive_prompt_merge(self, mock_print, mock_input):
-        """Test merging bottles in interactive mode."""
-        mock_input.return_value = "M"
-
-        metadata1 = ExtractedMetadata(
-            full_text="Text",
-            selected_text="Text",
-            source_images=[Path("bottle1.jpg")],
-        )
-        metadata2 = ExtractedMetadata(
-            full_text="Text",
-            selected_text="Text",
-            source_images=[Path("bottle2.jpg")],
-        )
-        bottle_dicts = [
-            {"name": "Bottle One", "distillery": "Dist A", "msrp": "99.99", "quantity": 1},
-            {"name": "Bottle Two", "distillery": "Dist A", "msrp": "99.99", "quantity": 1},
-        ]
-        metadata_list = [metadata1, metadata2]
-
-        generator = PreviewGenerator()
-        corrections, rejected = generator.interactive_prompt(
-            bottle_dicts, metadata_list
-        )
-
-        assert len(corrections) == 1
-        assert corrections[0]["field_name"] == "grouping"
-        assert corrections[0]["corrected_value"] == "merge_with_1"
-
-    @patch("builtins.input")
-    @patch("builtins.print")
-    def test_interactive_prompt_split(self, mock_print, mock_input):
-        """Test splitting bottles in interactive mode."""
-        mock_input.return_value = "S"
-
-        metadata = ExtractedMetadata(
-            full_text="Text",
-            selected_text="Text",
-            source_images=[Path("bottle1.jpg")],
-        )
-        bottle_dicts = [
-            {"name": "Grouped Bottle", "distillery": "Dist", "msrp": "199.99", "quantity": 2}
-        ]
-        metadata_list = [metadata]
-
-        generator = PreviewGenerator()
-        corrections, rejected = generator.interactive_prompt(
-            bottle_dicts, metadata_list
-        )
-
-        assert len(corrections) == 1
-        assert corrections[0]["field_name"] == "grouping"
-        assert corrections[0]["corrected_value"] == "split"
-
-    @patch("builtins.input")
-    @patch("builtins.print")
-    def test_interactive_prompt_edit(self, mock_print, mock_input):
+    def test_interactive_prompt_edit(self, mock_print, mock_input, tmp_path):
         """Test editing bottle fields in interactive mode."""
         def input_side_effect(*args):
             # First call selects Edit mode
@@ -1178,19 +1012,22 @@ class TestPreviewGeneratorInteractivePrompt:
         ]
         metadata_list = [metadata]
 
-        generator = PreviewGenerator()
+        generator = PreviewGenerator(tmp_path)
         corrections, rejected = generator.interactive_prompt(
             bottle_dicts, metadata_list
         )
 
         assert len(corrections) == 1
+        assert corrections[0]["bottle_id"] == "bottle1"
         assert corrections[0]["field_name"] == "distillery"
         assert corrections[0]["original_value"] == "Old Distillery"
         assert corrections[0]["corrected_value"] == "New Distillery"
+        # The prompt only records the edit; apply_corrections changes the bottle.
+        assert bottle_dicts[0]["distillery"] == "Old Distillery"
 
     @patch("builtins.input")
     @patch("builtins.print")
-    def test_interactive_prompt_quit(self, mock_print, mock_input):
+    def test_interactive_prompt_quit(self, mock_print, mock_input, tmp_path):
         """Test quitting early from interactive mode."""
         mock_input.return_value = "Q"
 
@@ -1206,7 +1043,7 @@ class TestPreviewGeneratorInteractivePrompt:
         ]
         metadata_list = [metadata, metadata, metadata]
 
-        generator = PreviewGenerator()
+        generator = PreviewGenerator(tmp_path)
         corrections, rejected = generator.interactive_prompt(
             bottle_dicts, metadata_list
         )
@@ -1218,11 +1055,11 @@ class TestPreviewGeneratorInteractivePrompt:
 
     @patch("builtins.input")
     @patch("builtins.print")
-    def test_interactive_prompt_invalid_action_treated_as_accept(
-        self, mock_print, mock_input
+    def test_interactive_prompt_invalid_action_asks_again(
+        self, mock_print, mock_input, tmp_path
     ):
-        """Test invalid action is treated as Accept."""
-        mock_input.return_value = "X"  # Invalid choice
+        """An unknown key or a bare Enter is never taken as Accept: the prompt repeats."""
+        mock_input.side_effect = ["X", "", "R"]
 
         metadata = ExtractedMetadata(
             full_text="Text",
@@ -1234,17 +1071,18 @@ class TestPreviewGeneratorInteractivePrompt:
         ]
         metadata_list = [metadata]
 
-        generator = PreviewGenerator()
+        generator = PreviewGenerator(tmp_path)
         corrections, rejected = generator.interactive_prompt(
             bottle_dicts, metadata_list
         )
 
         assert corrections == []
-        assert rejected == []
+        assert rejected == ["bottle1"]
+        assert mock_input.call_count == 3
 
     @patch("builtins.input")
     @patch("builtins.print")
-    def test_interactive_prompt_case_insensitive(self, mock_print, mock_input):
+    def test_interactive_prompt_case_insensitive(self, mock_print, mock_input, tmp_path):
         """Test action is case-insensitive."""
         mock_input.return_value = "a"  # lowercase a
 
@@ -1258,7 +1096,7 @@ class TestPreviewGeneratorInteractivePrompt:
         ]
         metadata_list = [metadata]
 
-        generator = PreviewGenerator()
+        generator = PreviewGenerator(tmp_path)
         corrections, rejected = generator.interactive_prompt(
             bottle_dicts, metadata_list
         )
@@ -1267,143 +1105,41 @@ class TestPreviewGeneratorInteractivePrompt:
         assert rejected == []
 
 
-class TestPreviewGeneratorHandleInteractiveChoice:
-    """Test parsing user interactive choice actions."""
+class TestInteractivePromptActions:
+    """Review offers only A/R/E/Q and shows the confidence recorded for the bottle."""
 
-    def test_handle_choice_accept(self):
-        """Test Accept choice returns None."""
-        generator = PreviewGenerator()
-        result = generator.handle_interactive_choice(
-            choice="A",
-            bottle_dict={"name": "Test"},
-            bottle_id="bottle1",
-            bottle_index=1,
-        )
+    @patch("builtins.input", return_value="A")
+    def test_shows_recorded_confidence_not_a_derived_one(self, mock_input, tmp_path, capsys):
+        bottle = {
+            "bottle_id": "IMG_1", "name": "Stagg", "distillery": "Buffalo Trace", "msrp": "99.99",
+            "proof": "130", "age": "15", "confidence": "LOW",
+        }
+        PreviewGenerator(tmp_path).interactive_prompt([bottle], [ExtractedMetadata(source_images=[Path("IMG_1.jpg")])])
+        out = capsys.readouterr().out
+        assert "Confidence:  LOW" in out
+        assert "[A]ccept | [R]eject | [E]dit | [Q]uit" in out
+        assert "[M]erge" not in out and "[S]plit" not in out
 
-        assert result is None
+    @patch("builtins.input", return_value="A")
+    def test_missing_confidence_is_unknown(self, mock_input, tmp_path, capsys):
+        PreviewGenerator(tmp_path).interactive_prompt([{"name": "X"}], [ExtractedMetadata(source_images=[Path("a.jpg")])])
+        assert "Confidence:  Unknown" in capsys.readouterr().out
 
-    def test_handle_choice_reject(self):
-        """Test Reject choice returns rejection correction."""
-        generator = PreviewGenerator()
-        result = generator.handle_interactive_choice(
-            choice="R",
-            bottle_dict={"name": "Test"},
-            bottle_id="bottle1",
-            bottle_index=1,
-        )
+    @pytest.mark.parametrize("action", ["M", "S"])
+    def test_merge_and_split_are_not_actions(self, action, tmp_path):
+        """M/S are unknown keys: the prompt asks again and records nothing for them."""
+        with patch("builtins.input", side_effect=[action, "A", action, "Q"]) as mock_input, \
+                patch("builtins.print"):
+            corrections, rejected = PreviewGenerator(tmp_path).interactive_prompt(
+                [{"name": "A"}, {"name": "B"}],
+                [ExtractedMetadata(source_images=[Path("a.jpg")]), ExtractedMetadata(source_images=[Path("b.jpg")])],
+            )
+        assert corrections == []
+        assert rejected == []
+        assert mock_input.call_count == 4
 
-        assert result is not None
-        assert result["field_name"] == "grouping"
-        assert result["corrected_value"] == "rejected"
-        assert result["bottle_id"] == "bottle1"
-
-    def test_handle_choice_merge(self):
-        """Test Merge choice returns merge correction."""
-        generator = PreviewGenerator()
-        result = generator.handle_interactive_choice(
-            choice="M",
-            bottle_dict={"name": "Test"},
-            bottle_id="bottle2",
-            bottle_index=2,  # Not first bottle
-        )
-
-        assert result is not None
-        assert result["field_name"] == "grouping"
-        assert result["corrected_value"] == "merge_with_1"
-
-    def test_handle_choice_merge_first_bottle(self):
-        """Test Merge choice on first bottle returns None."""
-        generator = PreviewGenerator()
-        result = generator.handle_interactive_choice(
-            choice="M",
-            bottle_dict={"name": "Test"},
-            bottle_id="bottle1",
-            bottle_index=1,  # First bottle
-        )
-
-        assert result is None
-
-    def test_handle_choice_split(self):
-        """Test Split choice returns split correction."""
-        generator = PreviewGenerator()
-        result = generator.handle_interactive_choice(
-            choice="S",
-            bottle_dict={"name": "Test"},
-            bottle_id="bottle1",
-            bottle_index=1,
-        )
-
-        assert result is not None
-        assert result["field_name"] == "grouping"
-        assert result["corrected_value"] == "split"
-
-    def test_handle_choice_edit(self):
-        """Test Edit choice returns edit mode marker."""
-        generator = PreviewGenerator()
-        result = generator.handle_interactive_choice(
-            choice="E",
-            bottle_dict={"name": "Test"},
-            bottle_id="bottle1",
-            bottle_index=1,
-        )
-
-        assert result is not None
-        assert result["field_name"] == "edit"
-        assert result["corrected_value"] == "enter_edit_mode"
-
-    def test_handle_choice_unknown(self):
-        """Test unknown choice returns None (treated as Accept)."""
-        generator = PreviewGenerator()
-        result = generator.handle_interactive_choice(
-            choice="X",
-            bottle_dict={"name": "Test"},
-            bottle_id="bottle1",
-            bottle_index=1,
-        )
-
-        assert result is None
-
-    def test_handle_choice_whitespace_trimming(self):
-        """Test choice is trimmed of whitespace."""
-        generator = PreviewGenerator()
-        result = generator.handle_interactive_choice(
-            choice="  A  ",  # Whitespace around choice
-            bottle_dict={"name": "Test"},
-            bottle_id="bottle1",
-            bottle_index=1,
-        )
-
-        assert result is None
-
-    def test_handle_choice_case_insensitive(self):
-        """Test choice is case-insensitive."""
-        generator = PreviewGenerator()
-        result = generator.handle_interactive_choice(
-            choice="r",  # lowercase
-            bottle_dict={"name": "Test"},
-            bottle_id="bottle1",
-            bottle_index=1,
-        )
-
-        assert result is not None
-        assert result["corrected_value"] == "rejected"
-
-    def test_handle_choice_includes_timestamp(self):
-        """Test correction includes corrected_at timestamp."""
-        generator = PreviewGenerator()
-        result = generator.handle_interactive_choice(
-            choice="R",
-            bottle_dict={"name": "Test"},
-            bottle_id="bottle1",
-            bottle_index=1,
-        )
-
-        assert result is not None
-        # Just verify timestamp exists and is in ISO format
-        assert "corrected_at" in result
-        assert isinstance(result["corrected_at"], str)
-        # Should parse as ISO format datetime
-        datetime.fromisoformat(result["corrected_at"])
+    def test_handle_interactive_choice_removed(self):
+        assert not hasattr(PreviewGenerator, "handle_interactive_choice")
 
 
 class TestOutputMarkers:

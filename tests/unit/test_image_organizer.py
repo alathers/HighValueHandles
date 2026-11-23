@@ -357,8 +357,8 @@ class TestImageOrganizerGroupByBottle:
         assert len(groups[1]) == 1
         assert img3 in groups[1]
 
-    def test_group_by_bottle_custom_similarity_threshold(self):
-        """Test grouping respects custom similarity threshold."""
+    def test_group_by_bottle_pairs_angle_suffix_names(self):
+        """Untimed photos sharing an angle-suffix base name form one group."""
         img1 = Image(path="/tmp/IMG_1234_front.jpg")
         img1.md5_hash = "hash1"
 
@@ -369,11 +369,9 @@ class TestImageOrganizerGroupByBottle:
         img3.md5_hash = "hash3"
 
         organizer = ImageOrganizer()
-        # Lower threshold groups more aggressively
-        groups = organizer.group_by_bottle([img1, img2, img3], similarity_threshold=0.5)
+        groups = organizer.group_by_bottle([img1, img2, img3])
 
-        # With low threshold, similar filenames should be grouped together
-        # IMG_1234_* should be in one group, IMG_9999_* in another
+        # IMG_1234_front/back pair up; IMG_9999_front is on its own.
         assert len(groups) == 2
 
     def test_group_by_bottle_no_hashes(self):
@@ -511,243 +509,6 @@ class TestImageOrganizerDetectDuplicates:
         assert img3.duplicate_of_id == img1.path
 
 
-class TestImageOrganizerIsDuplicateImage:
-    """Test is_duplicate_image method."""
-
-    def test_is_duplicate_image_same_hash(self):
-        """Test images with same hash are duplicates."""
-        img1 = Image(path="/tmp/img1.jpg")
-        img1.md5_hash = "hash123"
-
-        img2 = Image(path="/tmp/img2.jpg")
-        img2.md5_hash = "hash123"
-
-        organizer = ImageOrganizer()
-        is_dup = organizer.is_duplicate_image(img1, img2)
-
-        assert is_dup is True
-
-    def test_is_duplicate_image_different_hash(self):
-        """Test images with different hashes are not duplicates."""
-        img1 = Image(path="/tmp/img1.jpg")
-        img1.md5_hash = "hash1"
-
-        img2 = Image(path="/tmp/img2.jpg")
-        img2.md5_hash = "hash2"
-
-        organizer = ImageOrganizer()
-        is_dup = organizer.is_duplicate_image(img1, img2)
-
-        assert is_dup is False
-
-    def test_is_duplicate_image_one_no_hash(self):
-        """Test non-duplicate when one image has no hash."""
-        img1 = Image(path="/tmp/img1.jpg")
-        img1.md5_hash = "hash123"
-
-        img2 = Image(path="/tmp/img2.jpg")
-        img2.md5_hash = None
-
-        organizer = ImageOrganizer()
-        is_dup = organizer.is_duplicate_image(img1, img2)
-
-        assert is_dup is False
-
-    def test_is_duplicate_image_both_no_hash(self):
-        """Test non-duplicate when both images have no hash."""
-        img1 = Image(path="/tmp/img1.jpg")
-        img1.md5_hash = None
-
-        img2 = Image(path="/tmp/img2.jpg")
-        img2.md5_hash = None
-
-        organizer = ImageOrganizer()
-        is_dup = organizer.is_duplicate_image(img1, img2)
-
-        assert is_dup is False
-
-
-class TestImageOrganizerFilterDuplicateImages:
-    """Test filter_duplicate_images method."""
-
-    def test_filter_duplicate_images_no_duplicates(self):
-        """Test filtering images with no duplicates."""
-        img1 = Image(path="/tmp/img1.jpg")
-        img1.md5_hash = "hash1"
-
-        img2 = Image(path="/tmp/img2.jpg")
-        img2.md5_hash = "hash2"
-
-        organizer = ImageOrganizer()
-        filtered = organizer.filter_duplicate_images([img1, img2])
-
-        assert len(filtered) == 2
-        assert img1 in filtered
-        assert img2 in filtered
-
-    def test_filter_duplicate_images_removes_duplicates(self):
-        """Test filtering removes duplicate images."""
-        img1 = Image(path="/tmp/original.jpg")
-        img1.md5_hash = "hash_same"
-
-        img2 = Image(path="/tmp/copy1.jpg")
-        img2.md5_hash = "hash_same"
-
-        img3 = Image(path="/tmp/copy2.jpg")
-        img3.md5_hash = "hash_same"
-
-        img4 = Image(path="/tmp/different.jpg")
-        img4.md5_hash = "hash_diff"
-
-        organizer = ImageOrganizer()
-        filtered = organizer.filter_duplicate_images([img1, img2, img3, img4])
-
-        # Should keep one of hash_same and one of hash_diff
-        assert len(filtered) == 2
-
-    def test_filter_duplicate_images_keep_original_true(self):
-        """Test keep_original=True keeps first occurrence."""
-        img1 = Image(path="/tmp/img1.jpg")
-        img1.md5_hash = "hash"
-
-        img2 = Image(path="/tmp/img2.jpg")
-        img2.md5_hash = "hash"
-
-        img3 = Image(path="/tmp/img3.jpg")
-        img3.md5_hash = "hash"
-
-        organizer = ImageOrganizer()
-        filtered = organizer.filter_duplicate_images([img1, img2, img3], keep_original=True)
-
-        assert len(filtered) == 1
-        assert filtered[0] == img1
-
-    def test_filter_duplicate_images_no_hashes(self):
-        """Test filtering keeps images with no hash."""
-        img1 = Image(path="/tmp/img1.jpg")
-        img1.md5_hash = None
-
-        img2 = Image(path="/tmp/img2.jpg")
-        img2.md5_hash = "hash"
-
-        img3 = Image(path="/tmp/img3.jpg")
-        img3.md5_hash = None
-
-        organizer = ImageOrganizer()
-        filtered = organizer.filter_duplicate_images([img1, img2, img3])
-
-        # No hash images are kept
-        assert img1 in filtered
-        assert img2 in filtered
-        assert img3 in filtered
-
-    def test_filter_duplicate_images_empty_list(self):
-        """Test filtering empty list returns empty list."""
-        organizer = ImageOrganizer()
-        filtered = organizer.filter_duplicate_images([])
-
-        assert filtered == []
-
-
-class TestImageOrganizerImagesSimilar:
-    """Test _images_similar method."""
-
-    def test_images_similar_exact_duplicate(self):
-        """Test images are similar if they are duplicates."""
-        img1 = Image(path="/tmp/img1.jpg")
-        img1.md5_hash = "hash123"
-
-        img2 = Image(path="/tmp/img2.jpg")
-        img2.md5_hash = "hash123"
-
-        organizer = ImageOrganizer()
-        similar = organizer._images_similar(img1, img2, 0.8)
-
-        assert similar is True
-
-    def test_images_similar_filename_prefix_common(self):
-        """Test images with common filename prefix are similar."""
-        img1 = Image(path="/tmp/IMG_1234_front.jpg")
-        img1.md5_hash = "hash1"
-
-        img2 = Image(path="/tmp/IMG_1234_back.jpg")
-        img2.md5_hash = "hash2"
-
-        organizer = ImageOrganizer()
-        similar = organizer._images_similar(img1, img2, 0.8)
-
-        assert similar is True
-
-    def test_images_similar_different_names(self):
-        """Test images with different names are not similar."""
-        img1 = Image(path="/tmp/bottle_a.jpg")
-        img1.md5_hash = "hash1"
-
-        img2 = Image(path="/tmp/box_b.jpg")
-        img2.md5_hash = "hash2"
-
-        organizer = ImageOrganizer()
-        similar = organizer._images_similar(img1, img2, 0.8)
-
-        assert similar is False
-
-    def test_images_similar_same_directory(self):
-        """Test images in same directory may be similar."""
-        img1 = Image(path="/tmp/folder/img1.jpg")
-        img1.md5_hash = "hash1"
-
-        img2 = Image(path="/tmp/folder/img2.jpg")
-        img2.md5_hash = "hash2"
-
-        organizer = ImageOrganizer()
-        # Without hash match or name similarity, directory alone may group them
-        similar = organizer._images_similar(img1, img2, 0.8)
-
-        # Implementation may group by directory as fallback
-        assert isinstance(similar, bool)
-
-    def test_images_similar_different_directories(self):
-        """Test images in different directories with different names."""
-        img1 = Image(path="/tmp/folder1/bottle_1.jpg")
-        img1.md5_hash = "hash1"
-
-        img2 = Image(path="/tmp/folder2/bottle_2.jpg")
-        img2.md5_hash = "hash2"
-
-        organizer = ImageOrganizer()
-        similar = organizer._images_similar(img1, img2, 0.8)
-
-        assert similar is False
-
-    def test_images_similar_short_names_less_than_threshold(self):
-        """Test short names below similarity threshold."""
-        img1 = Image(path="/tmp/a.jpg")
-        img1.md5_hash = "hash1"
-
-        img2 = Image(path="/tmp/b.jpg")
-        img2.md5_hash = "hash2"
-
-        organizer = ImageOrganizer()
-        similar = organizer._images_similar(img1, img2, 0.8)
-
-        assert similar is False
-
-    def test_images_similar_no_hashes_check_name_only(self):
-        """Test similarity works without hashes."""
-        img1 = Image(path="/tmp/IMG_9999_1.jpg")
-        img1.md5_hash = None
-
-        img2 = Image(path="/tmp/IMG_9999_2.jpg")
-        img2.md5_hash = None
-
-        organizer = ImageOrganizer()
-        similar = organizer._images_similar(img1, img2, 0.8)
-
-        # A shared name prefix is not evidence of the same bottle (that rule
-        # merged whole IMG_46x0-46x9 decades of different bottles).
-        assert similar is False
-
-
 _T0 = dt.datetime(2026, 11, 7, 16, 0, 0)
 
 
@@ -835,10 +596,9 @@ class TestGroupByCaptureTime:
         assert back.near_duplicate_of is None
         assert first.near_duplicate_of is None
 
-    def test_group_by_bottle_ignores_similarity_threshold(self, tmp_path):
-        images = [_photo(tmp_path / f"IMG_{i}.jpeg", i * 60, text=str(i)) for i in range(3)]
-
-        assert len(ImageOrganizer().group_by_bottle(images, similarity_threshold=0.01)) == 3
+    def test_orb_similarity_helpers_removed(self):
+        for name in ("is_duplicate_image", "_images_similar", "filter_duplicate_images"):
+            assert not hasattr(ImageOrganizer, name)
 
     def test_constructor_gap_and_cap_respected(self, tmp_path):
         images = [_photo(tmp_path / f"IMG_{i}.jpeg", t, text=str(i)) for i, t in enumerate([0, 2, 11, 13])]
