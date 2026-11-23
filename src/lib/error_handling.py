@@ -1,14 +1,13 @@
 """Error handling types and utilities for bourbon image processor.
 
-Defines error types, retry logic, error reporting, and automatic retry management.
+Defines error types and structured error reports. Retries live in :mod:`lib.retry`.
 """
 
 import logging
-import time
 from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 from lib.exceptions import (
     AIModelError,
@@ -91,26 +90,6 @@ class ErrorReport:
             "hint": self.hint,
         }
 
-    @classmethod
-    def from_dict(cls, data: Dict) -> "ErrorReport":
-        """Create ErrorReport from dictionary.
-
-        Args:
-            data: Dictionary representation of error report.
-
-        Returns:
-            ErrorReport instance.
-        """
-        return cls(
-            error_type=ErrorType[data["error_type"]],
-            file_path=Path(data["file_path"]) if data["file_path"] else None,
-            message=data["message"],
-            details=data["details"],
-            timestamp=data.get("timestamp"),
-            retry_count=data.get("retry_count", 0),
-            hint=data.get("hint"),
-        )
-
     def __str__(self) -> str:
         """Human-readable string representation."""
         result = f"[{self.error_type.name}] {self.message}"
@@ -125,8 +104,8 @@ def _classify_bourbon_exception(error: Exception) -> Optional[Tuple[ErrorType, s
     """Classify this package's own exceptions by type, subclasses included.
 
     Uses ``isinstance`` so subclasses (for example the ``Vision*`` errors and
-    ``ModelServerError`` under ``AIModelError``, or ``DuplicateImageError``
-    under ``FileSystemError``) get their parent's category instead of UNKNOWN.
+    ``ModelServerError`` under ``AIModelError``) get their parent's category
+    instead of UNKNOWN.
 
     Args:
         error: Exception to classify.
@@ -166,172 +145,6 @@ def _classify_bourbon_exception(error: Exception) -> Optional[Tuple[ErrorType, s
     if isinstance(error, ValidationError):
         return ErrorType.VALIDATION_ERROR, "Check the input data format or model response schema."
     return None
-
-
-class RetryException(Exception):
-    """Exception thrown when retry fails after all attempts.
-
-    Wraps the original exception with retry context.
-
-    Attributes:
-        original_error: The underlying exception that caused the failure.
-        retry_count: Number of retry attempts made.
-    """
-
-    def __init__(self, message: str, original_error: Exception, retry_count: int):
-        """Initialize retry exception.
-
-        Args:
-            message: Exception message.
-            original_error: Underlying exception.
-            retry_count: Number of retries attempted.
-        """
-        super().__init__(message)
-        self.original_error = original_error
-        self.retry_count = retry_count
-
-
-class RetryManager:
-    """Manage automatic retry logic with exponential backoff.
-
-    Implements configurable retry strategy: max attempts, backoff delays,
-    and error type filtering.
-
-    Attributes:
-        max_attempts: Maximum number of attempts (default: 3).
-        backoff_delays: List of backoff delays in seconds (default: [0, 2, 5]).
-        retry_on: List of error types to retry on (empty = retry all).
-        log_retries: Whether to log retry attempts (default: True).
-    """
-
-    def __init__(
-        self,
-        max_attempts: int = 3,
-        backoff_delays: Optional[List[int]] = None,
-        retry_on: Optional[List[ErrorType]] = None,
-        log_retries: bool = True,
-    ):
-        """Initialize retry manager.
-
-        Args:
-            max_attempts: Maximum number of attempts.
-            backoff_delays: List of backoff delays in seconds.
-            retry_on: Error types to retry on (empty = retry all).
-            log_retries: Whether to log retry attempts.
-        """
-        self.max_attempts = max_attempts
-        self.backoff_delays = backoff_delays or [0, 2, 5]
-        self.retry_on = retry_on or []
-        self.log_retries = log_retries
-
-    def should_retry(self, error: Exception) -> bool:
-        """Determine if error should trigger retry.
-
-        Args:
-            error: Exception that occurred.
-
-        Returns:
-            True if error should be retried, False otherwise.
-        """
-        if not self.retry_on:
-            # No filter configured, retry all errors
-            return True
-
-        # Check if error matches any configured error type
-        error_type = self._classify_error(error)
-        return error_type in self.retry_on
-
-    def _classify_error(self, error: Exception) -> ErrorType:
-        """Classify exception into ErrorType category.
-
-        Args:
-            error: Exception to classify.
-
-        Returns:
-            Classified ErrorType.
-        """
-        # The package's own exceptions first (subclasses included)
-        classified = _classify_bourbon_exception(error)
-        if classified is not None:
-            return classified[0]
-        # Check for common exception types
-        error_name = type(error).__name__
-
-        if error_name in (
-            "UnidentifiedImageError",
-            "PIL.UnidentifiedImageError",
-            "cv2.error",
-            "OSError",
-        ):
-            return ErrorType.IMAGE_PROCESSING
-        elif "tesseract" in error_name.lower() or "pytesseract" in error_name.lower():
-            return ErrorType.OCR_FAILURE
-        elif "requests" in error.__class__.__module__ or error_name == "ConnectionError":
-            return ErrorType.NETWORK_ERROR
-        elif error_name in ("ValueError", "KeyError", "json.JSONDecodeError"):
-            return ErrorType.VALIDATION_ERROR
-        elif error_name in ("FileNotFoundError", "PermissionError"):
-            return ErrorType.FILESYSTEM_ERROR
-        else:
-            return ErrorType.UNKNOWN
-
-    def execute_with_retry(
-        self,
-        func,
-        *args,
-        error_context: Optional[str] = None,
-        **kwargs,
-    ):
-        """Execute function with automatic retry on failure.
-
-        Args:
-            func: Function to execute.
-            *args: Positional arguments to pass to func.
-            error_context: Context string for error messages.
-            **kwargs: Keyword arguments to pass to func.
-
-        Returns:
-            Function return value.
-
-        Raises:
-            RetryException: If all retry attempts fail.
-        """
-        last_error = None
-        retry_count = 0
-
-        for attempt in range(self.max_attempts):
-            try:
-                return func(*args, **kwargs)
-
-            except Exception as e:
-                last_error = e
-                retry_count = attempt
-
-                if attempt < self.max_attempts - 1 and self.should_retry(e):
-                    # Retry this error
-                    if self.log_retries:
-                        logger.warning(
-                            f"Attempt {attempt + 1}/{self.max_attempts} failed: {e}. Retrying..."
-                        )
-
-                    backoff = self.backoff_delays[min(attempt, len(self.backoff_delays) - 1)]
-                    if backoff > 0:
-                        time.sleep(backoff)
-                else:
-                    # Don't retry or max attempts reached
-                    error_type = self._classify_error(e)
-                    raise RetryException(
-                        f"Failed after {retry_count + 1} attempt(s): {e} ({error_context})",
-                        e,
-                        retry_count,
-                    ) from e
-
-        # Should not reach here, but handle edge case
-        raise RetryException(
-            f"Failed after {self.max_attempts} attempts: {last_error} ({error_context})",
-            last_error,
-            self.max_attempts - 1,
-        )
 
 
 def create_error_report(
@@ -400,41 +213,3 @@ def create_error_report(
         timestamp=datetime.now(UTC).isoformat(),
         hint=hint,
     )
-
-
-def save_error_reports(reports: List[ErrorReport], output_path: Path) -> None:
-    """Save error reports to JSON file.
-
-    Args:
-        reports: List of error reports.
-        output_path: Output file path (JSON format).
-    """
-    import json
-
-    data = [report.to_dict() for report in reports]
-
-    with open(output_path, "w") as f:
-        json.dump(data, f, indent=2)
-
-    logger.info(f"Saved {len(reports)} error report(s) to {output_path}")
-
-
-def load_error_reports(input_path: Path) -> List[ErrorReport]:
-    """Load error reports from JSON file.
-
-    Args:
-        input_path: Input file path (JSON format).
-
-    Returns:
-        List of error reports.
-
-    Raises:
-        FileNotFoundError: If file not found.
-        json.JSONDecodeError: If file is invalid JSON.
-    """
-    import json
-
-    with open(input_path) as f:
-        data = json.load(f)
-
-    return [ErrorReport.from_dict(item) for item in data]

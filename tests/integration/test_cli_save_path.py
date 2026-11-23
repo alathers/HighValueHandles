@@ -20,8 +20,8 @@ from cli import commands
 from models.bottle import Bottle, ExtractedMetadata
 
 LABELS = {
-    "evan": dict(name="Evan Williams Black Label", distillery="Heaven Hill", msrp="15.99", proof="86 Proof"),
-    "weller": dict(name="Weller Special Reserve", distillery="Buffalo Trace", msrp="$29.99", proof="90 Proof"),
+    "evan": dict(name="Evan Williams Black Label", distillery="Heaven Hill", label_price="15.99", proof="86 Proof"),
+    "weller": dict(name="Weller Special Reserve", distillery="Buffalo Trace", label_price="29.99", proof="90 Proof"),
 }
 
 
@@ -55,7 +55,7 @@ def photos(tmp_path):
     return d
 
 
-def _fake_vision(self, image_paths, ocr_text="", model=None):
+def _fake_vision(self, image_paths, ocr_text="", model=None, **_kwargs):
     """Stand-in for BottleAnalyzer.analyze_with_vision_model.
 
     Lists only the photos it was given (as the real method does), so the
@@ -74,9 +74,9 @@ def _run(argv, vision=_fake_vision, user_input=None):
     """Run ``main(argv)`` with server, OCR and vision mocked; return (rc, vision calls)."""
     calls: list[list[Path]] = []
 
-    def spy(self, image_paths, ocr_text="", model=None):
+    def spy(self, image_paths, ocr_text="", model=None, **kwargs):
         calls.append([Path(p) for p in image_paths])
-        return vision(self, image_paths, ocr_text, model)
+        return vision(self, image_paths, ocr_text, model, **kwargs)
 
     manager = MagicMock()
     with patch.object(commands, "pre_flight_checks", return_value=0), \
@@ -111,7 +111,9 @@ def test_end_to_end_writes_complete_bottle_folders(photos):
 
     data = json.loads((evan / "evan_williams_black_label.json").read_text())
     assert data["name"] == "Evan Williams Black Label"
-    assert data["msrp"] == "15.99"
+    assert data["msrp"] is None  # a price seen on the photo is never an MSRP
+    assert data["metadata"]["label_price"] == "15.99"
+    assert data["metadata"]["vision_attempts"] == 1
     assert len(data["metadata"]["source_images"]) == 2
     assert sorted(data["images"]) == ["images/evan_back.jpg", "images/evan_front.jpg"]
     assert data["confidence"] == "HIGH"
@@ -125,10 +127,11 @@ def test_end_to_end_writes_complete_bottle_folders(photos):
     assert "images/evan_back.jpg" in md
 
     weller = json.loads((out / "weller_special_reserve" / "weller_special_reserve.json").read_text())
-    assert weller["msrp"] == "29.99"
+    assert weller["msrp"] is None
+    assert weller["metadata"]["label_price"] == "29.99"
     assert weller["quantity"]["count"] == 2
-    assert weller["quantity"]["price"] == "29.99"
-    assert weller["total_value"] == "59.98"
+    assert weller["quantity"]["price"] is None  # unknown until a verified MSRP exists
+    assert weller["total_value"] is None
 
     # One preview (markdown + JSON) per batch
     assert len(list(out.glob("batch_*_preview.md"))) == 2
@@ -197,7 +200,7 @@ def test_analysis_failure_writes_retryable_report(photos, tmp_path):
 
     out = tmp_path / "out"
 
-    def vision(self, image_paths, ocr_text="", model=None):
+    def vision(self, image_paths, ocr_text="", model=None, **_kwargs):
         if Path(image_paths[0]).name.startswith("weller"):
             raise VisionResponseError("model returned no content")
         return _fake_vision(self, image_paths, ocr_text, model)
@@ -253,7 +256,7 @@ def test_same_file_names_in_two_folders_get_distinct_ids(tmp_path):
         _jpeg(root / sub / "IMG_1.jpg", color)
     out = tmp_path / "out"
 
-    def vision(self, image_paths, ocr_text="", model=None):
+    def vision(self, image_paths, ocr_text="", model=None, **_kwargs):
         from lib.exceptions import VisionResponseError
 
         if Path(image_paths[0]).parent.name == "b":
@@ -269,7 +272,7 @@ def test_same_file_names_in_two_folders_get_distinct_ids(tmp_path):
 
 
 def test_every_group_processed_once_with_small_batches(photos, tmp_path):
-    """No lookahead: each group is analyzed exactly once, in its own batch."""
+    """Each group is analyzed exactly once, in its own batch."""
     out = tmp_path / "out"
 
     rc, calls = _run(["process", "-f", str(photos), "-o", str(out), "-b", "1"])
@@ -279,20 +282,7 @@ def test_every_group_processed_once_with_small_batches(photos, tmp_path):
     assert len(_bottle_dirs(out)) == 2
 
 
-def test_deprecated_lookahead_is_accepted_and_ignored(photos, tmp_path, caplog):
-    out = tmp_path / "out"
-
-    with caplog.at_level("WARNING", logger="cli.commands"):
-        args = commands.parse_args(["process", "-f", str(photos), "-o", str(out), "--lookahead", "5", "--dry-run"])
-        commands.pre_flight_checks(args)  # may fail later (no server); the warning comes first
-    assert commands.LOOKAHEAD_DEPRECATION_WARNING in caplog.text
-
-    rc, calls = _run(["process", "-f", str(photos), "-o", str(out), "-b", "1", "--lookahead", "5"])
-    assert rc == 0
-    assert len(calls) == 2
-
-
-STAGG = dict(name="George T. Stagg", distillery="Buffalo Trace", msrp="99.99", proof="135.4 Proof")
+STAGG = dict(name="George T. Stagg", distillery="Buffalo Trace", label_price="99.99", proof="135.4 Proof")
 
 
 def _exif_jpeg(path: Path, seconds: float, stripes: int) -> None:
@@ -323,7 +313,7 @@ def stagg_photos(tmp_path):
     return d
 
 
-def _stagg_vision(self, image_paths, ocr_text="", model=None):
+def _stagg_vision(self, image_paths, ocr_text="", model=None, **_kwargs):
     """23A on photos 1-2, 23C on photo 3; reports a mixed group when both are sent."""
     names = {Path(p).name for p in image_paths}
     batches = {"23C" if n == "IMG_0003.jpg" else "23A" for n in names}
@@ -343,11 +333,10 @@ def test_mixed_group_is_split_into_separate_bottles(stagg_photos, tmp_path):
     rc, calls = _run(["process", "-f", str(stagg_photos), "-o", str(out), "-b", "5"], vision=_stagg_vision)
 
     assert rc == 0
-    assert [sorted(p.name for p in call) for call in calls] == [
-        ["IMG_0001.jpg", "IMG_0002.jpg", "IMG_0003.jpg"],  # the group
-        ["IMG_0001.jpg", "IMG_0002.jpg"],  # left half
-        ["IMG_0003.jpg"],  # right half
-    ]
+    named = [sorted(p.name for p in call) for call in calls]
+    assert named[0] == ["IMG_0001.jpg", "IMG_0002.jpg", "IMG_0003.jpg"]  # the group
+    # The halves run in parallel (default --concurrency 2), so their order may vary.
+    assert sorted(named[1:]) == [["IMG_0001.jpg", "IMG_0002.jpg"], ["IMG_0003.jpg"]]
     folders = _bottle_dirs(out)
     assert len(folders) == 2
     saved = {}
@@ -380,7 +369,7 @@ def test_mixed_group_false_alarm_stays_one_bottle(stagg_photos, tmp_path):
     """Halves that read as the same bottle (batch visible on one side only) are kept together."""
     out = tmp_path / "out"
 
-    def vision(self, image_paths, ocr_text="", model=None):
+    def vision(self, image_paths, ocr_text="", model=None, **_kwargs):
         names = {Path(p).name for p in image_paths}
         return ExtractedMetadata(
             source_images=[str(p) for p in image_paths], vision_model=model,
@@ -412,8 +401,14 @@ def test_split_check_can_be_turned_off(stagg_photos, tmp_path):
     assert len(_bottle_dirs(out)) == 1
 
 
+def _ctx(argv):
+    from lib.settings import resolve_settings
+
+    return commands.RunContext(resolve_settings(commands.parse_args(argv)))
+
+
 def test_output_dir_equal_to_input_folder_is_rejected(photos):
-    args = commands.parse_args(["process", "-f", str(photos), "-o", str(photos), "--dry-run"])
+    args = _ctx(["process", "-f", str(photos), "-o", str(photos), "--dry-run"])
 
     assert commands.pre_flight_checks(args) == 1
     assert not (photos / ".bourbon_output").exists()
@@ -423,7 +418,7 @@ def test_output_dir_differing_only_in_case_is_rejected(photos, tmp_path):
     """On case-insensitive filesystems (macOS default) -f Photos -o photos is the same dir."""
     if not (tmp_path / "PHOTOS").exists():
         pytest.skip("filesystem is case-sensitive")
-    args = commands.parse_args(["process", "-f", str(photos), "-o", str(tmp_path / "PHOTOS"), "--dry-run"])
+    args = _ctx(["process", "-f", str(photos), "-o", str(tmp_path / "PHOTOS"), "--dry-run"])
 
     assert commands.pre_flight_checks(args) == 1
 
@@ -455,9 +450,10 @@ def _feedback(out, batch_json, corrections, tmp_path):
 
 def test_feedback_resaves_only_corrected_bottles(photos, tmp_path):
     out = tmp_path / "out"
-    batch_json, _ = _single_batch_run(photos, out)
+    batch_json, ids = _single_batch_run(photos, out)
 
     rc = _feedback(out, batch_json, [{
+        "bottle_id": ids["Evan Williams Black Label"],
         "field_name": "proof", "original_value": "86 Proof", "corrected_value": "90 Proof",
     }], tmp_path)
 
@@ -468,6 +464,42 @@ def test_feedback_resaves_only_corrected_bottles(photos, tmp_path):
     resaved = json.loads((out / "evan_williams_black_label_2" / "evan_williams_black_label_2.json").read_text())
     assert resaved["proof"] == "90 Proof"
     assert [c["corrected_value"] for c in resaved["corrections"]] == ["90 Proof"]
+    assert resaved["corrections"][0]["bottle_id"] == ids["Evan Williams Black Label"]
+    assert resaved["corrections"][0]["source"].startswith("feedback:")
+
+
+def test_feedback_on_a_pre_rename_batch_never_publishes_the_photo_price_as_msrp(photos, tmp_path):
+    """Older batch files stored the photo price as msrp; a resave keeps it only as label_price."""
+    out = tmp_path / "out"
+    batch_json, ids = _single_batch_run(photos, out)
+    data = json.loads(batch_json.read_text())
+    for bottle in data["bottles"]:
+        bottle.pop("label_price", None)
+        bottle["msrp"] = "24.99"  # the old format: a price tag read from the photo
+    batch_json.write_text(json.dumps(data))
+
+    rc = _feedback(out, batch_json, [{
+        "bottle_id": ids["Evan Williams Black Label"],
+        "field_name": "proof", "original_value": "86 Proof", "corrected_value": "90 Proof",
+    }], tmp_path)
+
+    assert rc == 0
+    resaved = json.loads((out / "evan_williams_black_label_2" / "evan_williams_black_label_2.json").read_text())
+    assert resaved["proof"] == "90 Proof"
+    assert resaved["msrp"] is None
+
+
+def test_legacy_label_price_upgrade_keeps_a_human_msrp():
+    legacy = {"bottle_id": "A", "msrp": "24.99"}
+    corrected = {
+        "bottle_id": "B", "msrp": "59.99",
+        "corrections": [{"field_name": "msrp", "original_value": "", "corrected_value": "59.99"}],
+    }
+    current = {"bottle_id": "C", "msrp": None, "label_price": "19.99"}
+    commands._upgrade_legacy_label_price([legacy, corrected, current])
+    assert (legacy["msrp"], legacy["label_price"]) == (None, "24.99")
+    assert (corrected["msrp"], corrected["label_price"]) == ("59.99", None)
+    assert (current["msrp"], current["label_price"]) == (None, "19.99")
 
 
 def test_feedback_skips_bottles_rejected_in_the_batch(photos, tmp_path):
@@ -478,11 +510,234 @@ def test_feedback_skips_bottles_rejected_in_the_batch(photos, tmp_path):
     batch_json.write_text(json.dumps(data))
 
     rc = _feedback(out, batch_json, [
-        {"field_name": "proof", "original_value": "86 Proof", "corrected_value": "80 Proof"},
-        {"field_name": "proof", "original_value": "90 Proof", "corrected_value": "107 Proof"},
+        {"bottle_id": ids["Evan Williams Black Label"],
+         "field_name": "proof", "original_value": "86 Proof", "corrected_value": "80 Proof"},
+        {"bottle_id": ids["Weller Special Reserve"],
+         "field_name": "proof", "original_value": "90 Proof", "corrected_value": "107 Proof"},
     ], tmp_path)
 
     assert rc == 0
     assert [p.name for p in _bottle_dirs(out)] == [
         "evan_williams_black_label", "evan_williams_black_label_2", "weller_special_reserve",
     ]
+
+
+def test_feedback_never_retargets_a_correction(photos, tmp_path):
+    """Unknown bottle_id or a stale original value: nothing changes, exit 1."""
+    out = tmp_path / "out"
+    batch_json, ids = _single_batch_run(photos, out)
+    before = sorted(p.name for p in _bottle_dirs(out))
+
+    rc = _feedback(out, batch_json, [
+        # The value matches Evan Williams, but the ID names no bottle: never applied to Evan.
+        {"bottle_id": "IMG_9999", "field_name": "proof", "original_value": "86 Proof", "corrected_value": "80 Proof"},
+        # Right bottle, wrong old value (Weller reads 90 Proof).
+        {"bottle_id": ids["Weller Special Reserve"],
+         "field_name": "proof", "original_value": "86 Proof", "corrected_value": "80 Proof"},
+    ], tmp_path)
+
+    assert rc == 1
+    assert sorted(p.name for p in _bottle_dirs(out)) == before  # nothing resaved
+
+
+def test_feedback_corrections_without_bottle_id_are_refused(photos, tmp_path):
+    out = tmp_path / "out"
+    batch_json, _ = _single_batch_run(photos, out)
+
+    rc = _feedback(out, batch_json, [
+        {"field_name": "proof", "original_value": "86 Proof", "corrected_value": "90 Proof"},
+    ], tmp_path)
+
+    assert rc == 1
+
+
+def test_feedback_correction_of_unknown_field_is_refused(photos, tmp_path):
+    """A misspelled field never "applies": nothing is resaved and the run exits 1."""
+    out = tmp_path / "out"
+    batch_json, ids = _single_batch_run(photos, out)
+    before = sorted(p.name for p in _bottle_dirs(out))
+
+    rc = _feedback(out, batch_json, [{
+        "bottle_id": ids["Evan Williams Black Label"],
+        "field_name": "prof", "original_value": "", "corrected_value": "90 Proof",
+    }], tmp_path)
+
+    assert rc == 1
+    assert sorted(p.name for p in _bottle_dirs(out)) == before
+
+
+def test_feedback_null_corrected_value_is_refused(photos, tmp_path):
+    """A null corrected_value must not be written as the text "None"."""
+    out = tmp_path / "out"
+    batch_json, ids = _single_batch_run(photos, out)
+    before = sorted(p.name for p in _bottle_dirs(out))
+
+    rc = _feedback(out, batch_json, [{
+        "bottle_id": ids["Evan Williams Black Label"],
+        "field_name": "name", "original_value": "Evan Williams Black Label", "corrected_value": None,
+    }], tmp_path)
+
+    assert rc == 1
+    assert sorted(p.name for p in _bottle_dirs(out)) == before
+
+
+def test_feedback_exits_1_when_a_corrected_bottle_cannot_be_saved(photos, tmp_path):
+    """An applied correction that reaches no output folder is not a success."""
+    from image_processor.preview_generator import PreviewGenerator
+
+    out = tmp_path / "out"
+    batch_json, ids = _single_batch_run(photos, out)
+
+    with patch.object(PreviewGenerator, "save_bottle_files", side_effect=OSError("disk full")):
+        rc = _feedback(out, batch_json, [{
+            "bottle_id": ids["Evan Williams Black Label"],
+            "field_name": "proof", "original_value": "86 Proof", "corrected_value": "90 Proof",
+        }], tmp_path)
+
+    assert rc == 1
+
+
+def test_interactive_edit_lands_on_the_reviewed_bottle(photos, tmp_path):
+    """[E]dit on the second bottle changes only that bottle and records its bottle_id."""
+    out = tmp_path / "out"
+
+    rc, _ = _run(
+        ["process", "-f", str(photos), "-o", str(out), "-b", "all", "--interactive"],
+        # Bottle 1: accept. Bottle 2: edit distillery only (name, distillery, msrp, proof, age, release).
+        user_input=["A", "E", "", "Edited Distillery", "", "", "", ""],
+    )
+
+    assert rc == 0
+    saved = [
+        json.loads(next(d.glob("*.json")).read_text()) for d in _bottle_dirs(out)
+    ]
+    edited = [b for b in saved if b["distillery"] == "Edited Distillery"]
+    untouched = [b for b in saved if b["distillery"] != "Edited Distillery"]
+    assert len(edited) == 1 and len(untouched) == 1
+    assert "corrections" not in untouched[0]
+    (correction,) = edited[0]["corrections"]
+    assert correction["source"] == "interactive"
+    assert correction["field_name"] == "distillery"
+    assert Path(edited[0]["source_images"][0]).stem in correction["bottle_id"]
+
+
+
+def _strip_volatile(value):
+    """Drop timestamps (they differ between runs) from saved JSON."""
+    if isinstance(value, dict):
+        return {k: _strip_volatile(v) for k, v in value.items() if not k.endswith("_at") and k != "timestamp"}
+    if isinstance(value, list):
+        return [_strip_volatile(v) for v in value]
+    return value
+
+
+def _saved(out: Path) -> dict:
+    return {
+        d.name: _strip_volatile(json.loads((d / f"{d.name}.json").read_text()))
+        for d in _bottle_dirs(out)
+    }
+
+
+def test_concurrency_3_matches_concurrency_1_in_process(photos, stagg_photos, tmp_path):
+    """process_command with --concurrency 3 saves the same folders and JSON as a sequential run."""
+    from tests.helpers import make_settings
+
+    for sub in stagg_photos.iterdir():  # one shoot: two plain bottles and a mixed group to split
+        shutil.copy2(sub, photos / sub.name)
+    labels = {**LABELS}
+
+    def vision(self, image_paths, ocr_text="", model=None, **kwargs):
+        if Path(image_paths[0]).name.startswith("IMG_"):
+            return _stagg_vision(self, image_paths, ocr_text, model)
+        return _fake_vision(self, image_paths, ocr_text, model)
+
+    results = {}
+    for concurrency in (1, 3):
+        out = tmp_path / f"out{concurrency}"
+        settings = make_settings(image_folder=photos, output_dir=out, concurrency=concurrency, batch_size=5)
+        manager = MagicMock()
+        with patch.object(commands, "pre_flight_checks", return_value=0), \
+                patch.object(commands, "build_server_manager", return_value=manager), \
+                patch("image_processor.text_extractor.TextExtractor.extract_with_retry",
+                      lambda self, p, **k: f"OCR {Path(p).name}"), \
+                patch("image_processor.bottle_analyzer.BottleAnalyzer.analyze_with_vision_model", vision):
+            assert commands.process_command(settings) == 0
+        results[concurrency] = out
+    assert labels == LABELS
+
+    one, three = _saved(results[1]), _saved(results[3])
+    assert sorted(one) == sorted(three)
+    assert len(one) == 4  # evan, weller, and the split Stagg group
+    assert one == three
+    for out in results.values():
+        (manifest,) = out.glob("run_*_settings.json")
+        data = json.loads(manifest.read_text())
+        assert data["values"]["processing.concurrency"] in (1, 3)
+        assert data["models"]["vision"] == commands.DEFAULT_VISION_MODEL
+
+
+def test_run_manifest_records_settings_without_keys(photos, tmp_path, monkeypatch):
+    monkeypatch.setenv("BRAVE_API_KEY", "sekrit-brave-999")
+    out = tmp_path / "out"
+    rc, _ = _run(["process", "-f", str(photos), "-o", str(out), "-b", "all", "--concurrency", "1"])
+    assert rc == 0
+    (manifest,) = out.glob("run_*_settings.json")
+    text = manifest.read_text()
+    assert "sekrit-brave-999" not in text
+    data = json.loads(text)
+    assert data["run_id"] in manifest.name
+    assert data["sources"]["processing.concurrency"] == "cli:--concurrency"
+    assert data["sources"]["processing.batch_size"] == "cli:-b/--batch-size"
+    assert data["web_provider"]["resolved"] == "brave"
+    assert data["models"] == {"vision": commands.DEFAULT_VISION_MODEL, "text": "gpt-oss:120b"}
+    assert data["tool_version"]
+
+
+def test_hints_file_applies_sourced_values_and_warns_on_unused_keys(photos, tmp_path, caplog):
+    out = tmp_path / "out"
+    batch_json, ids = _single_batch_run(photos, tmp_path / "first")
+    evan_id = ids["Evan Williams Black Label"]
+    hints = tmp_path / "hints.toml"
+    hints.write_text(
+        f'[bottle.{evan_id}]\nnote = "Proof is on the back label."\nsource = "Owner checked, 2026-11-20"\n'
+        f'[bottle.{evan_id}.fields]\nproof = 90\n\n[bottle.IMG_9999]\nnote = "typo"\n'
+    )
+    notes = {}
+
+    def vision(self, image_paths, ocr_text="", model=None, reviewer_note="", **_kwargs):
+        notes[Path(image_paths[0]).name.split("_")[0]] = reviewer_note
+        return _fake_vision(self, image_paths, ocr_text, model)
+
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        rc, _ = _run(["process", "-f", str(photos), "-o", str(out), "-b", "all", "--hints", str(hints)], vision=vision)
+
+    assert rc == 0
+    assert notes == {"evan": "Proof is on the back label.", "weller": ""}
+    evan = json.loads((out / "evan_williams_black_label" / "evan_williams_black_label.json").read_text())
+    assert evan["proof"] == "90 Proof"
+    (correction,) = evan["corrections"]
+    assert correction["source"] == f"hint:hints.toml#{evan_id}: Owner checked, 2026-11-20"
+    assert correction["original_value"] == "86 Proof"
+    assert "hint overrides label read for proof: label '86 Proof', hint '90 Proof'" in evan["metadata"]["warnings"]
+    assert "Hint for bottle IMG_9999 matched no bottle in this run" in caplog.text
+
+
+def test_bad_hints_file_exits_1_before_any_vision_call(photos, tmp_path):
+    hints = tmp_path / "hints.toml"
+    hints.write_text('[bottle.x]\n[bottle.x.fields]\nbatch_number = "C1"\n')  # no source
+    out = tmp_path / "out"
+    calls = []
+
+    def vision(self, image_paths, ocr_text="", model=None, **_kwargs):
+        calls.append(image_paths)
+        return _fake_vision(self, image_paths, ocr_text, model)
+
+    with patch.object(commands, "build_server_manager") as build, \
+            patch("pytesseract.get_tesseract_version", return_value="5.0"), \
+            patch("image_processor.bottle_analyzer.BottleAnalyzer.analyze_with_vision_model", vision):
+        rc = commands.main(["process", "-f", str(photos), "-o", str(out), "--hints", str(hints)])
+    assert rc == 1
+    assert calls == []
+    build.assert_not_called()

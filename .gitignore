@@ -15,7 +15,7 @@ venv/
 
 # Project-specific
 processed/
-.specify_config.toml
+bourbon.toml
 hints.md
 .pytest_cache/
 .coverage

@@ -11,7 +11,7 @@ import io
 import shutil
 import time
 from pathlib import Path
-from unittest.mock import ANY, Mock, patch
+from unittest.mock import patch
 
 import numpy as np
 import pytesseract
@@ -23,20 +23,19 @@ from image_processor.text_extractor import (
     ExtractedText,
     OCRWord,
     TextExtractor,
-    clean_ocr_text,
     is_plausible_token,
     load_image,
     normalize_token,
     resize_long_edge,
     strong_score,
 )
-from lib.error_handling import RetryException, RetryManager
 from lib.exceptions import (
     ConfigurationError,
     ImageProcessingError,
     OCRError,
     RetryExhaustedError,
 )
+from lib.retry import RetryPolicy
 
 
 def _scalable_default_font() -> bool:
@@ -82,51 +81,32 @@ def _render(
 
 
 class TestRetryWiring:
-    """extract_with_retry must go through RetryManager.execute_with_retry."""
+    """extract_with_retry runs extract under lib.retry with an OCR-only policy (sleep injected)."""
 
-    def test_extract_with_retry_uses_execute_with_retry(self):
-        """Regression for the RetryManager.retry() AttributeError."""
-        rm = Mock(spec=RetryManager)  # spec: .retry would raise AttributeError
-        rm.execute_with_retry.return_value = _result("BOURBON")
-        ext = TextExtractor(rm)
+    @staticmethod
+    def _extractor(policy=None):
+        sleeps: list[float] = []
+        return TextExtractor(policy, sleep=sleeps.append), sleeps
 
-        assert ext.extract_with_retry(Path("a.jpg")) == "BOURBON"
-        rm.execute_with_retry.assert_called_once_with(
-            ext.extract,
-            Path("a.jpg"),
-            detect_rotation=True,
-            select_regions=True,
-            error_context=ANY,
-        )
+    def test_extract_with_retry_calls_extract(self):
+        ext, _ = self._extractor()
+        with patch.object(ext, "extract", return_value=_result("BOURBON")) as extract:
+            assert ext.extract_with_retry(Path("a.jpg")) == "BOURBON"
+        extract.assert_called_once_with(Path("a.jpg"), detect_rotation=True, select_regions=True)
 
     def test_orientation_corrected_disables_rotation(self):
-        rm = Mock(spec=RetryManager)
-        rm.execute_with_retry.return_value = _result()
-        ext = TextExtractor(rm)
-
-        ext.extract_with_retry(Path("a.jpg"), orientation_corrected=True, select_regions=False)
-
-        _, kwargs = rm.execute_with_retry.call_args
+        ext, _ = self._extractor()
+        with patch.object(ext, "extract", return_value=_result()) as extract:
+            ext.extract_with_retry(Path("a.jpg"), orientation_corrected=True, select_regions=False)
+        _, kwargs = extract.call_args
         assert kwargs["detect_rotation"] is False
         assert kwargs["select_regions"] is False
 
     def test_extract_detailed_with_retry_returns_extracted_text(self):
-        rm = Mock(spec=RetryManager)
+        ext, _ = self._extractor()
         result = _result("KENTUCKY")
-        rm.execute_with_retry.return_value = result
-
-        assert TextExtractor(rm).extract_detailed_with_retry("a.jpg") is result
-
-    def test_retry_exception_becomes_retry_exhausted(self):
-        rm = Mock(spec=RetryManager)
-        rm.execute_with_retry.side_effect = RetryException("x", OCRError("boom"), 1)
-
-        with pytest.raises(RetryExhaustedError) as excinfo:
-            TextExtractor(rm).extract_with_retry(Path("a.jpg"))
-
-        assert isinstance(excinfo.value.original_error, OCRError)
-        assert excinfo.value.retry_count == 1
-        assert "2 attempt(s)" in excinfo.value.message
+        with patch.object(ext, "extract", return_value=result):
+            assert ext.extract_detailed_with_retry("a.jpg") is result
 
     @pytest.mark.parametrize(
         "error",
@@ -136,52 +116,49 @@ class TestRetryWiring:
             ConfigurationError("no tess"),
         ],
     )
-    def test_file_errors_not_wrapped(self, error):
-        rm = Mock(spec=RetryManager)
-        rm.execute_with_retry.side_effect = RetryException("x", error, 0)
-
-        with pytest.raises(type(error)) as excinfo:
-            TextExtractor(rm).extract_with_retry(Path("a.jpg"))
+    def test_deterministic_errors_not_retried_or_wrapped(self, error):
+        ext, sleeps = self._extractor()
+        with patch.object(ext, "extract", side_effect=error) as extract, pytest.raises(type(error)) as excinfo:
+            ext.extract_with_retry(Path("a.jpg"))
         assert excinfo.value is error
-
-    def test_default_policy_does_not_retry_image_errors(self):
-        ext = TextExtractor()
-        with (
-            patch.object(ext, "extract", side_effect=ImageProcessingError("bad")) as extract,
-            patch("lib.error_handling.time.sleep") as sleep,
-            pytest.raises(ImageProcessingError),
-        ):
-            ext.extract_with_retry(Path("a.jpg"))
         assert extract.call_count == 1
-        sleep.assert_not_called()
-
-    def test_default_policy_does_not_retry_missing_tesseract(self):
-        ext = TextExtractor()
-        with (
-            patch.object(ext, "extract", side_effect=ConfigurationError("no tess")) as extract,
-            pytest.raises(ConfigurationError),
-        ):
-            ext.extract_with_retry(Path("a.jpg"))
-        assert extract.call_count == 1
+        assert sleeps == []
 
     def test_default_policy_retries_ocr_errors_once(self):
-        ext = TextExtractor()
+        ext, sleeps = self._extractor()
         with (
             patch.object(ext, "extract", side_effect=OCRError("t")) as extract,
-            patch("lib.error_handling.time.sleep") as sleep,
-            pytest.raises(RetryExhaustedError),
+            pytest.raises(RetryExhaustedError) as excinfo,
         ):
             ext.extract_with_retry(Path("a.jpg"))
         assert extract.call_count == 2
-        sleep.assert_called_once_with(1)
+        assert len(sleeps) == 1 and 0.5 <= sleeps[0] <= 1.0  # 1 s with jitter
+        assert isinstance(excinfo.value.original_error, OCRError)
+        assert excinfo.value.retry_count == 1
+        assert "2 attempt(s)" in excinfo.value.message
+
+    def test_ocr_keeps_two_attempts_whatever_the_vision_attempts(self):
+        ext, _ = self._extractor(RetryPolicy(max_attempts=5))
+        with patch.object(ext, "extract", side_effect=OCRError("t")) as extract, pytest.raises(RetryExhaustedError):
+            ext.extract_with_retry(Path("a.jpg"))
+        assert extract.call_count == 2
+
+    def test_no_retry_gives_one_ocr_attempt(self):
+        ext, sleeps = self._extractor(RetryPolicy.DISABLED)
+        with (
+            patch.object(ext, "extract", side_effect=OCRError("t")) as extract,
+            pytest.raises(RetryExhaustedError) as excinfo,
+        ):
+            ext.extract_with_retry(Path("a.jpg"))
+        assert extract.call_count == 1
+        assert sleeps == []
+        assert excinfo.value.retry_count == 0
 
     def test_default_policy_recovers_after_transient_failure(self):
-        ext = TextExtractor()
-        with (
-            patch.object(ext, "extract", side_effect=[OCRError("t"), _result("BOURBON")]),
-            patch("lib.error_handling.time.sleep"),
-        ):
+        ext, sleeps = self._extractor()
+        with patch.object(ext, "extract", side_effect=[OCRError("t"), _result("BOURBON")]):
             assert ext.extract_with_retry(Path("a.jpg")) == "BOURBON"
+        assert len(sleeps) == 1
 
     def test_legacy_detect_orientation_api_removed(self):
         """The OSD/minAreaRect orientation code was wrong and is gone."""
@@ -250,21 +227,6 @@ class TestTokenRules:
     )
     def test_normalize_token(self, raw, expected):
         assert normalize_token(raw) == expected
-
-    def test_clean_ocr_text(self):
-        noisy = "‘IW | KENTUCKY ~ BOURBON BOURBON 4 — eRB 90 PROOF"  # noqa: RUF001
-        assert clean_ocr_text(noisy) == "KENTUCKY BOURBON 90 PROOF"
-        assert clean_ocr_text(noisy, max_chars=15) == "KENTUCKY"
-
-    def test_clean_ocr_text_is_idempotent_and_handles_empty(self):
-        once = clean_ocr_text("Kentucky  straight\nBOURBON whiskey 47% ALC/VOL")
-        assert once == "Kentucky straight BOURBON whiskey 47% ALC/VOL"
-        assert clean_ocr_text(once) == once
-        assert clean_ocr_text("") == ""
-        assert clean_ocr_text("BOURBON", max_chars=0) == ""
-
-    def test_clean_ocr_text_hard_cuts_single_long_token(self):
-        assert clean_ocr_text("DISTILLERY", max_chars=4) == "DIST"
 
     def test_strong_score(self):
         words = [
@@ -561,8 +523,9 @@ class TestTesseractPipeline:
         assert isinstance(text, str)
         assert "BOURBON" in text.split()
 
-    def test_extract_text_returns_clean_text(self, tmp_path):
+    def test_extract_returns_clean_text(self, tmp_path):
         path = tmp_path / "upright.png"
         _render().save(path)
 
-        assert "KENTUCKY" in TextExtractor().extract_text(path, orientation_corrected=True)
+        assert "KENTUCKY" in TextExtractor().extract(path, detect_rotation=False).clean_text
+        assert not hasattr(TextExtractor, "extract_text")

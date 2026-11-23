@@ -35,16 +35,16 @@ import numpy as np
 import pytesseract
 from PIL import Image, ImageOps
 
-from lib.error_handling import ErrorType, RetryException, RetryManager
 from lib.exceptions import (
     ConfigurationError,
     ImageProcessingError,
     OCRError,
     RetryExhaustedError,
 )
+from lib.retry import RetryPolicy, call_with_retry
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Sequence
+    from collections.abc import Callable, Iterable, Sequence
 
 try:  # Optional HEIC/HEIF support (iPhone originals); harmless when absent.
     from pillow_heif import register_heif_opener  # type: ignore[import-not-found]
@@ -87,6 +87,10 @@ RELIABLE_SCORE = 20
 
 #: Per-call Tesseract timeout in seconds.
 TESSERACT_TIMEOUT_S = 30
+#: OCR attempts per photo when retry is on (transient Tesseract failures only).
+OCR_ATTEMPTS = 2
+#: Seconds between OCR attempts (before jitter).
+OCR_RETRY_DELAY_S = 1.0
 #: LSTM engine, sparse-text page segmentation.
 TESSERACT_CONFIG = "--oem 1 --psm 11"
 
@@ -254,39 +258,6 @@ def is_plausible_token(  # noqa: PLR0911 - one early return per rule
     return not (
         _MIXED_CASE_RE.search(token) and not token.isupper() and not _NAME_PREFIX_RE.match(token)
     )
-
-
-def clean_ocr_text(text: str, *, max_chars: int | None = None) -> str:
-    """Clean free OCR text using the token rules, ignoring confidence.
-
-    Splits on whitespace, normalises each token, keeps plausible ones,
-    collapses consecutive case-insensitive duplicates and joins with single
-    spaces. Idempotent on already-clean text.
-
-    Args:
-        text: Text to clean (e.g. combined OCR from several images).
-        max_chars: If set, truncate at the last space at or before this many
-            characters (a single over-long first token is cut hard).
-
-    Returns:
-        Cleaned text (possibly empty).
-    """
-    kept: list[str] = []
-    for raw in text.split():
-        token = normalize_token(raw)
-        if not is_plausible_token(token, 100.0):
-            continue
-        if kept and kept[-1].lower() == token.lower():
-            continue
-        kept.append(token)
-    cleaned = " ".join(kept)
-
-    if max_chars is not None and len(cleaned) > max_chars:
-        if max_chars <= 0:
-            return ""
-        cut = cleaned.rfind(" ", 0, max_chars + 1)
-        cleaned = cleaned[:cut] if cut > 0 else cleaned[:max_chars]
-    return cleaned
 
 
 def strong_score(words: Iterable[OCRWord]) -> int:
@@ -463,31 +434,38 @@ class TextExtractor:
     """Extract label text from bourbon bottle images using Tesseract OCR.
 
     Attributes:
-        retry_manager: RetryManager used by the ``*_with_retry`` methods. The
-            default retries transient Tesseract failures (``OCRError``) once
-            and never retries deterministic ones (missing file, undecodable
-            image, Tesseract not installed).
+        ocr_policy: Retry policy of the ``*_with_retry`` methods: transient
+            Tesseract failures (``OCRError``) get a fixed 2 attempts (1 when
+            retry is off); deterministic ones (missing file, undecodable
+            image, Tesseract not installed) are never retried.
         tesseract_timeout: Per-call Tesseract timeout in seconds.
     """
 
     def __init__(
         self,
-        retry_manager: RetryManager | None = None,
+        retry_policy: RetryPolicy | None = None,
         *,
         tesseract_timeout: int = TESSERACT_TIMEOUT_S,
+        sleep: Callable[[float], object] = time.sleep,
     ):
         """Initialize text extractor.
 
         Args:
-            retry_manager: Optional RetryManager; defaults to one OCR-only retry.
+            retry_policy: The run's retry policy; only whether it allows more
+                than one attempt matters (OCR uses a fixed 2 attempts, or 1).
+                Default: retry on.
             tesseract_timeout: Per-call Tesseract timeout in seconds.
+            sleep: Sleep function between attempts (injected in tests).
         """
-        self.retry_manager = retry_manager or RetryManager(
-            max_attempts=2,
-            backoff_delays=[1],
-            retry_on=[ErrorType.OCR_FAILURE],
+        attempts = OCR_ATTEMPTS if retry_policy is None or retry_policy.enabled else 1
+        self.ocr_policy = RetryPolicy(
+            max_attempts=attempts,
+            initial_delay=OCR_RETRY_DELAY_S,
+            max_delay=OCR_RETRY_DELAY_S,
+            max_timeout_retries=attempts,
         )
         self.tesseract_timeout = tesseract_timeout
+        self._sleep = sleep
 
     def _ocr_words(self, image: Image.Image) -> list[OCRWord]:
         """Run one Tesseract pass and return words with confidence >= 0.
@@ -688,35 +666,6 @@ class TextExtractor:
         )
         return result
 
-    def extract_text(
-        self,
-        image_path: Path,
-        orientation_corrected: bool = False,
-        select_regions: bool = True,
-    ) -> str:
-        """Extract cleaned text from an image (single attempt).
-
-        Args:
-            image_path: Image file path.
-            orientation_corrected: True if the image is known to be upright
-                (skips rotation voting).
-            select_regions: Whether to add label-region crop passes.
-
-        Returns:
-            Cleaned OCR text, possibly empty.
-
-        Raises:
-            FileNotFoundError: If the file does not exist.
-            ImageProcessingError: If the image cannot be decoded.
-            ConfigurationError: If the tesseract executable is not available.
-            OCRError: If Tesseract fails or times out.
-        """
-        return self.extract(
-            image_path,
-            detect_rotation=not orientation_corrected,
-            select_regions=select_regions,
-        ).clean_text
-
     def extract_detailed_with_retry(
         self,
         image_path: Path,
@@ -740,23 +689,24 @@ class TextExtractor:
             ConfigurationError: If the tesseract executable is not available.
             RetryExhaustedError: If OCR still fails after all attempts.
         """
+        image_path = Path(image_path)
         try:
-            result: ExtractedText = self.retry_manager.execute_with_retry(
-                self.extract,
-                Path(image_path),
-                detect_rotation=detect_rotation,
-                select_regions=select_regions,
-                error_context=f"OCR {image_path}",
+            result, _ = call_with_retry(
+                lambda _attempt: self.extract(
+                    image_path, detect_rotation=detect_rotation, select_regions=select_regions
+                ),
+                self.ocr_policy,
+                describe=f"OCR {image_path}",
+                is_retryable=lambda exc: isinstance(exc, OCRError),
+                sleep=self._sleep,
             )
-        except RetryException as e:
-            original = e.original_error
-            if isinstance(original, (FileNotFoundError, ImageProcessingError, ConfigurationError)):
-                raise original from e
+        except OCRError as e:
+            attempts = getattr(e, "attempts", 1)
             raise RetryExhaustedError(
-                f"OCR failed for {image_path} after {e.retry_count + 1} attempt(s)",
-                e.retry_count,
-                original,
-            ) from original
+                f"OCR failed for {image_path} after {attempts} attempt(s)",
+                attempts - 1,
+                e,
+            ) from e
         return result
 
     def extract_with_retry(

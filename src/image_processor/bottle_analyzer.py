@@ -1,16 +1,16 @@
 """Analyze images and extract bourbon bottle metadata.
 
-Processes single or multiple bottle images, groups them by bottle identity,
-and creates Bottle model instances with extracted metadata.
+Reads one bottle's photos (already grouped by capture time) with OCR and a
+vision model and returns the extracted label metadata.
 """
 
 import logging
+import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from image_processor.image_organizer import ImageOrganizer
 from image_processor.text_extractor import TextExtractor
 from image_processor.vision_prompt import (
     MAX_VISION_IMAGES,
@@ -22,9 +22,8 @@ from image_processor.vision_prompt import (
     parse_vision_response,
     vision_response_schema,
 )
-from lib.config import DEFAULT_VISION_MODEL
+from lib.constants import DEFAULT_VISION_MODEL
 from lib.duplicates import DuplicateDetector
-from lib.error_handling import RetryManager
 from lib.exceptions import (
     FATAL_MODEL_ERRORS,
     ConfigurationError,
@@ -33,20 +32,21 @@ from lib.exceptions import (
 )
 from lib.model_selector import ModelStage
 from lib.ollama_client import OllamaClient
+from lib.retry import RetryPolicy, call_with_retry
 from models.bottle import ExtractedMetadata
 from models.image import Image
 
 if TYPE_CHECKING:
     from lib.model_selector import ModelSelector
 
-# Maximum number of angle photos expected for a single bottle
-MAX_ANGLES_PER_BOTTLE = 4
-
-#: Attempts per bottle when the model answers with unusable output.
-VISION_RESPONSE_ATTEMPTS = 2
-
 #: Warning recorded when the model reports photos of different products.
 MIXED_GROUP_WARNING = "Vision model reports photos show different products; check grouping"
+#: Warning recorded when the answer was usable only after unusable-output retries.
+LATE_ANSWER_WARNING = "Vision answer was usable only on attempt {attempt}; review the fields"
+
+
+class AnalysisCancelledError(Exception):
+    """The run is aborting; this bottle's vision request was not started."""
 
 logger = logging.getLogger(__name__)
 
@@ -59,42 +59,54 @@ def _category_name(img: Image) -> str:
 class BottleAnalyzer:
     """Analyze bourbon bottle images and extract metadata.
 
-    Uses TextExtractor for OCR and vision model analysis,
-    groups related images, and creates Bottle instances.
+    Uses TextExtractor for OCR and the vision model for label fields. Safe to
+    share between worker threads: per-call state (``last_vision_result``) is
+    kept per thread.
 
     Attributes:
         text_extractor: TextExtractor for OCR and metadata extraction.
         ollama_client: Ollama client for vision model calls.
-        retry_manager: RetryManager for automatic retries.
+        retry_policy: Retry policy of the vision request.
         model_selector: Optional ModelSelector for per-stage model resolution.
-        last_vision_result: Raw result of the most recent vision call, or None.
+        last_vision_result: Raw result of this thread's most recent vision call, or None.
     """
 
     def __init__(
         self,
         text_extractor: TextExtractor | None = None,
         ollama_client: OllamaClient | None = None,
-        retry_manager: RetryManager | None = None,
-        image_organizer: ImageOrganizer | None = None,
         model_selector: "ModelSelector | None" = None,
+        *,
+        retry_policy: RetryPolicy | None = None,
+        sleep: Callable[[float], object] = time.sleep,
     ):
         """Initialize bottle analyzer.
 
         Args:
-            text_extractor: Optional TextExtractor instance.
+            text_extractor: Optional TextExtractor instance (default: one
+                using ``retry_policy``).
             ollama_client: Optional OllamaClient instance.
-            retry_manager: Optional RetryManager instance.
-            image_organizer: Optional ImageOrganizer instance.
             model_selector: Optional ModelSelector for per-stage model resolution.
+            retry_policy: Retry policy of the vision request (default:
+                ``RetryPolicy()``, 3 attempts); ``RetryPolicy.DISABLED`` for
+                ``--no-retry``.
+            sleep: Sleep between vision attempts (injected in tests).
         """
-        # OCR keeps its own narrow retry policy (transient Tesseract failures only).
-        self.text_extractor = text_extractor or TextExtractor()
+        self.retry_policy = retry_policy or RetryPolicy()
+        self.text_extractor = text_extractor or TextExtractor(self.retry_policy)
         self.ollama_client = ollama_client or OllamaClient()
-        self.retry_manager = retry_manager or RetryManager()
-        self.image_organizer = image_organizer or ImageOrganizer()
         self.model_selector = model_selector
-        #: Raw result of the most recent vision call (token counts for usage tracking).
-        self.last_vision_result: Any = None
+        self._sleep = sleep
+        self._local = threading.local()
+
+    @property
+    def last_vision_result(self) -> Any:  # noqa: ANN401
+        """Raw result of this thread's most recent vision call (token counts for usage tracking)."""
+        return getattr(self._local, "last_vision_result", None)
+
+    @last_vision_result.setter
+    def last_vision_result(self, value: Any) -> None:  # noqa: ANN401
+        self._local.last_vision_result = value
 
     def _resolve_vision_model(self, vision_model: str | None = None) -> str:
         """Pick the vision model: explicit argument, then selector, then default.
@@ -146,16 +158,24 @@ class BottleAnalyzer:
         self,
         images: list[Image],
         vision_model: str | None = None,
+        *,
+        reviewer_note: str = "",
+        cancel: threading.Event | None = None,
     ) -> tuple[dict, ExtractedMetadata]:
         """Process images for a single bottle and extract metadata.
 
-        Runs OCR on every photo, then one vision call with up to
-        ``MAX_VISION_IMAGES`` selected photos and their OCR text as hints.
+        Runs OCR on every photo once, then the vision request (with up to
+        ``MAX_VISION_IMAGES`` selected photos and their OCR text as hints)
+        under the retry policy; every vision attempt reuses the same OCR.
 
         Args:
             images: List of Image objects for this bottle.
             vision_model: Vision model name; if None, the model selector's
                 vision model, else ``DEFAULT_VISION_MODEL``.
+            reviewer_note: The owner's "where to look" note for this bottle
+                (hints file), passed to the prompt as guidance only.
+            cancel: When set (the run is aborting), no vision request is
+                started (``AnalysisCancelledError``).
 
         Returns:
             Tuple of (bottle_dict, metadata) where:
@@ -178,12 +198,15 @@ class BottleAnalyzer:
         # OCR every photo (also those not sent to the vision model).
         logger.debug("Extracting OCR text from %d image(s)", len(images))
         ocr_by_path: dict[str, str] = {}
+        ocr_by_image: dict[str, str] = {}
         ocr_texts: list[str] = []
         for img in images:
             try:
                 text = self.text_extractor.extract_with_retry(Path(img.path))
                 if text.strip():
                     ocr_by_path[str(img.path)] = text.strip()
+                    name = Path(img.path).name
+                    ocr_by_image[name if name not in ocr_by_image else str(img.path)] = text.strip()
                     ocr_texts.append(text.strip())
                     logger.debug("Successfully extracted %d characters from %s", len(text.strip()), img.path)
             except ConfigurationError as e:
@@ -204,9 +227,13 @@ class BottleAnalyzer:
             logger.warning("No images for this bottle; vision analysis has nothing to read")
 
         self.last_vision_result = None
+        if cancel is not None and cancel.is_set():
+            raise AnalysisCancelledError("run is aborting; vision request not started")
         start_time = time.time()
         try:
-            metadata = self.analyze_with_vision_model(image_paths, hints, model)
+            metadata = self.analyze_with_vision_model(
+                image_paths, hints, model, reviewer_note=reviewer_note, cancel=cancel
+            )
         except Exception as e:
             self._record_vision_usage(model, start_time, success=False, error=f"{type(e).__name__}: {e}")
             raise
@@ -216,6 +243,7 @@ class BottleAnalyzer:
         # Keep the OCR of every photo, and list every photo with the primary first.
         metadata.full_text = combined_ocr
         metadata.selected_text = combined_ocr
+        metadata.ocr_by_image = ocr_by_image
         ordered = [primary, *[img for img in images if img is not primary]] if primary else list(images)
         metadata.source_images = [str(img.path) for img in ordered]
 
@@ -252,38 +280,17 @@ class BottleAnalyzer:
                 duration=time.time() - start_time,
                 input_tokens=int(getattr(result, "prompt_eval_count", 0) or 0),
                 output_tokens=int(getattr(result, "eval_count", 0) or 0),
-                # No automatic fallback model: the resolved model is always the one used.
-                fallback_used=False,
                 error=error,
             )
         except Exception:
             logger.debug("Model usage tracking failed", exc_info=True)
-
-    def group_images_by_bottle(
-        self,
-        images: list[Image],
-        similarity_threshold: float = 0.8,
-    ) -> list[list[Image]]:
-        """Group images by bottle identity.
-
-        Uses ImageOrganizer to group related images (multi-angle photos of same bottle).
-
-        Args:
-            images: List of Image objects to group.
-            similarity_threshold: Minimum similarity score to consider images related.
-
-        Returns:
-            List of image groups, where each group is a list of Image objects
-                for the same bottle.
-        """
-        return self.image_organizer.group_by_bottle(images, similarity_threshold)
 
     def detect_quantity(
         self,
         images: list[Image],
         duplicate_detector: DuplicateDetector | None = None,
     ) -> int:
-        """Detect quantity based on hash-based duplicates and visual analysis.
+        """Count a bottle's quantity as its largest set of byte-identical photos.
 
         Args:
             images: List of images for this bottle.
@@ -308,24 +315,7 @@ class BottleAnalyzer:
                 logger.warning("Failed to generate hash for %s: %s", img.path, e)
 
         # Maximum duplicate count suggests quantity
-        max_count = max(hash_counts.values()) if hash_counts else 1
-
-        # Visual alternative: detect multiple bottles in single frame
-        # Heuristic: Use hash-based approach to detect multiple identical bottles
-        # If we have more images than the max count, check if there are duplicate
-        # groups that suggest multiple bottles photographed together
-        if len(images) > max_count:
-            # Analyze image hashes to count visually identical bottles
-            # Multiple photos of the same bottle will have different hashes,
-            # but multiple identical bottles photographed separately will show
-            # repeating hash patterns (each bottle photographed from same angle)
-            visual_count = self._estimate_quantity_from_images(images)
-            # Return the higher of the metadata count or visual analysis
-            # Metadata count may be wrong if not explicitly stated,
-            # visual analysis helps catch implicit multiple bottles
-            return max(max_count, visual_count)
-
-        return max_count
+        return max(hash_counts.values()) if hash_counts else 1
 
     def calculate_confidence(self, metadata: ExtractedMetadata) -> str:
         """Calculate overall extraction confidence.
@@ -343,7 +333,7 @@ class BottleAnalyzer:
         # So we use a simpler heuristic based on data completeness
 
         # Check metadata completeness
-        fields = ["distillery", "msrp", "name", "proof", "age"]
+        fields = ["distillery", "label_price", "name", "proof", "age"]
         filled = sum(1 for field in fields if hasattr(metadata, field) and getattr(metadata, field))
 
         # High confidence: all required fields populated
@@ -360,13 +350,18 @@ class BottleAnalyzer:
         image_paths: Path | Sequence[Path],
         ocr_text: str | Sequence[str] = "",
         model: str | None = None,
+        *,
+        reviewer_note: str = "",
+        cancel: threading.Event | None = None,
     ) -> ExtractedMetadata:
         """Read a bottle's label data from its photos with a vision model.
 
         Sends all photos in one ``chat_with_images`` call with the guarded
-        prompt, the JSON schema and thinking disabled. An unusable answer
-        (empty, truncated or without a name, distillery or release) is retried
-        once.
+        prompt, the JSON schema and thinking disabled, under
+        ``self.retry_policy``: an unusable answer (empty, truncated or without
+        a name, distillery or release), a timeout (once), an HTTP 5xx/408/429
+        or a refused connection is repeated; other errors are not. The number
+        of attempts is recorded in ``vision_attempts``.
 
         Args:
             image_paths: Photos of one bottle (a single Path is accepted).
@@ -374,6 +369,8 @@ class BottleAnalyzer:
                 string used as a single hint.
             model: Vision model name (default: selector's, else
                 ``DEFAULT_VISION_MODEL``).
+            reviewer_note: Owner's reading note (guidance only, never data).
+            cancel: Stops further attempts when set.
 
         Returns:
             ExtractedMetadata with the label fields, ``vision_model``,
@@ -381,7 +378,7 @@ class BottleAnalyzer:
             ExtractedMetadata carrying only the OCR text.
 
         Raises:
-            VisionResponseError: If both attempts returned unusable output.
+            VisionResponseError: If every attempt returned unusable output.
             VisionTimeoutError: If the model did not answer in time.
             VisionAnalysisError: For any other per-bottle vision failure.
             VisionModelUnavailableError, OllamaConnectionError, ModelServerError:
@@ -406,20 +403,29 @@ class BottleAnalyzer:
         model = model or self._resolve_vision_model(None)
         names = ", ".join(p.name for p in paths)
         self.last_vision_result = None
-        prompt = build_vision_prompt(len(paths), hints)
+        prompt = build_vision_prompt(len(paths), hints, reviewer_note=reviewer_note)
 
-        extraction: VisionExtraction | None = None
-        for attempt in range(1, VISION_RESPONSE_ATTEMPTS + 1):
+        unusable: list[int] = []
+        results: list[Any] = []
+
+        def attempt(number: int) -> VisionExtraction:
             result = self._call_vision_model(prompt, paths, model, names)
             self.last_vision_result = result
+            results.append(result)
             try:
-                extraction = self._extract_from_result(result, model, names)
-                break
-            except VisionResponseError as e:
-                if attempt >= VISION_RESPONSE_ATTEMPTS:
-                    raise
-                logger.warning("%s; retrying once", e)
-        assert extraction is not None  # loop either breaks with a value or raises
+                return self._extract_from_result(result, model, names)
+            except VisionResponseError:
+                unusable.append(number)
+                raise
+
+        extraction, attempts = call_with_retry(
+            attempt,
+            self.retry_policy,
+            describe=f"Vision {model} ({names})",
+            sleep=self._sleep,
+            cancel=cancel,
+        )
+        result = results[-1]
 
         logger.info(
             "Vision %s: %d image(s), %s prompt tokens, %s output tokens, %.1fs, parsed as %s",
@@ -432,6 +438,9 @@ class BottleAnalyzer:
         )
 
         warnings: list[str] = []
+        if unusable and attempts > 1:
+            warnings.append(LATE_ANSWER_WARNING.format(attempt=attempts))
+            logger.warning("%s (%s)", warnings[-1], names)
         # A single photo cannot mix products; same_bottle is only meaningful
         # (and only asked for) when several photos are compared.
         same_bottle = extraction.same_bottle if len(paths) > 1 else None
@@ -448,6 +457,7 @@ class BottleAnalyzer:
             vision_confidence=extraction.confidence,
             warnings=warnings,
             same_bottle=same_bottle,
+            vision_attempts=attempts,
         )
 
     def _call_vision_model(self, prompt: str, paths: list[Path], model: str, names: str) -> Any:
@@ -460,7 +470,7 @@ class BottleAnalyzer:
             names: Photo file names, for error messages.
 
         Returns:
-            The client's VisionChatResult.
+            The client's ChatResult.
 
         Raises:
             VisionAnalysisError: Client errors other than the fatal ones,
@@ -491,7 +501,7 @@ class BottleAnalyzer:
         """Parse a vision reply, rejecting empty, truncated or anonymous answers.
 
         Args:
-            result: VisionChatResult from the client.
+            result: ChatResult from the client.
             model: Vision model name (for messages).
             names: Photo file names (for messages).
 
@@ -521,44 +531,6 @@ class BottleAnalyzer:
                 f"Vision model '{model}' returned no identifying fields for {names}: {content[:300]!r}"
             )
         return extraction
-
-    def _estimate_quantity_from_images(self, images: list[Image]) -> int:
-        """Estimate quantity from visual analysis of images.
-
-        Uses MD5 hash grouping to detect multiple identical bottles.
-        When user photographs multiple identical bottles from the same angle,
-        each bottle's images share similar hashes within that group.
-
-        Args:
-            images: List of images for this bottle.
-
-        Returns:
-            Estimated quantity (minimum 1).
-        """
-        # Heuristic: Group images by MD5 hash to find repeated patterns
-        # If we see 2-3 near-identical images (hash A), then another 2-3 near-identical (hash B),
-        # this suggests 2 separate bottles each photographed multiple times from the same angle
-        # Example: [A1, A2, A3, B1, B2, B3] → likely 2 bottles, 3 photos each
-
-        detector = DuplicateDetector()
-        hash_counts: dict[str, int] = {}
-
-        # Count how many times each unique hash appears
-        for img in images:
-            try:
-                img_hash = detector.generate_hash(Path(img.path))
-                hash_counts[img_hash] = hash_counts.get(img_hash, 0) + 1
-            except Exception:
-                pass
-
-        # If we have duplicate hashes beyond what's needed for multi-angle photos
-        # (assume 3-4 angles per bottle), suggest larger quantity
-        if hash_counts:
-            max_count = max(hash_counts.values())
-            if max_count > MAX_ANGLES_PER_BOTTLE:
-                return max_count // MAX_ANGLES_PER_BOTTLE + 1
-
-        return 1
 
     def _build_bottle_dict(
         self,
@@ -593,8 +565,11 @@ class BottleAnalyzer:
         else:
             bottle_dict["distillery"] = "Unknown Distillery"
 
-        # None when no price was visible: unknown, never a $0.00 price.
-        bottle_dict["msrp"] = getattr(metadata, "msrp", None) or None
+        # A price seen in a photo is a shop/retail price, never an MSRP: it is
+        # kept as label_price, and the MSRP stays unknown until a verified
+        # source (fact check) or a person supplies it.
+        bottle_dict["label_price"] = getattr(metadata, "label_price", None) or None
+        bottle_dict["msrp"] = None
 
         if hasattr(metadata, "specific_release") and metadata.specific_release:
             bottle_dict["specific_release"] = metadata.specific_release
@@ -615,17 +590,3 @@ class BottleAnalyzer:
         bottle_dict["quantity"] = 1
 
         return bottle_dict
-
-    def _parse_vision_response(self, response: str) -> dict:
-        """Parse a vision model response into metadata field values.
-
-        Thin wrapper kept for compatibility; see
-        ``image_processor.vision_prompt.parse_vision_response``.
-
-        Args:
-            response: Vision model response string (JSON or ``key: value`` lines).
-
-        Returns:
-            Dictionary of extracted metadata fields.
-        """
-        return parse_vision_response(response).fields

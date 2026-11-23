@@ -1,126 +1,182 @@
 """CLI commands for bourbon image processor.
 
-Provides command-line interface for processing bourbon bottle images
-using argparse for argument parsing and structured command execution.
+Every command resolves one immutable :class:`lib.settings.Settings` (defaults,
+config files, ``BOURBON_*`` environment, flags) before doing anything; a
+configuration error exits 1 with every problem listed. Commands then run with
+a :class:`RunContext` holding the settings plus the run's live objects
+(model server manager, model selector, hints).
 """
 
 import argparse
 import hashlib
+import json
 import logging
-import math
 import os
 import signal
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from urllib.parse import urlparse
 
-from image_processor.batch_processor import (
-    DEFAULT_SPLIT_BUDGET_RATIO,
-    MAX_SPLIT_BUDGET_RATIO,
-    BatchProcessor,
-)
+from image_processor.batch_processor import BatchProcessor, BottleLogFilter, describe_error
 from image_processor.bottle_analyzer import BottleAnalyzer
-from image_processor.capture_grouping import DEFAULT_GAP_SECONDS, DEFAULT_MAX_GROUP_SIZE
+from image_processor.corrections import CORRECTABLE_FIELDS, apply_corrections
 from image_processor.image_organizer import OUTPUT_MARKER, ImageOrganizer
 from image_processor.preview_generator import PreviewGenerator
-from lib.config import DEFAULT_VISION_MODEL
+from lib.constants import DEFAULT_VISION_MODEL
 from lib.exceptions import FATAL_MODEL_ERRORS, ModelServerError, VisionAnalysisError
-from lib.model_availability import DEFAULT_MIN_FREE_BYTES, GiB, existing_ancestor
-from lib.model_selector import ModelSelector
-from lib.model_server import (
-    DEFAULT_OLLAMA_URL,
-    DEFAULT_REQUEST_TIMEOUT,
-    ModelServerManager,
-    ServerBackend,
+from lib.hints import HintBook, apply_hint_overrides
+from lib.model_availability import (
+    existing_ancestor,
+    format_gb,
+    is_local_url,
+    memory_verdict,
+    total_memory_bytes,
 )
+from lib.model_selector import ModelSelector, active_stages
+from lib.model_server import ModelServerManager
+from lib.settings import (
+    THINK_LEVELS,
+    WEB_PROVIDERS,
+    Settings,
+    SettingsError,
+    describe,
+    ignored_keys,
+    render_template,
+    resolve_settings,
+    settings_to_dict,
+)
+from models.bottle import Correction
 from models.image import group_bottle_id
 
 logger = logging.getLogger(__name__)
 
-#: Default of ``--min-free-gb`` (GiB that must stay free on the model store
-#: after a pull).
-DEFAULT_MIN_FREE_GB = DEFAULT_MIN_FREE_BYTES / GiB
-
 #: Subcommands; an argument list naming none of them runs ``process``.
-SUBCOMMANDS = ("process", "feedback", "retry")
-#: Upper bounds of the grouping options.
-MAX_GROUP_GAP_SECONDS = 600.0
-MAX_GROUP_SIZE_LIMIT = 20
-#: Logged when the deprecated ``--lookahead`` option is given.
-LOOKAHEAD_DEPRECATION_WARNING = (
-    "--lookahead is deprecated and ignored: photos are grouped by capture time, "
-    "so a bottle never spans two batches"
-)
+SUBCOMMANDS = ("process", "feedback", "retry", "config")
+#: Top-level options that take a value (skipped when finding the subcommand).
+_TOP_LEVEL_VALUE_OPTIONS = ("--config",)
+#: Log line format; ``bottle`` is the bottle a worker thread is analysing ('-' otherwise).
+LOG_FORMAT = "%(asctime)s %(levelname)s [%(bottle)s] %(name)s: %(message)s"
 
 
-def _backend_arg(value: str) -> str:
-    """argparse type for --server-backend: a supported backend name.
+# ---------------------------------------------------------------------------
+# Parser (every default is None: an absent flag never overrides config)
+# ---------------------------------------------------------------------------
 
-    Raises:
-        argparse.ArgumentTypeError: For an unknown or removed backend (argparse
-            then exits with status 2).
-    """
-    try:
-        return ServerBackend.parse(value).value
-    except ValueError as e:
-        raise argparse.ArgumentTypeError(str(e)) from None
+
+def _add_config_args(parser: argparse.ArgumentParser, *, suppress: bool) -> None:
+    """``--debug``, ``--config`` and ``--no-config`` (top level, and again after the subcommand)."""
+    default = argparse.SUPPRESS if suppress else None
+    parser.add_argument(
+        "--debug", action="store_const", const=True, default=default,
+        help="Enable debug logging and verbose output",
+    )
+    parser.add_argument(
+        "--config", type=Path, default=default, metavar="PATH",
+        help="Read only this config file (default: ~/.config/bourbon-process/config.toml, then ./bourbon.toml)",
+    )
+    parser.add_argument(
+        "--no-config", action="store_const", const=True, default=default,
+        help="Read no config file (reproducible runs)",
+    )
 
 
 def _add_server_args(parser: argparse.ArgumentParser) -> None:
-    """Add the model and model-server options shared by `process` and `retry`."""
+    """Model and model-server options shared by ``process`` and ``retry``."""
     parser.add_argument(
-        "-m",
-        "--model",
-        type=str,
-        default=None,
-        help=(
-            "Ollama vision model tag for analysis; must be vision-capable "
-            f"(default: $BOURBON_MODEL, else {DEFAULT_VISION_MODEL})"
-        ),
+        "-m", "--model", type=str, default=None,
+        help=f"Ollama vision model tag; must be vision-capable (default: {DEFAULT_VISION_MODEL})",
     )
+    parser.add_argument("-u", "--ollama-url", type=str, default=None, help="Ollama service URL")
     parser.add_argument(
-        "-u",
-        "--ollama-url",
-        type=str,
-        default=DEFAULT_OLLAMA_URL,
-        help=f"Ollama service URL (default: {DEFAULT_OLLAMA_URL})",
-    )
-    parser.add_argument(
-        "--server-backend",
-        type=_backend_arg,
-        default=os.environ.get("BOURBON_SERVER_BACKEND", "ollama"),
-        metavar="{" + ",".join(b.value for b in ServerBackend) + "}",
-        help="Model serving backend (default: $BOURBON_SERVER_BACKEND, else ollama)",
-    )
-    parser.add_argument(
-        "--server-start-timeout",
-        type=float,
-        default=None,
+        "--server-start-timeout", type=float, default=None, metavar="SECONDS",
         help="Seconds to wait for a model server this run starts (default: 30)",
     )
     parser.add_argument(
-        "--request-timeout",
-        "--vision-timeout",
-        dest="request_timeout",
-        type=float,
-        default=float(DEFAULT_REQUEST_TIMEOUT),
-        help=f"Per-request model timeout in seconds (default: {DEFAULT_REQUEST_TIMEOUT})",
+        "--request-timeout", dest="request_timeout", type=float, default=None, metavar="SECONDS",
+        help="Per-request vision timeout in seconds, covering a cold model load (default: 600)",
     )
     parser.add_argument(
-        "--keep-server",
-        action="store_true",
+        "--keep-server", action=argparse.BooleanOptionalAction, default=None,
         help="Leave a model server started by this run running afterwards",
     )
     parser.add_argument(
-        "--no-server-autostart",
-        action="store_true",
-        help="Never start a model server; fail if none is running",
+        "--server-autostart", action=argparse.BooleanOptionalAction, default=None,
+        help="Start a local Ollama if none is running (--no-server-autostart: fail instead)",
+    )
+    parser.add_argument(
+        "--keep-models-loaded", action=argparse.BooleanOptionalAction, default=None,
+        help="Keep the vision and text models loaded together (skip the unloads between phases)",
+    )
+
+
+def _add_retry_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "-r", "--allow-retry", dest="retry_enabled", action="store_const", const=True, default=None,
+        help="Repeat model requests that fail in a way that may pass (default: on)",
+    )
+    parser.add_argument(
+        "--no-retry", dest="retry_enabled", action="store_const", const=False, default=None,
+        help="Make every model request once",
+    )
+    parser.add_argument(
+        "--retry-attempts", type=int, default=None, metavar="N",
+        help="Attempts per model request when retry is on, 1-5 (default: 3)",
+    )
+
+
+def _add_text_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--verify", action=argparse.BooleanOptionalAction, default=None,
+        help="Fact-check each bottle with the text model (default: on)",
+    )
+    parser.add_argument(
+        "--text-model", type=str, default=None, metavar="TAG",
+        help="Ollama text model of the fact check, or 'none' (default: gpt-oss:120b)",
+    )
+    parser.add_argument(
+        "--text-think", type=str, default=None, metavar="|".join(THINK_LEVELS),
+        help="Reasoning effort of the fact-check extraction (default: high)",
+    )
+    parser.add_argument(
+        "--text-timeout", type=float, default=None, metavar="SECONDS",
+        help="Read timeout of one text-model call (default: 900)",
+    )
+
+
+def _add_web_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--web", action=argparse.BooleanOptionalAction, default=None,
+        help="Look bottles up on the web and cite the pages used (default: on)",
+    )
+    parser.add_argument(
+        "--web-provider", type=str, default=None, metavar="|".join(WEB_PROVIDERS),
+        help="Search provider (default: auto = Brave key, Ollama key, SearXNG URL, else DuckDuckGo)",
+    )
+    parser.add_argument(
+        "--web-cache-dir", type=Path, default=None, metavar="PATH",
+        help="Web cache directory (default: ${XDG_CACHE_HOME:-~/.cache}/bourbon-process/web)",
+    )
+    parser.add_argument(
+        "--refresh-web", action="store_const", const=True, default=None,
+        help="Ignore cached web pages and search results for this run",
+    )
+    parser.add_argument(
+        "-v", "--include-vendor-images", dest="include_vendor_images",
+        action=argparse.BooleanOptionalAction, default=None,
+        help="Fetch a vendor reference image per bottle (implies web lookups)",
+    )
+
+
+def _add_hints_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--hints", dest="hints_file", type=Path, default=None, metavar="PATH",
+        help="Hints TOML: per-bottle reading notes and sourced field values (see examples/hints.example.toml)",
     )
 
 
@@ -128,13 +184,8 @@ def parse_args(argv: list | None = None) -> argparse.Namespace:
     """Parse command-line arguments.
 
     Arguments that name no subcommand run ``process`` (``bourbon-process -f
-    photos`` is ``bourbon-process process -f photos``).
-
-    Args:
-        argv: Optional list of arguments (default: sys.argv[1:]).
-
-    Returns:
-        Parsed arguments namespace.
+    photos`` is ``bourbon-process process -f photos``). Every option defaults
+    to None; :func:`lib.settings.resolve_settings` fills in config and defaults.
     """
     argv = list(sys.argv[1:] if argv is None else argv)
     if not _names_subcommand(argv):
@@ -148,225 +199,132 @@ def build_parser() -> argparse.ArgumentParser:
         description="Process bourbon bottle images and extract metadata.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    _add_config_args(parser, suppress=False)
 
-    # Global options
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="Enable debug logging and verbose output",
-    )
-
-    # --debug is also accepted after the subcommand. SUPPRESS keeps a missing
+    # Also accepted after the subcommand; SUPPRESS keeps a missing
     # subcommand-level flag from overwriting the top-level value.
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument(
-        "--debug",
-        action="store_true",
-        default=argparse.SUPPRESS,
-        help="Enable debug logging and verbose output",
-    )
+    _add_config_args(common, suppress=True)
 
-    # Create subparsers for different commands
     subparsers = parser.add_subparsers(dest="command", help="Command to execute")
 
-    # Process command (default behavior)
+    # process
     process_parser = subparsers.add_parser(
-        "process",
-        parents=[common],
-        help="Process bourbon bottle images and extract metadata",
+        "process", parents=[common], help="Process bourbon bottle images and extract metadata",
     )
-
-    # Input/output options for process command
     process_parser.add_argument(
-        "-f",
-        "--image-folder",
-        type=Path,
-        default=Path(),
+        "-f", "--image-folder", type=Path, default=None,
         help="Folder containing images to process (default: current directory)",
     )
     process_parser.add_argument(
-        "-o",
-        "--output-dir",
-        type=Path,
-        default=Path("processed"),
+        "-o", "--output-dir", type=Path, default=None,
         help="Output directory for processed bottles (default: processed/)",
     )
-
-    # Processing options
     process_parser.add_argument(
-        "-b",
-        "--batch-size",
-        type=str,
-        default="5",
-        help="Number of bottles to process per batch, or 'all' to process all (default: 5)",
+        "-b", "--batch-size", type=str, default=None,
+        help="Bottles per batch, or 'all' (default: 5)",
     )
     process_parser.add_argument(
-        "--lookahead",
-        type=int,
-        default=None,
-        metavar="N",
-        help=(
-            "Deprecated and ignored (photos are grouped by capture time, so a bottle never "
-            "spans two batches); still accepted (0-10) so existing scripts keep working"
-        ),
+        "--concurrency", type=int, default=None, metavar="N",
+        help="Bottle groups analysed in parallel, 1-10; output is identical to a sequential run "
+        "(default: 2; use 1 for evaluation runs)",
     )
     process_parser.add_argument(
-        "--concurrency",
-        type=int,
-        default=3,
-        help="Maximum concurrent operations (default: 3)",
+        "--group-gap-seconds", type=float, default=None, metavar="SECONDS",
+        help="Most seconds between consecutive photos of one bottle; photos are grouped by "
+        "EXIF capture time (default: 12)",
     )
     process_parser.add_argument(
-        "--group-gap-seconds",
-        type=float,
-        default=DEFAULT_GAP_SECONDS,
-        metavar="SECONDS",
-        help=(
-            "Most seconds between consecutive photos of one bottle; photos are grouped by "
-            f"EXIF capture time (default: {DEFAULT_GAP_SECONDS:g})"
-        ),
+        "--group-max-size", type=int, default=None, metavar="N",
+        help="Most photos per bottle; longer runs of photos are split at their largest time gap, "
+        "0 = no limit (default: 3)",
     )
     process_parser.add_argument(
-        "--group-max-size",
-        type=int,
-        default=DEFAULT_MAX_GROUP_SIZE,
-        metavar="N",
-        help=(
-            "Most photos per bottle; longer runs of photos are split at their largest time gap, "
-            f"0 = no limit (default: {DEFAULT_MAX_GROUP_SIZE})"
-        ),
-    )
-    process_parser.add_argument(
-        "--split-budget-ratio",
-        type=float,
-        default=DEFAULT_SPLIT_BUDGET_RATIO,
-        metavar="RATIO",
+        "--split-budget-ratio", type=float, default=None, metavar="RATIO",
         help=(
             "When the vision model says a group's photos show different products, the group is "
             "split at its largest time gap and each half is read again (2 extra analyses). "
             "This caps the extra analyses of the whole run at RATIO x number of groups (at least 4); "
-            "an analysis is one vision request (retried once if unusable) plus OCR; "
-            f"0 turns the split check off (default: {DEFAULT_SPLIT_BUDGET_RATIO:g}, "
-            f"max {MAX_SPLIT_BUDGET_RATIO:g})"
+            "retries of a request do not count; 0 turns the split check off (default: 0.35, max 2)"
         ),
     )
-
-    # Model and model-server options
     _add_server_args(process_parser)
     process_parser.add_argument(
-        "--pull",
-        "--pull-missing",
-        dest="pull",
-        action="store_true",
-        help=(
-            "Download the vision model if it is not installed, after checking its download "
-            "size against free disk space (off by default: models are never downloaded "
-            "implicitly)"
-        ),
+        "--pull", action=argparse.BooleanOptionalAction, default=None,
+        help="Download missing models after checking their size against free disk space "
+        "(off by default: models are never downloaded implicitly)",
     )
     process_parser.add_argument(
-        "--min-free-gb",
-        type=float,
-        default=DEFAULT_MIN_FREE_GB,
-        metavar="GB",
-        help=(
-            "Free space (GiB) to keep on the Ollama model store after a --pull; a pull "
-            f"also keeps 10%% of its size free (default: {DEFAULT_MIN_FREE_GB:g})"
-        ),
+        "--min-free-gb", type=float, default=None, metavar="GB",
+        help="Free space (GiB) to keep on the Ollama model store after a --pull (default: 5)",
+    )
+    process_parser.add_argument(
+        "-i", "--interactive", action=argparse.BooleanOptionalAction, default=None,
+        help="Review every bottle interactively before saving",
+    )
+    _add_hints_arg(process_parser)
+    _add_retry_args(process_parser)
+    _add_text_args(process_parser)
+    _add_web_args(process_parser)
+    process_parser.add_argument(
+        "--dry-run", action="store_const", const=True, default=None,
+        help="Check inputs and probe the model server without starting it, pulling "
+        "models or processing images",
     )
 
-    # Behavior options
-    process_parser.add_argument(
-        "-i",
-        "--interactive",
-        action="store_true",
-        help="Enable interactive preview and review mode",
-    )
-    process_parser.add_argument(
-        "-v",
-        "--include-vendor-images",
-        action="store_true",
-        help="Include vendor/supply chain images in processing",
-    )
-    process_parser.add_argument(
-        "-r",
-        "--allow-retry",
-        action="store_true",
-        default=True,
-        help="Allow automatic retry on processing failures (default: True)",
-    )
-    process_parser.add_argument(
-        "--no-retry",
-        action="store_false",
-        dest="allow_retry",
-        help="Disable automatic retry on processing failures",
-    )
-
-    # Debug options for process command
-    process_parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help=(
-            "Check inputs and probe the model server without starting it, pulling "
-            "models or processing images"
-        ),
-    )
-
-    # Feedback command
+    # feedback
     feedback_parser = subparsers.add_parser(
-        "feedback",
-        parents=[common],
-        help="Apply feedback and corrections to processed batch",
+        "feedback", parents=[common], help="Apply feedback and corrections to processed batch",
     )
-
     feedback_parser.add_argument(
-        "-o",
-        "--output-dir",
-        type=Path,
-        default=Path("processed"),
+        "-o", "--output-dir", type=Path, default=None,
         help="Output directory containing processed batches (default: processed/)",
     )
     feedback_parser.add_argument(
-        "--batch",
-        type=str,
+        "--batch", type=str, default=None,
         help=(
             "Batch ID to apply feedback to, e.g. '20261122_193000_001' for "
             "batch_20261122_193000_001_preview.md (default: most recent batch)"
         ),
     )
     feedback_parser.add_argument(
-        "--corrections",
-        type=Path,
-        help="Path to JSON file containing corrections",
+        "--corrections", type=Path, default=None, help="Path to JSON file containing corrections",
     )
     feedback_parser.add_argument(
-        "-i",
-        "--interactive",
-        action="store_true",
+        "-i", "--interactive", action=argparse.BooleanOptionalAction, default=None,
         help="Enable interactive feedback collection mode",
     )
+    feedback_parser.add_argument(
+        "--approve", action="append", default=None, metavar="BOTTLE_ID",
+        help="Approve a bottle for publishing (repeatable; applied by the fact-check stage)",
+    )
 
-    # Retry command
+    # retry
     retry_parser = subparsers.add_parser(
-        "retry",
-        parents=[common],
-        help="Retry processing failed bottles from error reports",
+        "retry", parents=[common], help="Retry processing failed bottles from error reports",
     )
-
+    retry_parser.add_argument("--report", type=Path, required=True, help="Path to error_report.json file")
     retry_parser.add_argument(
-        "--report",
-        type=Path,
-        required=True,
-        help="Path to error_report.json file",
-    )
-    retry_parser.add_argument(
-        "-o",
-        "--output-dir",
-        type=Path,
-        default=Path("processed"),
+        "-o", "--output-dir", type=Path, default=None,
         help="Output directory for processed bottles (default: processed/)",
     )
+    _add_hints_arg(retry_parser)
     _add_server_args(retry_parser)
+    _add_retry_args(retry_parser)
+    _add_text_args(retry_parser)
+    _add_web_args(retry_parser)
+
+    # config
+    config_parser = subparsers.add_parser(
+        "config", parents=[common], help="Show the effective configuration or print a config template",
+    )
+    config_parser.add_argument(
+        "config_action", choices=("show", "template"),
+        help="show: files, values and their sources; template: a commented config file",
+    )
+    config_parser.add_argument(
+        "--json", action="store_const", const=True, default=None, help="show: print JSON",
+    )
 
     return parser
 
@@ -374,105 +332,147 @@ def build_parser() -> argparse.ArgumentParser:
 def _names_subcommand(argv: list[str]) -> bool:
     """True if ``argv`` names a subcommand, or asks for the top-level help.
 
-    Top-level options take no values, so the first token not starting with
-    '-' is the subcommand position.
+    The first token that is neither an option nor the value of a top-level
+    option that takes one (``--config PATH``) is the subcommand position.
     """
+    skip = False
     for token in argv:
+        if skip:
+            skip = False
+            continue
         if token in ("-h", "--help"):
             return True
+        if token in _TOP_LEVEL_VALUE_OPTIONS:
+            skip = True
+            continue
         if not token.startswith("-"):
             return token in SUBCOMMANDS
     return False
 
 
 def setup_logging(debug: bool = False) -> None:
-    """Configure logging based on debug flag.
+    """Configure logging (stdout; each line names the bottle being analysed, or '-').
 
     Args:
         debug: Whether to enable DEBUG-level logging.
     """
     level = logging.DEBUG if debug else logging.INFO
-    format_str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-
-    logging.basicConfig(
-        level=level,
-        format=format_str,
-        stream=sys.stdout,
-    )
+    logging.basicConfig(level=level, format=LOG_FORMAT, stream=sys.stdout)
+    for handler in logging.getLogger().handlers:
+        if not any(isinstance(f, BottleLogFilter) for f in handler.filters):
+            handler.addFilter(BottleLogFilter())
     # Third-party DEBUG output (PIL logs ~15 EXIF tags per image read) would
     # bury the pipeline's own messages.
     for noisy in ("PIL", "urllib3"):
         logging.getLogger(noisy).setLevel(logging.INFO)
 
 
-def resolve_vision_model(args: argparse.Namespace) -> str:
-    """Return the vision model requested for this run.
-
-    Precedence: ``-m/--model``, then ``$BOURBON_MODEL``, then the default.
-
-    Args:
-        args: Parsed command-line arguments.
-
-    Returns:
-        Model name (an Ollama tag), sent to the client unchanged.
-    """
-    return getattr(args, "model", None) or os.environ.get("BOURBON_MODEL") or DEFAULT_VISION_MODEL
+# ---------------------------------------------------------------------------
+# Run context
+# ---------------------------------------------------------------------------
 
 
-def build_server_manager(args: argparse.Namespace) -> ModelServerManager:
-    """Create (but do not start) the model server manager selected by the CLI flags.
+@dataclass
+class RunContext:
+    """Settings plus the live objects of one command run."""
 
-    Args:
-        args: Parsed command-line arguments (missing attributes use defaults).
+    settings: Settings
+    server_manager: ModelServerManager | None = None
+    model_selector: ModelSelector | None = None
+    mark_output_dir: bool = True
+    hints: HintBook = dataclass_field(default_factory=lambda: HintBook.EMPTY)
+    run_id: str = ""
 
-    Returns:
-        A ModelServerManager for the selected backend.
+
+def _as_context(target: "Settings | RunContext | argparse.Namespace") -> RunContext:
+    """A RunContext for a command entry point (parsed args are resolved to Settings)."""
+    if isinstance(target, RunContext):
+        return target
+    if isinstance(target, Settings):
+        return RunContext(target)
+    return RunContext(resolve_settings(target))
+
+
+def build_server_manager(settings: Settings) -> ModelServerManager:
+    """Create (but do not start) the Ollama server manager for these settings.
 
     Raises:
-        ValueError: If the backend name or a backend option is invalid.
+        ValueError: If a server option is invalid.
     """
-    backend = ServerBackend.parse(getattr(args, "server_backend", None) or "ollama")
-    kwargs: dict[str, Any] = {}
-
-    timeout = getattr(args, "request_timeout", None)
-    if timeout is not None:
-        kwargs["timeout"] = timeout
-    startup_timeout = getattr(args, "server_start_timeout", None)
-    if startup_timeout is not None:
-        kwargs["startup_timeout"] = startup_timeout
-    if getattr(args, "no_server_autostart", False):
-        kwargs["auto_start"] = False
-
-    kwargs["base_url"] = getattr(args, "ollama_url", None) or DEFAULT_OLLAMA_URL
-    kwargs["model"] = resolve_vision_model(args)
-
+    server = settings.server
     return ModelServerManager(
-        backend=backend,
-        keep_running=bool(getattr(args, "keep_server", False)),
-        **kwargs,
+        keep_running=server.keep_running,
+        base_url=server.ollama_url,
+        model=settings.model.vision_model,
+        timeout=server.request_timeout,
+        startup_timeout=server.start_timeout,
+        auto_start=server.autostart,
     )
 
 
-def _required_models(args: argparse.Namespace) -> list[str]:
-    """Models the server must provide before processing starts.
+def _model_selector(settings: Settings) -> ModelSelector:
+    """The run's per-stage model selector (vision model, plus the text model when active)."""
+    config = SimpleNamespace(model=settings.model.vision_model)
+    if settings.text.active:
+        config.metadata_generation_model = settings.text.model
+    return ModelSelector.from_config(config)
 
-    Only the resolved vision model is required: it is the only model the
-    pipeline calls (``lib.model_selector.IMPLEMENTED_MODEL_STAGES``).
-    Delegates to ``ModelSelector.required_models`` so the two never drift.
-    Fallback and unimplemented-stage models are never checked or pulled.
 
-    Args:
-        args: Parsed command-line arguments.
+def _required_models(settings: Settings) -> list[tuple[str, str]]:
+    """Models the server must provide before processing starts, with their capability.
+
+    Only the stages this run calls are required: the vision model, plus the
+    text model when the fact check is active. Inactive stages' models are
+    never checked or pulled.
+    """
+    return _model_selector(settings).required_model_specs(active_stages(settings.text.active))
+
+
+def _text_model_ram_verdict(manager: ModelServerManager, text_model: str) -> tuple[str, str, int | None]:
+    """``(verdict, detail, size)`` of the text model against this machine's memory.
+
+    verdict is ``ok``, ``warn``, ``error``, ``unknown`` or ``remote``.
+    """
+    base_url = getattr(getattr(manager, "server", None), "base_url", None)
+    if isinstance(base_url, str) and not is_local_url(base_url):
+        return "remote", f"Ollama at {base_url} is remote; its own memory is used", None
+    size = manager.installed_model_size(text_model)
+    if isinstance(size, bool) or not isinstance(size, (int, float)) or size <= 0:
+        return "unknown", "model size unknown", None
+    verdict, detail = memory_verdict(size, total_memory_bytes())
+    return verdict, detail, size
+
+
+def _text_model_memory_check(manager: ModelServerManager, text_model: str) -> int:
+    """Advisory check of the text model's size against physical memory.
+
+    The size is what the server reports for the installed model
+    (``/api/tags``). Unknown sizes or memory are only logged at debug level.
 
     Returns:
-        The model names to check, in order.
+        0 if the model fits (or this cannot be measured; a warning is
+        logged above 75 % of memory), 2 if the model is larger than
+        physical memory (an error is logged).
     """
-    return ModelSelector.from_config(SimpleNamespace(model=resolve_vision_model(args))).required_models()
-
-
-def _min_free_bytes(args: argparse.Namespace) -> int:
-    """``--min-free-gb`` in bytes (validated by :func:`pre_flight_checks`)."""
-    return int(getattr(args, "min_free_gb", DEFAULT_MIN_FREE_GB) * GiB)
+    verdict, detail, size = _text_model_ram_verdict(manager, text_model)
+    advice = "use a smaller model (--text-model gpt-oss:20b) or skip the fact check (--no-verify)"
+    if verdict == "remote":
+        logger.debug("%s; skipping the memory check of text model '%s'", detail, text_model)
+        return 0
+    if verdict == "error":
+        logger.error("Text model '%s' does not fit in memory: %s; %s.", text_model, detail, advice)
+        return 2
+    if verdict == "warn":
+        logger.warning(
+            "Text model '%s' is large for this machine: %s; the vision model is unloaded "
+            "before the fact check unless --keep-models-loaded. If it is too slow, %s.",
+            text_model, detail, advice,
+        )
+    elif verdict == "unknown" or size is None:
+        logger.debug("Text model '%s': %s", text_model, detail)
+    else:
+        logger.debug("Text model '%s' (%s): %s", text_model, format_gb(size), detail)
+    return 0
 
 
 def _same_directory(a: Any, b: Any) -> bool:  # noqa: ANN401
@@ -507,7 +507,7 @@ def _is_ancestor(ancestor: Any, path: Any) -> bool:  # noqa: ANN401
         return False
 
 
-def _check_output_dir(args: argparse.Namespace) -> int:
+def _check_output_dir(ctx: RunContext) -> int:
     """Check the output directory is writable; see :func:`pre_flight_checks`.
 
     A dry run writes nothing: it checks that the nearest existing ancestor
@@ -515,8 +515,8 @@ def _check_output_dir(args: argparse.Namespace) -> int:
     the directory, probes it with a uniquely named temporary file and marks
     it as output (unless it contains the photos).
     """
-    output_dir = Path(args.output_dir)
-    if getattr(args, "dry_run", False):
+    output_dir = Path(ctx.settings.output_dir)
+    if ctx.settings.dry_run:
         target = existing_ancestor(output_dir)
         if not target.is_dir() or not os.access(target, os.W_OK | os.X_OK):
             logger.error("Output directory is not writable: %s (checked %s)", output_dir, target)
@@ -527,7 +527,7 @@ def _check_output_dir(args: argparse.Namespace) -> int:
         output_dir.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(dir=output_dir, prefix=".write_test_"):
             pass
-        if getattr(args, "_mark_output_dir", True):
+        if ctx.mark_output_dir:
             (output_dir / OUTPUT_MARKER).touch()
         logger.info("Output directory is writable: %s", output_dir)
     except Exception:
@@ -536,152 +536,85 @@ def _check_output_dir(args: argparse.Namespace) -> int:
     return 0
 
 
-def pre_flight_checks(args: argparse.Namespace) -> int:
+def _load_hints(ctx: RunContext) -> int:
+    """Load ``settings.hints_file`` into ``ctx.hints``; 1 (logged) if the file is invalid."""
+    path = ctx.settings.hints_file
+    if path is None:
+        ctx.hints = HintBook.EMPTY
+        return 0
+    try:
+        ctx.hints = HintBook.load(path)
+    except SettingsError as e:
+        logger.error("Invalid hints file:\n%s", e)
+        return 1
+    return 0
+
+
+def pre_flight_checks(ctx: RunContext) -> int:
     """Verify prerequisites before processing.
 
-    Cheap local checks run first; the model server is checked last. On
-    success ``args._server_manager``, ``args._model_selector`` and the
-    resolved ``args.model`` are set. In a dry run the server is only probed:
-    nothing is started, pulled or loaded.
-
-    Args:
-        args: Parsed command-line arguments.
+    Setting values were validated by :func:`lib.settings.resolve_settings`;
+    this checks the filesystem, the hints file, Tesseract and the model
+    server, cheap checks first. On success ``ctx.server_manager``,
+    ``ctx.model_selector`` and ``ctx.hints`` are set. In a dry run the server
+    is only probed: nothing is started, pulled or loaded.
 
     Returns:
-        Exit code: 0 if checks pass, 1 (invalid argument, output directory
-        equal to the input folder, Tesseract missing),
-        2 (model server or model unavailable, invalid --ollama-url port),
-        3 (no images), 5 (output directory not writable).
+        Exit code: 0 if checks pass, 1 (output directory equal to the input
+        folder, invalid hints file, Tesseract missing), 2 (model server or
+        model unavailable, text model larger than memory), 3 (no images),
+        5 (output directory not writable).
     """
-    # Validate argument values first
-    if args.command == "process":
-        # Validate batch_size: integer >= 1 OR literal 'all'
-        batch_size = args.batch_size
-        if batch_size.lower() != "all":
-            try:
-                batch_int = int(batch_size)
-                if batch_int < 1:
-                    logger.error("Invalid --batch-size: must be >= 1 or 'all', got '%s'", batch_size)
-                    return 1
-            except ValueError:
-                logger.error("Invalid --batch-size: must be integer or 'all', got '%s'", batch_size)
-                return 1
+    settings = ctx.settings
+    image_folder = Path(settings.image_folder)
+    output_dir = Path(settings.output_dir)
 
-        # --lookahead is deprecated and ignored; its old range is still checked
-        # so scripts that passed a bad value keep failing the same way.
-        lookahead = getattr(args, "lookahead", None)
-        if lookahead is not None:
-            if lookahead < 0 or lookahead > 10:
-                logger.error("Invalid --lookahead: must be between 0 and 10, got '%s'", lookahead)
-                return 1
-            logger.warning(LOOKAHEAD_DEPRECATION_WARNING)
-
-        # Validate concurrency: integer 1-10
-        if args.concurrency < 1 or args.concurrency > 10:
-            logger.error("Invalid --concurrency: must be between 1 and 10, got '%s'", args.concurrency)
-            return 1
-
-        # Validate grouping options
-        gap = getattr(args, "group_gap_seconds", DEFAULT_GAP_SECONDS)
-        if not isinstance(gap, (int, float)) or not math.isfinite(gap) or not 0 < gap <= MAX_GROUP_GAP_SECONDS:
-            logger.error(
-                "Invalid --group-gap-seconds: must be > 0 and <= %g, got '%s'", MAX_GROUP_GAP_SECONDS, gap
-            )
-            return 1
-        size = getattr(args, "group_max_size", DEFAULT_MAX_GROUP_SIZE)
-        if not isinstance(size, int) or not 0 <= size <= MAX_GROUP_SIZE_LIMIT:
-            logger.error(
-                "Invalid --group-max-size: must be between 0 and %d, got '%s'", MAX_GROUP_SIZE_LIMIT, size
-            )
-            return 1
-        ratio = getattr(args, "split_budget_ratio", DEFAULT_SPLIT_BUDGET_RATIO)
-        if (
-            not isinstance(ratio, (int, float))
-            or not math.isfinite(ratio)
-            or not 0 <= ratio <= MAX_SPLIT_BUDGET_RATIO
-        ):
-            logger.error(
-                "Invalid --split-budget-ratio: must be between 0 and %g, got '%s'", MAX_SPLIT_BUDGET_RATIO, ratio
-            )
-            return 1
-
-        # Validate timeouts
-        for flag, dest in (
-            ("--request-timeout", "request_timeout"),
-            ("--server-start-timeout", "server_start_timeout"),
-        ):
-            value = getattr(args, dest, None)
-            if value is not None and value <= 0:
-                logger.error("Invalid %s: must be > 0, got '%s'", flag, value)
-                return 1
-
-        # Validate min_free_gb: a finite number >= 0
-        min_free_gb = getattr(args, "min_free_gb", DEFAULT_MIN_FREE_GB)
-        if not isinstance(min_free_gb, (int, float)) or not math.isfinite(min_free_gb) or min_free_gb < 0:
-            logger.error("Invalid --min-free-gb: must be >= 0, got '%s'", min_free_gb)
-            return 1
-
-        # Validate ollama_url format
-        try:
-            parsed = urlparse(args.ollama_url)
-            if not parsed.scheme or not parsed.netloc:
-                logger.error("Invalid --ollama-url: must be valid URL, got '%s'", args.ollama_url)
-                return 1
-        except Exception as e:
-            logger.error("Invalid --ollama-url: %s", e)
-            return 1
-        try:
-            parsed.port  # noqa: B018 - raises ValueError for an out-of-range port
-        except ValueError as e:
-            logger.error("Invalid --ollama-url '%s': %s", args.ollama_url, e)
-            return 2
-
-    # Check input folder exists
-    if not args.image_folder.exists():
-        logger.error("Input folder does not exist: %s", args.image_folder)
+    if not image_folder.exists():
+        logger.error("Input folder does not exist: %s", image_folder)
         return 3
-
-    if not args.image_folder.is_dir():
-        logger.error("Input path is not a directory: %s", args.image_folder)
+    if not image_folder.is_dir():
+        logger.error("Input path is not a directory: %s", image_folder)
         return 3
 
     # Outputs written into the input folder itself would be re-processed.
-    if _same_directory(args.output_dir, args.image_folder):
+    if _same_directory(output_dir, image_folder):
         logger.error(
             "--output-dir must not be the same directory as --image-folder "
             "(outputs would be re-processed): %s",
-            args.output_dir,
+            output_dir,
         )
         return 1
 
     # Count exactly what the scan will process (earlier outputs, hidden
     # folders and the output directory are left out).
-    image_files = ImageOrganizer().iter_image_paths(
-        args.image_folder, recursive=True, exclude=[args.output_dir]
-    )
+    image_files = ImageOrganizer().iter_image_paths(image_folder, recursive=True, exclude=[output_dir])
     if not image_files:
-        logger.error("No supported images found in folder: %s", args.image_folder)
+        logger.error("No supported images found in folder: %s", image_folder)
         logger.info("Supported formats: %s", ", ".join(sorted(ImageOrganizer.SUPPORTED_EXTENSIONS)))
         return 3
 
-    logger.info("Found %s images in %s", len(image_files), args.image_folder)
+    logger.info("Found %s images in %s", len(image_files), image_folder)
+
+    # A bad hints file stops the run before any model work.
+    exit_code = _load_hints(ctx)
+    if exit_code:
+        return exit_code
 
     # An output directory that contains the photos must not be marked as
     # output: later scans of it (or of its parents) would skip the photos.
-    args._mark_output_dir = not _is_ancestor(args.output_dir, args.image_folder)
-    if not args._mark_output_dir:
+    ctx.mark_output_dir = not _is_ancestor(output_dir, image_folder)
+    if not ctx.mark_output_dir:
         logger.warning(
             "--output-dir %s contains --image-folder %s; outputs are written next to your photos "
             "(each bottle folder is marked so later scans skip it). Prefer an output directory "
             "outside the photo folder.",
-            args.output_dir, args.image_folder,
+            output_dir, image_folder,
         )
 
-    exit_code = _check_output_dir(args)
+    exit_code = _check_output_dir(ctx)
     if exit_code:
         return exit_code
 
-    # Check Tesseract OCR installed
     try:
         import pytesseract
 
@@ -693,110 +626,175 @@ def pre_flight_checks(args: argparse.Namespace) -> int:
         return 1
 
     # Model server last: it is the slow check and may start a process.
-    return _check_model_server(args)
+    return _check_model_server(ctx)
 
 
-def _check_model_server(args: argparse.Namespace) -> int:
+def _check_model_server(ctx: RunContext) -> int:
     """Pre-flight step for the model server; see :func:`pre_flight_checks`."""
+    settings = ctx.settings
     try:
-        backend = ServerBackend.parse(getattr(args, "server_backend", None) or "ollama")
-        manager = build_server_manager(args)
+        manager = build_server_manager(settings)
     except Exception as e:
         logger.error("Failed to configure model server: %s", e)
         return 2
 
-    args._server_manager = manager
-    args.model = resolve_vision_model(args)
-    required = _required_models(args)
+    ctx.server_manager = manager
+    required = _required_models(settings)
+    required_names = ", ".join(name for name, _ in required)
+    stages = active_stages(settings.text.active)
     model_checks: dict[str, Any] = {
-        "allow_pull": bool(getattr(args, "pull", False)),
-        "capability": "vision",
-        "min_free_bytes": _min_free_bytes(args),
+        "allow_pull": settings.model.pull,
+        "min_free_bytes": settings.model.min_free_bytes,
+        # Only the vision model is loaded at pre-flight: a text model loaded
+        # now would sit beside it through the whole vision phase.
+        "warm_models": [settings.model.vision_model],
     }
 
     def _fail(message: str, *params: object) -> int:
         logger.error(message, *params)
         manager.close()
-        args._server_manager = None
+        ctx.server_manager = None
         return 2
 
-    if getattr(args, "dry_run", False):
+    if settings.dry_run:
+        logger.info("Dry run: active stages: %s", ", ".join(sorted(s.name for s in stages)))
+        logger.info(
+            "Dry run: text model: %s (fact check %s)",
+            settings.text.model, "on" if settings.text.active else "off",
+        )
+        logger.info("Dry run: web search provider: %s", settings.web.provider_resolved)
         state = manager.probe()
         if not state.is_running:
             allowed, why = manager.server.can_start()
             if not allowed:
-                return _fail(
-                    "Dry run: %s backend at %s is not running and %s",
-                    backend.value, state.base_url, why,
-                )
+                return _fail("Dry run: Ollama at %s is not running and %s", state.base_url, why)
             logger.warning(
-                "Dry run: %s backend at %s is not running (would be started); skipping model checks",
-                backend.value, state.base_url,
+                "Dry run: Ollama at %s is not running (would be started); skipping model checks",
+                state.base_url,
             )
+            if settings.text.active:
+                logger.info("Dry run: RAM check of text model %s: not checked (server not running)",
+                            settings.text.model)
         else:
-            logger.info("Dry run: %s backend at %s is reachable", backend.value, state.base_url)
+            logger.info("Dry run: Ollama at %s is reachable", state.base_url)
             if not manager.ensure_models(required, dry_run=True, warm=False, **model_checks):
-                return _fail(
-                    "Required models unavailable: %s (see the errors above)",
-                    ", ".join(required),
-                )
+                return _fail("Required models unavailable: %s (see the errors above)", required_names)
+            if settings.text.active:
+                verdict, detail, _ = _text_model_ram_verdict(manager, settings.text.model)
+                logger.info("Dry run: RAM check of text model %s: %s (%s)", settings.text.model, verdict, detail)
+                if _text_model_memory_check(manager, settings.text.model):
+                    return _fail("Text model %s does not fit in memory", settings.text.model)
     else:
         if not manager.ensure_running():
             return _fail("Model server unavailable: %s", manager.last_error or "health check failed")
         logger.info("Model server is reachable at %s", manager.server.base_url)
         if not manager.ensure_models(required, dry_run=False, warm=True, **model_checks):
-            return _fail(
-                "Required models unavailable: %s (see the errors above)",
-                ", ".join(required),
-            )
+            return _fail("Required models unavailable: %s (see the errors above)", required_names)
+        if settings.text.active and _text_model_memory_check(manager, settings.text.model):
+            return _fail("Text model %s does not fit in memory", settings.text.model)
 
-    selector = ModelSelector.from_config(SimpleNamespace(model=args.model))
-    if getattr(args, "debug", False):
-        selector.print_stage_report()
-    args._model_selector = selector
+    selector = _model_selector(settings)
+    if settings.debug:
+        selector.print_stage_report(stages)
+    ctx.model_selector = selector
     return 0
 
 
-def process_command(args: argparse.Namespace) -> int:
-    """Process bourbon bottle images from input folder.
+# ---------------------------------------------------------------------------
+# process
+# ---------------------------------------------------------------------------
+
+
+def process_command(target: "Settings | RunContext | argparse.Namespace") -> int:
+    """Process bourbon bottle images from the input folder.
 
     The usage summary is always logged and the model server manager is always
     closed (stopping the server only if this run started it).
 
     Args:
-        args: Parsed command-line arguments.
+        target: The run's Settings, or a prepared RunContext.
 
     Returns:
         Exit code: 0 (success), 1 (general error / some bottles failed),
                    2 (model server or model unavailable), 3 (no valid images found),
                    4 (all bottles failed), 5 (output directory creation failed).
     """
+    ctx = _as_context(target)
     try:
-        exit_code = pre_flight_checks(args)
+        exit_code = pre_flight_checks(ctx)
         if exit_code:
             return exit_code
-        if getattr(args, "_server_manager", None) is None:
-            args._server_manager = build_server_manager(args)
-        if getattr(args, "_model_selector", None) is None:
-            args._model_selector = ModelSelector.from_config(
-                SimpleNamespace(model=resolve_vision_model(args))
-            )
-        return _run_pipeline(args, args._server_manager, args._model_selector)
+        if ctx.settings.hints_file is not None and ctx.hints.path is None:
+            exit_code = _load_hints(ctx)  # pre-flight normally loaded it already
+            if exit_code:
+                return exit_code
+        if ctx.server_manager is None:
+            ctx.server_manager = build_server_manager(ctx.settings)
+        if ctx.model_selector is None:
+            ctx.model_selector = _model_selector(ctx.settings)
+        return _run_pipeline(ctx)
     finally:
-        _log_usage_summary(getattr(args, "_model_selector", None))
-        server_manager = getattr(args, "_server_manager", None)
-        if server_manager is not None:
+        _log_usage_summary(ctx.model_selector)
+        if ctx.server_manager is not None:
             try:
-                server_manager.close()
+                ctx.server_manager.close()
             except Exception:
                 logger.warning("Error while shutting down the model server", exc_info=True)
 
 
-def _run_pipeline(
-    args: argparse.Namespace,
-    server_manager: ModelServerManager,
-    model_selector: ModelSelector,
-) -> int:
+def _tool_version() -> str:
+    try:
+        from importlib.metadata import version
+
+        return version("bourbon-image-processor")
+    except Exception:
+        return "unknown"
+
+
+def _write_run_manifest(ctx: RunContext) -> Path | None:
+    """Write ``<output_dir>/run_<run_id>_settings.json`` (never overwritten; no API keys).
+
+    A taken name gets a ``_N`` suffix, which also becomes part of ``ctx.run_id``.
+    Returns the path, or None if it could not be written (logged).
+    """
+    settings = ctx.settings
+    base_id = ctx.run_id
+    try:
+        Path(settings.output_dir).mkdir(parents=True, exist_ok=True)
+    except OSError:
+        logger.exception("Could not create the output directory %s", settings.output_dir)
+        return None
+    for n in range(1, 100):
+        run_id = base_id if n == 1 else f"{base_id}_{n}"
+        path = Path(settings.output_dir) / f"run_{run_id}_settings.json"
+        manifest = {
+            "run_id": run_id,
+            "tool": "bourbon-image-processor",
+            "tool_version": _tool_version(),
+            "created_at": datetime.now().astimezone().isoformat(),
+            "models": {
+                "vision": settings.model.vision_model,
+                "text": settings.text.model if settings.text.active else None,
+            },
+            **settings_to_dict(settings),
+        }
+        try:
+            with path.open("x", encoding="utf-8") as handle:
+                json.dump(manifest, handle, indent=2)
+                handle.write("\n")
+        except FileExistsError:
+            continue
+        except OSError:
+            logger.exception("Could not write the run settings file %s", path)
+            return None
+        ctx.run_id = run_id
+        logger.info("Run settings recorded in %s", path)
+        return path
+    logger.error("Could not find a free run settings file name for run %s", base_id)
+    return None
+
+
+def _run_pipeline(ctx: RunContext) -> int:
     """Scan, group, analyze and save bottles. Does not close the server manager.
 
     The scan skips the output directory and earlier outputs. Each bottle is
@@ -804,29 +802,23 @@ def _run_pipeline(
     a bottle that fails analysis or saving, or is rejected in interactive
     mode, gets an ``error_report_<bottle_id>.json`` that ``retry`` can read.
 
-    Args:
-        args: Parsed command-line arguments (pre-flight already passed).
-        server_manager: Model server manager (started unless dry run).
-        model_selector: Per-stage model selector (records usage).
-
     Returns:
         Exit code: 0 (no failures), 1 (some failed), 2 (model server
-        unavailable), 4 (all failed).
+        unavailable), 3 (no images), 4 (all failed).
     """
+    settings = ctx.settings
     image_organizer = ImageOrganizer(
-        gap_seconds=getattr(args, "group_gap_seconds", DEFAULT_GAP_SECONDS),
-        max_group_size=getattr(args, "group_max_size", DEFAULT_MAX_GROUP_SIZE),
+        gap_seconds=settings.grouping.gap_seconds,
+        max_group_size=settings.grouping.max_group_size,
     )
 
     # Scan images, leaving out earlier outputs (the output dir may sit inside
     # the input folder, e.g. the default `-f . -o processed`).
-    images = image_organizer.scan_images(
-        args.image_folder, recursive=True, exclude=[args.output_dir]
-    )
+    images = image_organizer.scan_images(settings.image_folder, recursive=True, exclude=[settings.output_dir])
     if not images:
         logger.error(
             "No supported images found in %s (earlier outputs and hidden folders are skipped)",
-            args.image_folder,
+            settings.image_folder,
         )
         return 3
 
@@ -837,37 +829,70 @@ def _run_pipeline(
     _assign_bottle_ids(image_groups)
     logger.info("Found %s bottle groups", len(image_groups))
 
-    if args.dry_run:
+    if settings.dry_run:
         logger.info("Dry-run mode: would process images but not execute")
         for group in image_groups:
             logger.info("  %s: %s", group_bottle_id(group), [str(img.path) for img in group])
         return 0
 
     try:
-        client = server_manager.get_client()
+        client = ctx.server_manager.get_client()
     except ModelServerError as e:
         logger.error("Model server unavailable: %s", e)
         return 2
 
-    bottle_analyzer = BottleAnalyzer(
-        ollama_client=client,
-        image_organizer=image_organizer,
-        model_selector=model_selector,
-    )
-    vision_model = resolve_vision_model(args)
+    ctx.run_id = ctx.run_id or datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
+    _write_run_manifest(ctx)
 
-    batch_processor = BatchProcessor(
-        batch_size=args.batch_size,
-        bottle_analyzer=bottle_analyzer,
-        split_budget_ratio=getattr(args, "split_budget_ratio", DEFAULT_SPLIT_BUDGET_RATIO),
-        max_group_size=getattr(args, "group_max_size", DEFAULT_MAX_GROUP_SIZE),
-    )
-    preview_generator = PreviewGenerator(
-        output_dir=args.output_dir, mark_output_dir=getattr(args, "_mark_output_dir", True)
-    )
+    executor = None
+    if settings.concurrency > 1:
+        executor = ThreadPoolExecutor(max_workers=settings.concurrency, thread_name_prefix="bottle")
+        logger.info(
+            "Analysing up to %d bottle groups in parallel; parallel vision requests depend on the "
+            "server's OLLAMA_NUM_PARALLEL (extra requests queue, and the wait counts toward "
+            "--request-timeout)",
+            settings.concurrency,
+        )
+    batch_processor = None
+    try:
+        bottle_analyzer = BottleAnalyzer(
+            ollama_client=client,
+            model_selector=ctx.model_selector,
+            retry_policy=settings.retry.policy(),
+        )
+        batch_processor = BatchProcessor(
+            batch_size=settings.batch_size,
+            bottle_analyzer=bottle_analyzer,
+            split_budget_ratio=settings.grouping.split_budget_ratio,
+            max_group_size=settings.grouping.max_group_size,
+            executor=executor,
+            hints=ctx.hints,
+        )
+        exit_code = _process_batches(ctx, image_groups, bottle_analyzer, batch_processor)
+    except BaseException:
+        if batch_processor is not None:
+            batch_processor.cancel.set()
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+            executor = None
+        raise
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+    return exit_code
 
+
+def _process_batches(
+    ctx: RunContext,
+    image_groups: list,
+    bottle_analyzer: BottleAnalyzer,
+    batch_processor: BatchProcessor,
+) -> int:
+    """Run every batch: analysis, hint overrides, review, previews, saving and reports."""
+    settings = ctx.settings
+    preview_generator = PreviewGenerator(output_dir=settings.output_dir, mark_output_dir=ctx.mark_output_dir)
     totals = _RunTotals()
-    run_id = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
+    seen_ids: set[str] = {group_bottle_id(group) for group in image_groups if group}
 
     # One split-check budget for the whole run, shared by all batches.
     batch_processor.start_run(image_groups)
@@ -875,17 +900,13 @@ def _run_pipeline(
     # batch is processed as sliced: no group is ever moved or seen twice.
     batches = batch_processor.slice_into_batches(image_groups)
 
-    # Process each batch
     for batch_idx, batch in enumerate(batches, 1):
         logger.info("Processing batch %s/%s (%s image groups)", batch_idx, len(batches), len(batch))
 
-        # Process the batch. Fatal model errors (model unusable, server gone)
-        # would fail every remaining bottle the same way: abort the run.
+        # Fatal model errors (model unusable, server gone) would fail every
+        # remaining bottle the same way: abort the run.
         try:
-            batch_result = batch_processor.process_batch(
-                batch,
-                vision_model=vision_model,
-            )
+            batch_result = batch_processor.process_batch(batch, vision_model=settings.model.vision_model)
         except FATAL_MODEL_ERRORS as e:
             logger.error("Aborting: %s", e)
             return 2
@@ -900,38 +921,32 @@ def _run_pipeline(
             ]
             bottle_dict["quantity"] = max(1, bottle_analyzer.detect_quantity(group)) if group else 1
 
+        # Hint field values: sourced human corrections, before review and saving.
+        for bottle_dict, metadata in zip(batch_result.bottle_dicts, batch_result.metadata_list, strict=True):
+            seen_ids.add(PreviewGenerator.bottle_id_for(bottle_dict, metadata))
+        apply_hint_overrides(
+            batch_result.bottle_dicts, batch_result.metadata_list, ctx.hints, settings.hints_file
+        )
+
         # Interactive mode: prompt user for corrections
         rejected: set[str] = set()
-        if args.interactive:
+        if settings.interactive:
             try:
-                from models.bottle import Correction
-
                 correction_dicts, rejected_bottles_from_prompt = preview_generator.interactive_prompt(
                     batch_result.bottle_dicts,
                     batch_result.metadata_list,
                 )
 
                 if correction_dicts:
-                    # Convert dict corrections to Correction objects
-                    corrections = [
-                        Correction(
-                            field_name=cd["field_name"],
-                            original_value=cd["original_value"],
-                            corrected_value=cd["corrected_value"],
-                        )
-                        for cd in correction_dicts
-                    ]
-
-                    # Apply corrections to bottle_dicts
-                    batch_result.bottle_dicts = batch_processor.apply_corrections(
-                        batch_result.bottle_dicts,
-                        corrections,
+                    corrections = _corrections_from_prompt(correction_dicts)
+                    _, unapplied = apply_corrections(
+                        batch_result.bottle_dicts, batch_result.metadata_list, corrections
                     )
-
-                    # Learn from corrections for future batches
-                    batch_processor.learn_from_feedback(corrections)
-
-                    logger.info("Applied %d corrections from interactive feedback", len(corrections))
+                    _log_unapplied(unapplied)
+                    logger.info(
+                        "Applied %d of %d corrections from interactive feedback",
+                        len(corrections) - len(unapplied), len(corrections),
+                    )
 
                 # Rejected bottles are not saved and count as failed
                 rejected = set(rejected_bottles_from_prompt)
@@ -945,12 +960,12 @@ def _run_pipeline(
         # Batch preview report and JSON, after review so they hold the
         # corrected values and every rejected bottle (skipped when processing
         # all in a single batch).
-        if str(args.batch_size).lower() != "all":
+        if str(settings.batch_size).lower() != "all":
             try:
                 preview_path = preview_generator.save_batch_preview(
                     batch_result.bottle_dicts,
                     batch_result.metadata_list,
-                    batch_id=f"{run_id}_{batch_idx:03d}",
+                    batch_id=f"{ctx.run_id}_{batch_idx:03d}",
                     rejected_bottles=list(batch_result.failed_bottles),
                 )
                 logger.info("Saved batch preview report to %s", preview_path)
@@ -959,6 +974,12 @@ def _run_pipeline(
 
         _save_batch_bottles(batch_result, rejected, preview_generator, bottle_analyzer, totals)
         _report_failed_bottles(batch_result, batch, rejected, preview_generator, totals)
+
+    for unused in ctx.hints.unused(seen_ids):
+        logger.warning(
+            "Hint for bottle %s matched no bottle in this run (check the bottle ID in %s)",
+            unused, settings.hints_file,
+        )
 
     # Completion reporting
     logger.info("=" * 60)
@@ -971,7 +992,7 @@ def _run_pipeline(
     nudge = batch_processor.group_size_nudge()
     if nudge:
         logger.warning("%s", nudge)
-    logger.info("Output directory: %s", args.output_dir)
+    logger.info("Output directory: %s", settings.output_dir)
     for folder in totals.saved_folders:
         logger.info("  Saved: %s", folder)
     for report in totals.error_reports:
@@ -1026,11 +1047,14 @@ def _write_failure_report(
     images: list,
     error: BaseException | str,
     stage: str,
+    retry_count: int = 0,
 ) -> None:
     """Write a retry-able failure report; a failure to write is only logged."""
     try:
         totals.error_reports.append(
-            preview_generator.save_failure_report(bottle_id, [str(p) for p in images], error, stage=stage)
+            preview_generator.save_failure_report(
+                bottle_id, [str(p) for p in images], error, stage=stage, retry_count=retry_count
+            )
         )
     except Exception:
         logger.exception("Could not write the %s failure report for %s", stage, bottle_id)
@@ -1060,7 +1084,12 @@ def _save_batch_bottles(
             )
             continue
         try:
-            bottle = Bottle.from_analysis(bottle_dict, metadata, quantity=bottle_dict.get("quantity"))
+            bottle = Bottle.from_analysis(
+                bottle_dict,
+                metadata,
+                quantity=bottle_dict.get("quantity"),
+                corrections=bottle_dict.get("corrections") or [],
+            )
             extra = (
                 {"vision_raw_response": bottle_dict["vision_raw_response"]}
                 if "vision_raw_response" in bottle_dict
@@ -1101,9 +1130,9 @@ def _report_failed_bottles(
         totals.failed += 1
         if failed_bottle_id in rejected:
             continue
-        reason = batch_result.errors.get(failed_bottle_id)
-        if reason:
-            logger.warning("Bottle failed to process: %s (%s)", failed_bottle_id, reason)
+        error = batch_result.errors.get(failed_bottle_id)
+        if error:
+            logger.warning("Bottle failed to process: %s (%s)", failed_bottle_id, describe_error(error))
         else:
             logger.warning("Bottle failed to process: %s", failed_bottle_id)
         group = groups_by_id.get(failed_bottle_id, [])
@@ -1112,8 +1141,9 @@ def _report_failed_bottles(
             totals,
             failed_bottle_id,
             [img.path for img in group],
-            reason or "analysis failed; see the log",
+            error or "analysis failed; see the log",
             "analysis",
+            retry_count=max(0, getattr(error, "attempts", 1) - 1),
         )
 
 
@@ -1137,15 +1167,13 @@ def _log_usage_summary(selector: Any) -> None:  # noqa: ANN401
     logger.info("=" * 60)
     logger.info("  Total calls:      %s", summary.get("total_calls", 0))
     logger.info("  Successful calls: %s", summary.get("successful_calls", 0))
-    logger.info("  Fallback calls:   %s", summary.get("fallback_calls", 0))
     logger.info("  Total duration:   %.2fs", summary.get("total_duration_seconds", 0))
     by_stage = summary.get("by_stage", {})
     if by_stage:
         logger.info("  By stage:")
         for stage_name, stats in by_stage.items():
-            logger.info("    %s: %s calls, %s success, %s fallback",
-                        stage_name, stats.get("total", 0),
-                        stats.get("success", 0), stats.get("fallback", 0))
+            logger.info("    %s: %s calls, %s success",
+                        stage_name, stats.get("total", 0), stats.get("success", 0))
     by_model = summary.get("by_model", {})
     if by_model:
         logger.info("  By model:")
@@ -1165,29 +1193,36 @@ def _resave_corrected_bottles(
     metadata_list: list,
     counts_before: list[int],
     rejected: set[str],
-) -> int:
+) -> tuple[int, list[str]]:
     """Save each bottle that just received a correction as a new output folder.
 
-    ``BatchProcessor.apply_corrections`` appends to a bottle's
+    ``apply_corrections`` appends to a bottle's
     ``corrections`` list, so a bottle is resaved only if that list grew.
     Bottles listed as rejected (in the batch JSON or during this review) and
     bottles no correction touched are left alone; existing folders are never
     overwritten (``save_bottle_files`` picks a new ``_N`` name).
 
     Returns:
-        Number of bottles resaved.
+        ``(resaved, failed)``: the number of bottles resaved, and the IDs of
+        corrected bottles whose new folder could not be written (so the
+        caller can report that the correction reached no output).
     """
     from models.bottle import Bottle
 
     resaved = 0
-    for index, (bottle_dict, metadata) in enumerate(zip(bottle_dicts, metadata_list)):  # noqa: B905
+    failed: list[str] = []
+    for index, bottle_dict in enumerate(bottle_dicts):
+        # A batch JSON without (enough) metadata still gets its corrected bottles saved.
+        metadata = metadata_list[index] if index < len(metadata_list) else None
         bottle_id = PreviewGenerator.bottle_id_for(bottle_dict, metadata)
-        if bottle_id in rejected:
-            logger.info("Not resaving rejected bottle %s", bottle_id)
-            continue
         recorded = bottle_dict.get("corrections") or []
         before = counts_before[index] if index < len(counts_before) else 0
         if len(recorded) <= before:
+            continue
+        if bottle_id in rejected:
+            logger.warning(
+                "Bottle %s is rejected, so its correction(s) were not saved to any output", bottle_id
+            )
             continue
         try:
             bottle = Bottle.from_analysis(bottle_dict, metadata, corrections=recorded)
@@ -1196,29 +1231,138 @@ def _resave_corrected_bottles(
             resaved += 1
         except Exception:
             logger.exception("Failed to resave bottle %s", bottle_id)
-    return resaved
+            failed.append(bottle_id)
+    return resaved, failed
 
 
-def feedback_command(args: argparse.Namespace) -> int:
-    """Apply feedback and corrections to processed batch.
+def _corrections_from_prompt(correction_dicts: list[dict]) -> list[Correction]:
+    """Turn ``interactive_prompt`` correction dicts into Corrections (source 'interactive')."""
+    return [
+        Correction(
+            bottle_id=cd["bottle_id"],
+            field_name=cd["field_name"],
+            original_value=cd["original_value"],
+            corrected_value=cd["corrected_value"],
+            source="interactive",
+        )
+        for cd in correction_dicts
+    ]
 
-    Args:
-        args: Parsed command-line arguments.
+
+def _log_unapplied(unapplied: list[tuple[Correction, str]]) -> None:
+    """Log every correction that was not applied, with its reason."""
+    for correction, reason in unapplied:
+        logger.error(
+            "Correction not applied (%s): bottle %s, %s %r -> %r",
+            reason, correction.bottle_id, correction.field_name,
+            correction.original_value, correction.corrected_value,
+        )
+
+
+def _load_corrections_file(path: Path) -> list[Correction]:
+    """Read a corrections file: a JSON list of ``{bottle_id, field_name, original_value, corrected_value}``.
+
+    Raises:
+        ValueError: If the file is not such a list or an entry lacks a key.
+        OSError, json.JSONDecodeError: If the file cannot be read or parsed.
+    """
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, list):
+        raise ValueError(
+            "corrections file must be a JSON list of "
+            "{bottle_id, field_name, original_value, corrected_value} objects"
+        )
+    corrections = []
+    for index, item in enumerate(data):
+        if not isinstance(item, dict):
+            raise ValueError(f"entry {index} is not an object")
+        missing = [
+            key for key in ("bottle_id", "field_name", "original_value", "corrected_value")
+            if key not in item
+        ]
+        if missing:
+            raise ValueError(f"entry {index} lacks {', '.join(missing)}")
+        if item["corrected_value"] is None:
+            # str(None) would write the literal text "None" into the bottle.
+            raise ValueError(f"entry {index} has a null corrected_value")
+        corrections.append(
+            Correction.from_dict(
+                {
+                    **item,
+                    "original_value": "" if item["original_value"] is None else str(item["original_value"]),
+                    "corrected_value": str(item["corrected_value"]),
+                    "source": f"feedback:{path}",
+                }
+            )
+        )
+    return corrections
+
+
+def _upgrade_legacy_label_price(bottle_dicts: list[dict]) -> None:
+    """Move a pre-``label_price`` batch's photo price out of ``msrp`` (in place).
+
+    Batches written before the rename stored the price read from the photos
+    as ``msrp``. That is a shop price, never an MSRP, so a resaved bottle must
+    not publish it as one: it becomes ``label_price`` and ``msrp`` becomes
+    unknown. An ``msrp`` a person set (a recorded correction of ``msrp``) is
+    kept.
+    """
+    for bottle_dict in bottle_dicts:
+        if not isinstance(bottle_dict, dict) or "label_price" in bottle_dict:
+            continue
+        human_msrp = any(
+            isinstance(c, dict) and c.get("field_name") == "msrp" for c in bottle_dict.get("corrections") or []
+        )
+        if human_msrp:
+            bottle_dict["label_price"] = None
+            continue
+        price = bottle_dict.get("msrp")
+        bottle_dict["label_price"] = price
+        bottle_dict["msrp"] = None
+        if price not in (None, ""):
+            logger.warning(
+                "Bottle %s: older batch file stored the photo price %s as msrp; it is kept as "
+                "label_price and the MSRP is unknown",
+                bottle_dict.get("bottle_id", "?"), price,
+            )
+
+
+def feedback_command(target: "Settings | RunContext | argparse.Namespace") -> int:
+    """Apply feedback and corrections to a processed batch.
+
+    Uses ``settings.output_dir``, ``batch``, ``corrections``, ``interactive``
+    and ``approve``; no model, server or web setting. Corrections (from
+    ``--corrections`` or interactive review) are applied by bottle ID only
+    (:func:`image_processor.corrections.apply_corrections`); every correction
+    that could not be applied is logged with its reason.
 
     Returns:
-        Exit code: 0 (success), 1 (general error), 2 (batch not found).
+        Exit code: 0 (success), 1 (general error, or a correction was not
+        applied), 2 (batch not found).
     """
-    from models.bottle import Correction
+    from models.bottle import ExtractedMetadata
+
+    settings = _as_context(target).settings
+    output_dir = Path(settings.output_dir)
+
+    if settings.approve:
+        # Recorded only; the fact-check stage applies approvals.
+        logger.info(
+            "--approve is applied by the fact-check stage (requested for: %s)", ", ".join(settings.approve)
+        )
 
     # Determine batch to load
-    if args.batch:
-        batch_preview_file = args.output_dir / f"batch_{args.batch}_preview.md"
-        batch_json_file = args.output_dir / f"batch_{args.batch}.json"
+    if settings.batch:
+        batch_preview_file = output_dir / f"batch_{settings.batch}_preview.md"
+        batch_json_file = output_dir / f"batch_{settings.batch}.json"
+        if not batch_json_file.exists() and not batch_preview_file.exists():
+            logger.error("Batch %s not found in %s", settings.batch, output_dir)
+            return 2
     else:
         # Find most recent batch preview
-        batch_preview_files = sorted(args.output_dir.glob("batch_*_preview.md"))
+        batch_preview_files = sorted(output_dir.glob("batch_*_preview.md"))
         if not batch_preview_files:
-            logger.error("No batch preview files found in %s", args.output_dir)
+            logger.error("No batch preview files found in %s", output_dir)
             return 2
         batch_preview_file = max(batch_preview_files, key=lambda p: (p.stat().st_mtime, p.name))
         batch_json_file = batch_preview_file.with_name(
@@ -1227,141 +1371,102 @@ def feedback_command(args: argparse.Namespace) -> int:
 
     logger.info("Using batch file: %s", batch_preview_file)
 
-    # Load batch data from JSON if available
-    bottle_dicts = []
-    metadata_list = []
-    previously_rejected: set[str] = set()
+    if not batch_json_file.exists():
+        logger.error("Batch data file not found: %s (it holds the bottles to correct)", batch_json_file)
+        return 2
+    try:
+        batch_data = json.loads(batch_json_file.read_text(encoding="utf-8"))
+        bottle_dicts: list[dict] = list(batch_data.get("bottles") or [])
+        previously_rejected = {str(r) for r in batch_data.get("rejected") or []}
+        metadata_list = [ExtractedMetadata.from_dict(m) for m in batch_data.get("metadata") or []]
+    except Exception:
+        logger.exception("Failed to load batch JSON file %s", batch_json_file)
+        return 1
+    logger.info("Loaded %d bottles from batch JSON", len(bottle_dicts))
+    _upgrade_legacy_label_price(bottle_dicts)
 
-    if batch_json_file.exists():
-        try:
-            import json
-
-            with batch_json_file.open("r", encoding="utf-8") as f:
-                batch_data = json.load(f)
-                bottle_dicts = batch_data.get("bottles", [])
-                previously_rejected = {str(r) for r in batch_data.get("rejected") or []}
-                # Reconstruct metadata from loaded data
-                from models.bottle import ExtractedMetadata
-
-                metadata_list = [
-                    ExtractedMetadata.from_dict(m) for m in batch_data.get("metadata", [])
-                ]
-            logger.info("Loaded %d bottles from batch JSON", len(bottle_dicts))
-        except Exception:
-            logger.exception("Failed to load batch JSON file")
-
-    # Load corrections from JSON file if provided
     corrections: list[Correction] = []
-
-    if args.corrections and args.corrections.exists():
-        try:
-            import json
-
-            with args.corrections.open("r", encoding="utf-8") as f:
-                corrections_data = json.load(f)
-                corrections = [Correction.from_dict(c) for c in corrections_data]
-            logger.info("Loaded %d corrections from %s", len(corrections), args.corrections)
-        except Exception:
-            logger.exception("Failed to load corrections file")
+    rejected = set(previously_rejected)
+    if settings.corrections:
+        corrections_file = Path(settings.corrections)
+        if not corrections_file.exists():
+            logger.error("Corrections file not found: %s", corrections_file)
             return 1
-
-    # Apply corrections
-    if corrections and bottle_dicts:
-        batch_processor = BatchProcessor()
-        batch_processor.bottle_analyzer = BottleAnalyzer()
-
-        before = _correction_counts(bottle_dicts)
-        modified_bottles = batch_processor.apply_corrections(bottle_dicts, corrections)
-        logger.info("Applied %d corrections to %d bottles", len(corrections), len(modified_bottles))
-
-        _resave_corrected_bottles(
-            PreviewGenerator(output_dir=args.output_dir),
-            modified_bottles,
-            metadata_list,
-            before,
-            previously_rejected,
-        )
-        logger.info("Feedback processing complete")
-        return 0
-
-    # Interactive mode
-    if args.interactive:
         try:
-            preview_generator = PreviewGenerator(output_dir=args.output_dir)
-            batch_processor = BatchProcessor()
-
-            correction_dicts, rejected_bottles = preview_generator.interactive_prompt(
-                bottle_dicts,
-                metadata_list,
-            )
-
-            if correction_dicts:
-                # Convert dict corrections to Correction objects
-                corrections = [
-                    Correction(
-                        field_name=cd["field_name"],
-                        original_value=cd["original_value"],
-                        corrected_value=cd["corrected_value"],
-                    )
-                    for cd in correction_dicts
-                ]
-
-                # Apply corrections to bottle_dicts
-                before = _correction_counts(bottle_dicts)
-                modified_bottles = batch_processor.apply_corrections(bottle_dicts, corrections)
-
-                # Learn from corrections
-                batch_processor.learn_from_feedback(corrections)
-
-                logger.info("Applied %d corrections from interactive feedback", len(corrections))
-
-                _resave_corrected_bottles(
-                    preview_generator,
-                    modified_bottles,
-                    metadata_list,
-                    before,
-                    previously_rejected | {str(r) for r in rejected_bottles or []},
-                )
-
-            logger.info("Interactive feedback complete")
-            return 0
-
+            corrections = _load_corrections_file(corrections_file)
+        except Exception as e:
+            logger.error("Failed to load corrections file %s: %s", corrections_file, e)
+            return 1
+        logger.info("Loaded %d corrections from %s", len(corrections), corrections_file)
+    elif settings.interactive:
+        try:
+            correction_dicts, rejected_bottles = PreviewGenerator(
+                output_dir=output_dir
+            ).interactive_prompt(bottle_dicts, metadata_list)
         except Exception:
             logger.exception("Interactive feedback failed")
             return 1
+        corrections = _corrections_from_prompt(correction_dicts)
+        rejected |= {str(r) for r in rejected_bottles or []}
 
-    logger.info("No corrections applied")
+    if not corrections:
+        logger.info("No corrections applied")
+        return 0
+
+    before = _correction_counts(bottle_dicts)
+    _, unapplied = apply_corrections(bottle_dicts, metadata_list, corrections)
+    _log_unapplied(unapplied)
+    logger.info("Applied %d of %d corrections", len(corrections) - len(unapplied), len(corrections))
+
+    _, failed = _resave_corrected_bottles(
+        PreviewGenerator(output_dir=output_dir),
+        bottle_dicts,
+        metadata_list,
+        before,
+        rejected,
+    )
+    if unapplied:
+        logger.error("%d correction(s) were not applied (see above)", len(unapplied))
+    if failed:
+        logger.error(
+            "Corrected bottle(s) could not be saved, so their corrections reached no output: %s",
+            ", ".join(failed),
+        )
+    if unapplied or failed:
+        return 1
+    logger.info("Feedback processing complete")
     return 0
 
 
-def retry_command(args: argparse.Namespace) -> int:
-    """Retry processing failed bottles from error report.
+def retry_command(target: "Settings | RunContext | argparse.Namespace") -> int:
+    """Retry processing a failed bottle from its error report.
 
-    Args:
-        args: Parsed command-line arguments.
+    Uses ``settings.report``, the server, model, retry and hints settings.
 
     Returns:
-        Exit code: 0 (success), 1 (general error or model server unavailable),
-        2 (report not found).
+        Exit code: 0 (success), 1 (general error, invalid hints file or
+        model server unavailable), 2 (report not found).
     """
     from models.image import Image
 
+    ctx = _as_context(target)
+    settings = ctx.settings
+    report_path = Path(settings.report) if settings.report is not None else None
+
     # Check error report exists
-    if not args.report.exists():
-        logger.error("Error report not found: %s", args.report)
+    if report_path is None or not report_path.exists():
+        logger.error("Error report not found: %s", report_path)
         return 2
 
     # Load error report
-    import json
-
     try:
-        with args.report.open("r", encoding="utf-8") as f:
+        with report_path.open("r", encoding="utf-8") as f:
             error_report = json.load(f)
     except Exception:
         logger.exception("Failed to read error report")
         return 1
 
-    logger.info("Loading error report: %s", args.report)
+    logger.info("Loading error report: %s", report_path)
 
     # Validate error report structure
     required_fields = ["bottle_id", "images", "error_message"]
@@ -1373,7 +1478,18 @@ def retry_command(args: argparse.Namespace) -> int:
     bottle_id = error_report["bottle_id"]
     image_paths = error_report["images"]
     error_message = error_report["error_message"]
-    suggested_fix = error_report.get("suggested_fix", {})
+    suggested_fix = error_report.get("suggested_fix") or {}
+    if not isinstance(bottle_id, str) or not bottle_id.strip():
+        logger.error("Error report has no usable bottle_id: %r", bottle_id)
+        return 1
+    problem = _suggested_fix_problem(suggested_fix)
+    if problem:
+        # Refuse before any model work: a person's fix that cannot be applied
+        # must not be silently dropped from the reprocessed bottle.
+        logger.error("Invalid suggested_fix in %s: %s", report_path, problem)
+        return 1
+    if _load_hints(ctx):
+        return 1
 
     logger.info("Retrying bottle: %s", bottle_id)
     logger.info("Error was: %s", error_message)
@@ -1395,117 +1511,114 @@ def retry_command(args: argparse.Namespace) -> int:
 
     # Start (or adopt) the model server; always release it afterwards.
     try:
-        server_manager = build_server_manager(args)
+        server_manager = build_server_manager(settings)
     except Exception as e:
         logger.error("Failed to configure model server: %s", e)
         return 1
+    ctx.server_manager = server_manager
     try:
         if not server_manager.ensure_running():
             logger.error(
                 "Model server unavailable: %s", server_manager.last_error or "health check failed"
             )
             return 1
-        return _retry_bottle(args, server_manager, bottle_id, images, suggested_fix)
+        return _retry_bottle(ctx, report_path, bottle_id, images, suggested_fix)
     finally:
         server_manager.close()
 
 
+#: ``suggested_fix`` keys that are report metadata, not bottle fields.
+_REPORT_METADATA_KEYS = frozenset({"bottle_id", "images", "error_message"})
+
+
+def _suggested_fix_problem(suggested_fix: Any) -> str | None:  # noqa: ANN401
+    """Why an error report's ``suggested_fix`` cannot be applied, or None if it can."""
+    if not isinstance(suggested_fix, dict):
+        return f"must be an object of field -> value, got {type(suggested_fix).__name__}"
+    for name, value in suggested_fix.items():
+        if name in _REPORT_METADATA_KEYS:
+            continue
+        if name not in CORRECTABLE_FIELDS:
+            return f"{name!r} is not a correctable field (allowed: {', '.join(sorted(CORRECTABLE_FIELDS))})"
+        if value is None:
+            return f"{name!r} has a null value"
+    return None
+
+
 def _retry_bottle(
-    args: argparse.Namespace,
-    server_manager: ModelServerManager,
+    ctx: RunContext,
+    report_path: Path,
     bottle_id: str,
     images: list,
     suggested_fix: dict,
 ) -> int:
     """Re-run analysis for one bottle from an error report (server already up).
 
-    Args:
-        args: Parsed command-line arguments.
-        server_manager: Running model server manager.
-        bottle_id: Bottle identifier from the report.
-        images: Image objects for the bottle.
-        suggested_fix: Field corrections from the report.
+    The bottle goes through the same steps as in ``process``: OCR and the
+    vision request under the retry policy (with the hint note), then the
+    hint field values, then the report's ``suggested_fix``.
 
     Returns:
         Exit code: 0 (success) or 1 (failure).
     """
     from models.bottle import Bottle
 
+    settings = ctx.settings
     try:
-        client = server_manager.get_client()
+        client = ctx.server_manager.get_client()
     except ModelServerError as e:
         logger.error("Model server unavailable: %s", e)
         return 1
-    vision_model = resolve_vision_model(args)
 
-    image_organizer = ImageOrganizer()
-    bottle_analyzer = BottleAnalyzer(ollama_client=client, image_organizer=image_organizer)
+    bottle_analyzer = BottleAnalyzer(ollama_client=client, retry_policy=settings.retry.policy())
+    fix_fields = {
+        name: value
+        for name, value in (suggested_fix or {}).items()
+        if name not in _REPORT_METADATA_KEYS
+    }
 
-    # Apply suggested corrections if provided
-    corrections: list = []
-    if suggested_fix:
-        from models.bottle import Correction
-
-        for field_name, correction_value in suggested_fix.items():
-            if field_name in ["bottle_id", "images", "error_message"]:
-                continue  # Skip metadata fields
-            corrections.append(
-                Correction(
-                    field_name=field_name,
-                    original_value="",
-                    corrected_value=str(correction_value),
-                )
-            )
-
-    # Check hints.md for additional guidance
-    hints_file = args.report.parent.parent / "hints.md"
-    hints_text = ""
-
-    if hints_file.exists():
-        try:
-            with hints_file.open("r", encoding="utf-8") as f:
-                hints_text = f.read()
-            # Extract hints relevant to this bottle
-            import re
-
-            bottle_hints_pattern = re.compile(
-                rf".*{re.escape(bottle_id)}.*?:(.*?)(?=\n\n|\n[0-9]+\.|\Z)", re.MULTILINE | re.DOTALL
-            )
-            matches = bottle_hints_pattern.findall(hints_text)
-            if matches:
-                hints_text = "\n".join(matches).strip()
-                logger.info("Found hints for bottle %s", bottle_id)
-        except Exception:
-            logger.warning("Failed to read hints.md")
-
-    # Re-process the bottle
     try:
-        # Apply hints as corrections if applicable
-        if hints_text and not corrections:
-            logger.info("Applying hints from hints.md")
-            # Hints could be applied as context to the analyzer
-            # For now, just log them as they may need manual interpretation
-
         bottle_dict, metadata = bottle_analyzer.process_single_bottle(
             images,
-            vision_model=vision_model,
+            vision_model=settings.model.vision_model,
+            reviewer_note=ctx.hints.note_for(bottle_id),
         )
+        bottle_dict["bottle_id"] = bottle_id
 
-        # Apply suggested corrections
-        if corrections:
-            batch_processor = BatchProcessor()
-            bottle_dict = batch_processor.apply_corrections([bottle_dict], corrections)[0]
+        _, unapplied_hints = apply_hint_overrides([bottle_dict], [metadata], ctx.hints, settings.hints_file)
+        if unapplied_hints:
+            logger.error("Not saving bottle %s: its hint values could not be applied", bottle_id)
+            return 1
+
+        # Apply the report's suggested_fix: a person wrote these values for
+        # this bottle, so each is aimed at it by ID against the fresh reading.
+        if fix_fields:
+            corrections = [
+                Correction(
+                    bottle_id=bottle_id,
+                    field_name=field_name,
+                    original_value="" if bottle_dict.get(field_name) is None else str(bottle_dict.get(field_name)),
+                    corrected_value=str(value),
+                    source=f"feedback:{report_path}",
+                )
+                for field_name, value in fix_fields.items()
+            ]
+            _, unapplied = apply_corrections([bottle_dict], [metadata], corrections)
+            if unapplied:
+                _log_unapplied(unapplied)
+                logger.error("Not saving bottle %s: its suggested_fix could not be applied", bottle_id)
+                return 1
             logger.info("Applied %d corrections from suggested_fix", len(corrections))
 
         bottle = Bottle.from_analysis(
             bottle_dict,
             metadata,
             quantity=max(1, bottle_analyzer.detect_quantity(images)),
-            corrections=corrections,
+            corrections=bottle_dict.get("corrections") or [],
         )
 
         # Save output files (a new folder; earlier output is never replaced)
-        preview_generator = PreviewGenerator(output_dir=args.output_dir)
+        preview_generator = PreviewGenerator(output_dir=settings.output_dir)
         output_folder = preview_generator.save_bottle_files(
             bottle,
             metadata,
@@ -1524,9 +1637,28 @@ def _retry_bottle(
         return 1
 
 
+def config_command(target: "Settings | RunContext | argparse.Namespace") -> int:
+    """``config show [--json]`` (effective values and their sources) or ``config template``."""
+    settings = _as_context(target).settings
+    if settings.config_action == "template":
+        sys.stdout.write(render_template())
+        return 0
+    print(describe(settings, as_json=settings.json))
+    return 0
+
+
 def _exit_on_signal(signum: int, _frame: Any) -> None:  # noqa: ANN401
     """Signal handler: exit with the conventional 128 + signal status."""
     sys.exit(128 + signum)
+
+
+#: Command name -> entry point.
+_COMMANDS = {
+    "process": "process_command",
+    "feedback": "feedback_command",
+    "retry": "retry_command",
+    "config": "config_command",
+}
 
 
 def main(argv: list | None = None) -> int:
@@ -1536,7 +1668,7 @@ def main(argv: list | None = None) -> int:
         argv: Optional list of arguments (default: sys.argv[1:]).
 
     Returns:
-        Exit code.
+        Exit code (1 for any configuration error, listed on stderr).
     """
     if not (sys.argv[1:] if argv is None else list(argv)):
         # A bare `bourbon-process` would otherwise process the current folder.
@@ -1544,8 +1676,21 @@ def main(argv: list | None = None) -> int:
         return 1
     args = parse_args(argv)
 
-    # Setup logging
-    setup_logging(debug=args.debug)
+    try:
+        settings = resolve_settings(args)
+    except SettingsError as e:
+        print("bourbon-process: configuration error:", file=sys.stderr)
+        for error in e.errors:
+            print(f"  - {error}", file=sys.stderr)
+        return 1
+
+    setup_logging(debug=settings.debug)
+    if settings.debug:
+        ignored = ignored_keys(settings)
+        if ignored:
+            logger.debug("Settings not used by '%s' (ignored): %s", settings.command, ", ".join(ignored))
+    if settings.command in ("process", "retry") and settings.web.enabled and settings.web.provider_resolved == "none":
+        logger.warning("Web lookups are on but skipped: %s", settings.web.provider_reason)
 
     # Turn SIGTERM, SIGHUP (terminal closed, SSH session dropped) and SIGQUIT
     # (Ctrl-backslash) into SystemExit so `finally` blocks run and an owned model
@@ -1556,15 +1701,11 @@ def main(argv: list | None = None) -> int:
         if sig is not None:
             signal.signal(sig, _exit_on_signal)
 
-    if args.command == "process":
-        return process_command(args)
-    elif args.command == "feedback":
-        return feedback_command(args)
-    elif args.command == "retry":
-        return retry_command(args)
-    else:
-        logger.error("Unknown command: %s", args.command)
+    command = globals().get(_COMMANDS.get(settings.command, ""))
+    if command is None:
+        logger.error("Unknown command: %s", settings.command)
         return 1
+    return command(settings)
 
 
 if __name__ == "__main__":

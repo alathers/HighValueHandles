@@ -54,6 +54,34 @@ class TestExtractedMetadataVisionFields:
     def test_null_warnings_load_as_empty(self):
         assert ExtractedMetadata.from_dict({"warnings": None}).warnings == []
 
+    def test_round_trip_label_price_attempts_and_ocr_by_image(self):
+        metadata = ExtractedMetadata(
+            name="Stagg",
+            label_price="59.99",
+            vision_attempts=3,
+            ocr_by_image={"IMG_1.jpg": "GEORGE T STAGG", "IMG_2.jpg": "135.4 PROOF"},
+        )
+        data = metadata.to_dict()
+        assert data["label_price"] == "59.99"
+        assert "msrp" not in data  # a visible price is never an MSRP
+        assert data["vision_attempts"] == 3
+        assert data["ocr_by_image"] == {"IMG_1.jpg": "GEORGE T STAGG", "IMG_2.jpg": "135.4 PROOF"}
+
+        restored = ExtractedMetadata.from_dict(data)
+        assert restored.label_price == "59.99"
+        assert restored.vision_attempts == 3
+        assert restored.ocr_by_image == metadata.ocr_by_image
+        assert not hasattr(restored, "msrp")
+
+    def test_new_field_defaults_and_older_files(self):
+        assert ExtractedMetadata().vision_attempts == 1
+        assert ExtractedMetadata().ocr_by_image == {}
+        old = ExtractedMetadata.from_dict({"name": "Old", "msrp": "45.00"})
+        # Older files called the visible price "msrp"; it was always read from the photos.
+        assert old.label_price == "45.00"
+        assert old.vision_attempts == 1
+        assert old.ocr_by_image == {}
+
 
 class TestParseMoney:
     """parse_money() accepts the price styles OCR and vision models produce."""
@@ -127,15 +155,32 @@ class TestBottleFromAnalysis:
         assert Bottle.from_analysis({"name": "X", "quantity": raw}).quantity.count == expected
 
     def test_dict_corrections_are_converted(self):
-        correction = Correction(field_name="age", original_value="10", corrected_value="12")
+        correction = Correction(bottle_id="IMG_1", field_name="age", original_value="10", corrected_value="12")
         bottle = Bottle.from_analysis(
             {"name": "X"},
-            corrections=[{"field_name": "name", "original_value": "A", "corrected_value": "B"}, correction],
+            corrections=[
+                {"bottle_id": "IMG_1", "field_name": "name", "original_value": "A", "corrected_value": "B"},
+                correction,
+            ],
         )
 
         assert isinstance(bottle.corrections[0], Correction)
         assert bottle.corrections[0].corrected_value == "B"
+        assert bottle.corrections[0].bottle_id == "IMG_1"
         assert bottle.corrections[1] is correction
+
+    def test_correction_round_trip_keeps_bottle_id_and_source(self):
+        correction = Correction(
+            bottle_id="IMG_1", field_name="age", original_value="10", corrected_value="12",
+            source="feedback:corrections.json",
+        )
+        bottle = Bottle.from_analysis({"name": "X"}, corrections=[correction])
+
+        restored = Bottle.from_json(bottle.to_json())
+
+        assert restored.corrections == [correction]
+        assert bottle.to_dict()["corrections"][0]["bottle_id"] == "IMG_1"
+        assert bottle.to_dict()["corrections"][0]["source"] == "feedback:corrections.json"
 
     def test_batch_number_copied_from_dict(self):
         bottle = Bottle.from_analysis({"name": "X", "batch_number": " B-7 "})
@@ -193,6 +238,18 @@ class TestUnknownMsrp:
         assert bottle.total_value == Decimal("0.00")
         # Naive timestamps from older versions are UTC.
         assert bottle.extracted_at.utcoffset().total_seconds() == 0
+
+
+class TestTotalValue:
+    """total_value is quantity * price, or None when the price is unknown (no ohr estimate)."""
+
+    def test_total_value_is_count_times_price(self):
+        assert Bottle.from_analysis({"name": "X", "msrp": "45.00"}, quantity=3).total_value == Decimal("135.00")
+
+    def test_ohr_is_gone(self):
+        bottle = Bottle.from_analysis({"name": "X"})
+        assert not hasattr(bottle, "ohr")
+        assert "ohr" not in bottle.to_dict()
 
 
 class TestAbv:

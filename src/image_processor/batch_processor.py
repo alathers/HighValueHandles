@@ -1,7 +1,8 @@
 """Process bourbon bottles in configurable batches.
 
-Handles batch slicing, per-bottle analysis with the same-bottle split check
-(the "backstop"), and user feedback integration for iterative refinement.
+Handles batch slicing and per-bottle analysis with the same-bottle split check
+(the "backstop"). User corrections are applied by
+:func:`image_processor.corrections.apply_corrections`.
 
 Same-bottle split check
 -----------------------
@@ -24,9 +25,25 @@ largest capture-time gap and each half is analyzed again:
 
 Extra analyses are bounded by a run-wide budget computed once over all
 groups (:meth:`BatchProcessor.start_run`) and shared by every batch. The
-budget counts analyses, not model requests: each analysis may retry an
-unusable vision answer once and re-runs OCR on its photos. When the budget is
-used up, a flagged group is kept whole with a warning.
+budget counts analyses, not model requests: retries of a vision request
+(``--retry-attempts``) are not charged to it. When the budget is used up, a
+flagged group is kept whole with a warning.
+
+Concurrency
+-----------
+With an executor (``--concurrency`` > 1) a batch runs in two phases:
+
+1. every group's first analysis (OCR plus the vision request, with retries)
+   runs in parallel; results are collected in input order;
+2. on the calling (coordinator) thread, in input order: the split check
+   (budget, halves; the two halves of a split run in parallel), bottle IDs
+   and the "possibly the same bottle" hints.
+
+Everything order-dependent runs in phase 2, so the output (bottles, IDs,
+split stats, hints) is identical to a sequential run for the same model
+answers. Workers never write files. A fatal model error stops new work,
+waits for running analyses and is re-raised (the first in input order).
+Without an executor everything runs inline, group by group.
 
 Review hints (never merged automatically): a bottle whose photos start at most
 :data:`ADJACENT_HINT_MAX_GAP_SECONDS` after the previous bottle's and whose
@@ -38,25 +55,43 @@ those hints join groups exactly at the cap size, :meth:`group_size_nudge`
 suggests raising it.
 """
 
+import contextvars
 import hashlib
 import logging
 import math
+import threading
+import time
 from collections import Counter
+from collections.abc import Callable, Sequence
+from concurrent.futures import FIRST_EXCEPTION, Executor, Future, wait
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import Any, Optional, TypeVar
 
 from image_processor.bottle_analyzer import MIXED_GROUP_WARNING, BottleAnalyzer
 from image_processor.bottle_identity import identity_conflicts
 from image_processor.capture_grouping import DEFAULT_MAX_GROUP_SIZE, split_at_largest_gap
 from lib.exceptions import FATAL_MODEL_ERRORS
-from models.bottle import Correction, ExtractedMetadata
+from models.bottle import ExtractedMetadata
 from models.image import Image, group_bottle_id
 
-if TYPE_CHECKING:
-    from lib.model_selector import ModelSelector
-
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
+V = TypeVar("V")
+
+#: The bottle (group) a log record belongs to; set by each analysis task.
+BOTTLE_CONTEXT: contextvars.ContextVar[str] = contextvars.ContextVar("bottle", default="-")
+
+
+class BottleLogFilter(logging.Filter):
+    """Adds ``record.bottle`` (the current :data:`BOTTLE_CONTEXT`, '-' outside a task)."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not hasattr(record, "bottle"):
+            record.bottle = BOTTLE_CONTEXT.get()
+        return True
+
 
 #: Default share of groups that may get a split check: the run may spend
 #: ``ceil(ratio * groups)`` extra analyses (at least
@@ -185,30 +220,44 @@ class BatchResult:
         batch_id: Sequential batch identifier (1, 2, 3...).
         bottle_dicts: List of processed bottle dictionaries.
         metadata_list: List of extracted metadata for each bottle.
-        corrections: List of user corrections applied to this batch.
         failed_bottles: List of bottle IDs that failed processing.
-        errors: Why each failed bottle failed, keyed by bottle ID, as
-            ``'<ExceptionType>: <message>'``.
+        errors: Why each failed bottle failed, keyed by bottle ID: the
+            exception itself (``exc.attempts`` holds the attempts made when
+            a retry policy gave up).
     """
 
     batch_id: int
     bottle_dicts: list[dict] = field(default_factory=list)
     metadata_list: list[ExtractedMetadata] = field(default_factory=list)
-    corrections: list[Correction] = field(default_factory=list)
     failed_bottles: list[str] = field(default_factory=list)
-    errors: dict[str, str] = field(default_factory=dict)
+    errors: dict[str, BaseException] = field(default_factory=dict)
+
+
+@dataclass
+class _Outcome:
+    """A task's result or its (non-fatal) error."""
+
+    value: Any = None
+    error: BaseException | None = None
+
+
+def describe_error(error: BaseException | str | None) -> str:
+    """``'<ExceptionType>: <message>'`` for an exception (strings unchanged)."""
+    if error is None:
+        return ""
+    if isinstance(error, BaseException):
+        return f"{type(error).__name__}: {error}"
+    return str(error)
 
 
 class BatchProcessor:
     """Process bourbon bottles in configurable batches.
 
-    Manages batch slicing, batch processing orchestration (with the
-    same-bottle split check), and user feedback integration.
+    Manages batch slicing and batch processing orchestration (with the
+    same-bottle split check).
 
     Attributes:
         batch_size: Number of bottles per batch, or "all" for unbatched.
-        lookahead: Deprecated and ignored (photos are grouped by capture
-            time, so a bottle cannot straddle batches).
         bottle_analyzer: BottleAnalyzer instance for processing.
         split_budget_ratio: Extra analyses per group the split check may
             spend over a run (0 disables it).
@@ -223,28 +272,28 @@ class BatchProcessor:
     def __init__(
         self,
         batch_size: int | str = 5,
-        lookahead: int = 3,
-        bottle_analyzer: Optional[BottleAnalyzer] = None,
-        similarity_threshold: float = 0.7,
-        model_selector: Optional["ModelSelector"] = None,
         *,
+        bottle_analyzer: Optional[BottleAnalyzer] = None,
         split_budget_ratio: float = DEFAULT_SPLIT_BUDGET_RATIO,
         max_group_size: int = DEFAULT_MAX_GROUP_SIZE,
+        executor: Executor | None = None,
+        hints: Any = None,  # noqa: ANN401 - anything with note_for(bottle_id) -> str
     ):
         """Initialize batch processor.
 
         Args:
             batch_size: Number of bottles per batch, or "all" for unbatched.
-            lookahead: Deprecated, ignored; kept so old callers still work.
             bottle_analyzer: Optional BottleAnalyzer instance.
-            similarity_threshold: Grouping threshold adjusted by
-                ``learn_from_feedback`` (0.0-1.0).
-            model_selector: Optional ModelSelector for per-stage model resolution.
             split_budget_ratio: Extra analyses per group the same-bottle
                 split check may spend over the run, 0 to disable
                 (0-``MAX_SPLIT_BUDGET_RATIO``).
             max_group_size: The grouping's photos-per-bottle cap (0 = none);
                 see :meth:`group_size_nudge`.
+            executor: Thread pool for parallel analyses (``--concurrency`` >
+                1); None runs everything inline. The caller owns and shuts
+                it down.
+            hints: The run's hint book (``note_for(bottle_id)``); its notes
+                are passed to the vision prompt as reading guidance.
 
         Raises:
             ValueError: If ``split_budget_ratio`` is out of range.
@@ -256,10 +305,7 @@ class BatchProcessor:
         if not 0 <= split_budget_ratio <= MAX_SPLIT_BUDGET_RATIO:
             message = f"split_budget_ratio must be between 0 and {MAX_SPLIT_BUDGET_RATIO:g}, got {split_budget_ratio}"
             raise ValueError(message)
-        self.lookahead = lookahead
         self.bottle_analyzer = bottle_analyzer or BottleAnalyzer()
-        self.similarity_threshold = similarity_threshold
-        self.model_selector = model_selector
         self.split_budget_ratio = split_budget_ratio
         self.max_group_size = max_group_size
         self.split_stats: Counter[str] = Counter()
@@ -267,6 +313,13 @@ class BatchProcessor:
         self._split_budget: int | None = None
         self._split_calls_used = 0
         self._reserved_ids: set[str] = set()
+        self.executor = executor
+        self.hints = hints
+        #: Set when a fatal model error aborts the batch: no new vision request starts.
+        self.cancel = threading.Event()
+        self._progress_lock = threading.Lock()
+        self._progress_done = 0
+        self._progress_total = 0
 
         logger.debug(
             "Initialized BatchProcessor: batch_size=%s, split_budget_ratio=%.2f",
@@ -292,6 +345,8 @@ class BatchProcessor:
         self._reserved_ids = {group_bottle_id(group) for group in image_groups if group}
         self.split_stats = Counter()
         self._previous = None
+        self._progress_done = 0
+        self._progress_total = len(image_groups)
         logger.info(
             "Same-bottle split check: up to %d extra analyses for %d groups",
             self._split_budget,
@@ -369,22 +424,6 @@ class BatchProcessor:
         logger.info("Split %d image groups into %d batches", len(image_groups), len(batches))
         return batches
 
-    def apply_lookahead(
-        self,
-        current_batch: list[list[Image]],
-        remaining_groups: list[list[Image]],
-    ) -> tuple[list[list[Image]], list[list[Image]]]:
-        """Deprecated no-op: returns both arguments unchanged.
-
-        Lookahead used to pull visually similar groups from later batches
-        into the current one. Photos are now grouped by capture time before
-        batching, so a bottle never straddles a batch, and the ORB similarity
-        it relied on matched different bottles as often as the same one.
-        Kept for one release so old callers do not break.
-        """
-        logger.debug("apply_lookahead is deprecated and does nothing")
-        return current_batch, remaining_groups
-
     def process_batch(
         self,
         batch: list[list[Image]],
@@ -417,38 +456,29 @@ class BatchProcessor:
         batch_id = id(batch)
         logger.info("Processing batch with %d image groups", len(batch))
 
-        # Pass model_selector to bottle_analyzer if available (T164)
-        if self.model_selector is not None:
-            self.bottle_analyzer.model_selector = self.model_selector
         if self._split_budget is None:
             logger.debug("start_run() was not called; split-check budget computed from this batch")
             self.start_run(batch)
 
         result = BatchResult(batch_id=batch_id)
+        self.cancel.clear()
 
-        for i, image_group in enumerate(batch, 1):
-            # Run-unique ID assigned by the caller, else the first photo's stem.
-            bottle_id = group_bottle_id(image_group)
-            logger.debug("Processing bottle %d/%d: %s", i, len(batch), bottle_id)
-
-            try:
-                analyses = self._analyze_group(image_group, vision_model)
-            except FATAL_MODEL_ERRORS:
-                raise
-            except Exception as e:
-                logger.error("Failed to process bottle %s: %s: %s", bottle_id, type(e).__name__, e)
-                logger.debug("Traceback for bottle %s", bottle_id, exc_info=True)
-                result.failed_bottles.append(bottle_id)
-                result.errors[bottle_id] = f"{type(e).__name__}: {e}"
-                self._previous = None  # a failed bottle sits between its neighbours
-                continue
-
-            self._assign_bottle_ids(image_group, analyses)
-            for analysis in analyses:
-                self._hint_adjacent(analysis)
-                result.bottle_dicts.append(analysis.bottle_dict)
-                result.metadata_list.append(analysis.metadata)
-            logger.info("Successfully processed bottle: %s", bottle_id)
+        if self.executor is None:
+            # Inline: each group's first pass and its phase-2 work, in order.
+            for image_group in batch:
+                outcome = self._run_task(
+                    lambda g: self._first_pass(g, vision_model), image_group, group_bottle_id(image_group)
+                )
+                self._finish_group(image_group, outcome, vision_model, result)
+        else:
+            # Phase 1 in parallel, phase 2 on this thread in input order.
+            outcomes = self._map_ordered(
+                lambda g: self._first_pass(g, vision_model),
+                batch,
+                labels=[group_bottle_id(g) for g in batch],
+            )
+            for image_group, outcome in zip(batch, outcomes, strict=True):
+                self._finish_group(image_group, outcome, vision_model, result)
 
         logger.info(
             "Batch processing complete: %d successful, %d failed",
@@ -458,20 +488,131 @@ class BatchProcessor:
 
         return result
 
-    def _analyze(self, images: list[Image], vision_model: str | None, group_size: int = 0) -> _Analysis:
-        """One analysis (one vision request, plus a retry if unusable, and OCR) for a list of photos."""
-        bottle_dict, metadata = self.bottle_analyzer.process_single_bottle(images, vision_model=vision_model)
-        return _Analysis(bottle_dict, metadata, list(images), group_size)
+    def _note_for(self, group: Sequence[Image]) -> str:
+        """The hint note for a group ('' without hints)."""
+        if self.hints is None or not group:
+            return ""
+        try:
+            return str(self.hints.note_for(group_bottle_id(list(group))) or "")
+        except Exception:
+            logger.debug("Hint lookup failed", exc_info=True)
+            return ""
 
-    def _analyze_group(self, group: list[Image], vision_model: str | None) -> list[_Analysis]:
-        """Analyze one group and run the same-bottle split check on it.
-
-        Returns:
-            One analysis per resulting bottle, in capture order (the first
-            contains the group's first photo).
-        """
+    def _first_pass(self, group: list[Image], vision_model: str | None) -> _Analysis:
+        """Phase 1 of a group: OCR and the first vision analysis (no shared state touched)."""
+        start = time.monotonic()
         group_size = sum(1 for img in group if not getattr(img, "is_duplicate", False))
-        return self._resolve_mixed(self._analyze(group, vision_model, group_size), vision_model)
+        outcome = "failed"
+        try:
+            analysis = self._analyze(group, vision_model, group_size, note=self._note_for(group))
+            outcome = "analysed"
+            return analysis
+        finally:
+            if self._progress_total:
+                with self._progress_lock:
+                    self._progress_done += 1
+                    done = self._progress_done
+                logger.info(
+                    "[%d/%d] %s %s (%.1fs)",
+                    done, self._progress_total, group_bottle_id(group), outcome, time.monotonic() - start,
+                )
+
+    def _finish_group(
+        self, image_group: list[Image], outcome: _Outcome, vision_model: str | None, result: BatchResult
+    ) -> None:
+        """Phase 2 of a group (coordinator thread): split check, IDs, adjacent hints, bookkeeping."""
+        bottle_id = group_bottle_id(image_group)
+        token = BOTTLE_CONTEXT.set(bottle_id)
+        try:
+            analyses = None
+            error = outcome.error
+            if error is None:
+                try:
+                    analyses = self._resolve_mixed(outcome.value, vision_model, note=self._note_for(image_group))
+                except FATAL_MODEL_ERRORS:
+                    raise
+                except Exception as e:
+                    error = e
+            if error is not None:
+                logger.error("Failed to process bottle %s: %s", bottle_id, describe_error(error))
+                logger.debug("Traceback for bottle %s", bottle_id, exc_info=error)
+                result.failed_bottles.append(bottle_id)
+                result.errors[bottle_id] = error
+                self._previous = None  # a failed bottle sits between its neighbours
+                return
+            self._assign_bottle_ids(image_group, analyses)
+            for analysis in analyses:
+                self._hint_adjacent(analysis)
+                result.bottle_dicts.append(analysis.bottle_dict)
+                result.metadata_list.append(analysis.metadata)
+            logger.info("Successfully processed bottle: %s", bottle_id)
+        finally:
+            BOTTLE_CONTEXT.reset(token)
+
+    def _run_task(self, fn: Callable[[T], V], item: T, label: str) -> _Outcome:
+        """Run one task with its bottle label set; non-fatal errors become an outcome.
+
+        A fatal model error sets :attr:`cancel` and propagates.
+        """
+        token = BOTTLE_CONTEXT.set(label)
+        try:
+            return _Outcome(value=fn(item))
+        except FATAL_MODEL_ERRORS:
+            self.cancel.set()
+            raise
+        except Exception as e:
+            return _Outcome(error=e)
+        finally:
+            BOTTLE_CONTEXT.reset(token)
+
+    def _map_ordered(
+        self,
+        fn: Callable[[T], V],
+        items: Sequence[T],
+        *,
+        labels: Sequence[str] | None = None,
+        stop_on_error: bool = False,
+    ) -> list[_Outcome]:
+        """Run ``fn`` over ``items`` (in parallel with an executor); outcomes in input order.
+
+        Without an executor the items run inline; with ``stop_on_error`` the
+        remaining items are then skipped after the first error (as the
+        sequential code always did). A fatal model error cancels pending
+        tasks, waits for running ones and is re-raised; with several, the
+        first in input order wins.
+        """
+        labels = list(labels) if labels is not None else [BOTTLE_CONTEXT.get()] * len(items)
+        if self.executor is None:
+            outcomes: list[_Outcome] = []
+            for item, label in zip(items, labels, strict=True):
+                outcome = self._run_task(fn, item, label)
+                outcomes.append(outcome)
+                if stop_on_error and outcome.error is not None:
+                    break
+            return outcomes
+        futures: list[Future] = [
+            self.executor.submit(self._run_task, fn, item, label)
+            for item, label in zip(items, labels, strict=True)
+        ]
+        done, _ = wait(futures, return_when=FIRST_EXCEPTION)
+        if any(f.exception() is not None for f in done if not f.cancelled()):
+            self.cancel.set()
+            for future in futures:
+                future.cancel()
+            wait(futures)
+            for future in futures:
+                if not future.cancelled() and future.exception() is not None:
+                    raise future.exception()
+        return [f.result() for f in futures]
+
+    def _analyze(
+        self, images: list[Image], vision_model: str | None, group_size: int = 0, note: str = ""
+    ) -> _Analysis:
+        """One analysis (OCR, then the vision request under the retry policy) for a list of photos."""
+        bottle_dict, metadata = self.bottle_analyzer.process_single_bottle(
+            images, vision_model=vision_model, reviewer_note=note, cancel=self.cancel
+        )
+        return _Analysis(bottle_dict, metadata, list(images), group_size)
 
     def _hint_adjacent(self, analysis: _Analysis) -> None:
         """Add the "possibly the same bottle" review hint against the previous bottle.
@@ -508,7 +649,9 @@ class BatchProcessor:
         if cap > 0 and cap in (previous.group_size, analysis.group_size):
             self.split_stats["adjacent_hint_at_cap"] += 1
 
-    def _resolve_mixed(self, analysis: _Analysis, vision_model: str | None, depth: int = 0) -> list[_Analysis]:
+    def _resolve_mixed(
+        self, analysis: _Analysis, vision_model: str | None, depth: int = 0, note: str = ""
+    ) -> list[_Analysis]:
         """Split an analysis the model called mixed, if the halves really differ.
 
         Recurses into halves the model still calls mixed; stops at single
@@ -522,6 +665,7 @@ class BatchProcessor:
             vision_model: Vision model name (None: the analyzer resolves it).
             depth: 0 for a whole group, more for its halves (only depth 0
                 counts toward the per-group stats).
+            note: The group's hint note, passed to both halves' analyses.
         """
         if getattr(analysis.metadata, "same_bottle", None) is not False or self.split_budget_ratio <= 0:
             return [analysis]
@@ -544,25 +688,26 @@ class BatchProcessor:
             [Path(img.path).name for img in left],
             [Path(img.path).name for img in right],
         )
-        try:
-            halves = [
-                self._analyze(left, vision_model, analysis.group_size),
-                self._analyze(right, vision_model, analysis.group_size),
-            ]
-        except FATAL_MODEL_ERRORS:
-            raise
-        except Exception as e:
+        outcomes = self._map_ordered(
+            lambda half: self._analyze(half, vision_model, analysis.group_size, note=note),
+            [left, right],
+            stop_on_error=True,
+        )
+        failure = next((o.error for o in outcomes if o.error is not None), None)
+        if failure is not None:
+            e = failure
             self.split_stats["failed"] += 1
             logger.warning("Split check failed for %s: %s: %s; keeping one bottle", names, type(e).__name__, e)
             _add_warning(analysis.metadata, SPLIT_FAILED_WARNING.format(error=f"{type(e).__name__}: {e}"))
             return [analysis]
 
+        halves = [o.value for o in outcomes]
         conflicts = identity_conflicts(halves[0].metadata, halves[1].metadata)
         reason = f"{', '.join(conflicts)} differ" if conflicts else "a half still shows different products"
         hint = SPLIT_HINT.format(count=len(analysis.images), names=names, reason=reason)
         for half in halves:
             _add_warning(half.metadata, hint)  # discarded again if this turns out a false alarm
-        parts = [self._resolve_mixed(half, vision_model, depth + 1) for half in halves]
+        parts = [self._resolve_mixed(half, vision_model, depth + 1, note=note) for half in halves]
 
         if not conflicts and all(
             len(part) == 1 and getattr(part[0].metadata, "same_bottle", None) is not False for part in parts
@@ -614,157 +759,3 @@ class BatchProcessor:
             n += 1
         self._reserved_ids.add(candidate)
         return candidate
-
-    def learn_from_feedback(
-        self,
-        corrections: list[Correction],
-    ) -> None:
-        """Learn from user corrections to improve future grouping.
-
-        Analyzes user corrections to adjust heuristics for subsequent batches.
-        Adjusts similarity_threshold based on merge/split correction patterns.
-
-        Args:
-            corrections: List of user corrections from feedback.
-        """
-        if not corrections:
-            return
-
-        logger.info("Learning from %d corrections", len(corrections))
-
-        # Analyze correction patterns
-        merge_corrections = [
-            c for c in corrections if c.field_name == "grouping" and c.corrected_value == "merge"
-        ]
-        split_corrections = [
-            c for c in corrections if c.field_name == "grouping" and c.corrected_value == "split"
-        ]
-
-        # Adjust similarity threshold based on correction patterns
-        merge_count = len(merge_corrections)
-        split_count = len(split_corrections)
-
-        if merge_count > split_count:
-            # Too many splits - we're being too aggressive about grouping
-            # Tighten threshold to reduce false positives
-            adjustment = 0.05 * min(merge_count, 3)  # Cap at 0.15 adjustment
-            new_threshold = min(1.0, self.similarity_threshold + adjustment)
-            logger.info(
-                "Tightening similarity threshold: %.2f -> %.2f (based on %d merge corrections)",
-                self.similarity_threshold,
-                new_threshold,
-                merge_count,
-            )
-            self.similarity_threshold = new_threshold
-        elif split_count > merge_count:
-            # Too many merges - we're being too conservative about grouping
-            # Loosen threshold to catch more related items
-            adjustment = 0.05 * min(split_count, 3)  # Cap at 0.15 adjustment
-            new_threshold = max(0.3, self.similarity_threshold - adjustment)
-            logger.info(
-                "Loosening similarity threshold: %.2f -> %.2f (based on %d split corrections)",
-                self.similarity_threshold,
-                new_threshold,
-                split_count,
-            )
-            self.similarity_threshold = new_threshold
-        else:
-            logger.debug(
-                "Balanced feedback: %d merges, %d splits - no threshold change",
-                merge_count,
-                split_count,
-            )
-
-    def apply_corrections(
-        self,
-        bottle_dicts: list[dict],
-        corrections: list[Correction],
-    ) -> list[dict]:
-        """Apply user corrections to bottle dictionaries.
-
-        Args:
-            bottle_dicts: List of bottle dictionaries from batch result.
-            corrections: List of corrections to apply.
-
-        Returns:
-            Updated list of bottle dictionaries with corrections applied.
-        """
-        if not corrections:
-            return bottle_dicts
-
-        logger.info("Applying %d corrections to %d bottles", len(corrections), len(bottle_dicts))
-
-        # Apply corrections to matching bottles
-        for correction in corrections:
-            # Find bottle by path or name (simplified matching)
-            matching_bottle = self._find_matching_bottle(bottle_dicts, correction)
-
-            if matching_bottle:
-                # Apply field correction
-                original_value = matching_bottle.get(correction.field_name)
-                matching_bottle[correction.field_name] = correction.corrected_value
-
-                # Store correction history
-                if "corrections" not in matching_bottle:
-                    matching_bottle["corrections"] = []
-
-                matching_bottle["corrections"].append(
-                    {
-                        "field_name": correction.field_name,
-                        "original_value": original_value,
-                        "corrected_value": correction.corrected_value,
-                        "corrected_at": correction.corrected_at.isoformat() if correction.corrected_at else None,
-                    }
-                )
-
-                logger.info(
-                    "Applied correction to bottle: %s = %s (was %s)",
-                    correction.field_name,
-                    correction.corrected_value,
-                    original_value,
-                )
-
-        return bottle_dicts
-
-    def _find_matching_bottle(
-        self,
-        bottle_dicts: list[dict],
-        correction: Correction,
-    ) -> Optional[dict]:
-        """Find matching bottle dictionary for a correction.
-
-        Simple matching based on bottle path or name. In production,
-        could use more sophisticated matching.
-
-        Args:
-            bottle_dicts: List of bottle dictionaries.
-            correction: Correction to match.
-
-        Returns:
-            Matching bottle dictionary or None.
-        """
-        # Try to match by path if available in correction metadata
-        if hasattr(correction, "bottle_path"):
-            for bottle in bottle_dicts:
-                if "images" in bottle and correction.bottle_path in bottle["images"]:
-                    return bottle
-
-        # Try to match by name
-        if hasattr(correction, "bottle_name"):
-            for bottle in bottle_dicts:
-                if bottle.get("name") == correction.bottle_name:
-                    return bottle
-
-        # If no explicit identifiers, match by field value
-        # First find any bottle where the field matches the original_value
-        for bottle in bottle_dicts:
-            if bottle.get(correction.field_name) == correction.original_value:
-                return bottle
-
-        # Also try to match where the field matches the corrected_value
-        # This handles sequential corrections on the same field
-        for bottle in bottle_dicts:
-            if bottle.get(correction.field_name) == correction.corrected_value:
-                return bottle
-
-        return None
