@@ -62,6 +62,23 @@ class ServerBackend(Enum):
     OLLAMA = auto()
     """Ollama with automatic start/stop."""
 
+    @classmethod
+    def parse(cls, value: "ServerBackend | str") -> "ServerBackend":
+        """Coerce a CLI/config string ("mpltx", "ollama") or enum into a ServerBackend.
+
+        Raises:
+            ValueError: If the value does not name a known backend.
+        """
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, str):
+            try:
+                return cls[value.strip().upper()]
+            except KeyError:
+                pass
+        valid = ", ".join(b.name.lower() for b in cls)
+        raise ValueError(f"Unknown backend: {value!r} (expected one of: {valid})")
+
 
 # ---------------------------------------------------------------------------
 # Server state
@@ -1065,7 +1082,7 @@ class ModelServerManager:
             config: Optional Config object for configuration.
             **kwargs: Backend-specific initialization parameters.
         """
-        self._backend = backend
+        self._backend = ServerBackend.parse(backend)
         self._server: BaseModelServer | None = None
         self._initialized = False
 

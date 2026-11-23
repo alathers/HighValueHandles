@@ -44,6 +44,32 @@ class TestServerBackend:
     def test_ollama_value(self):
         assert ServerBackend.OLLAMA.value is not None
 
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("ollama", ServerBackend.OLLAMA),
+            ("mpltx", ServerBackend.MPLTX),
+            ("OLLAMA", ServerBackend.OLLAMA),
+            (" Mpltx ", ServerBackend.MPLTX),
+            (ServerBackend.OLLAMA, ServerBackend.OLLAMA),
+        ],
+    )
+    def test_parse_accepts_strings_and_members(self, value, expected):
+        assert ServerBackend.parse(value) is expected
+
+    @pytest.mark.parametrize("value", ["", "llama", None, 1])
+    def test_parse_rejects_unknown(self, value):
+        with pytest.raises(ValueError, match="Unknown backend"):
+            ServerBackend.parse(value)
+
+    @pytest.mark.parametrize(
+        ("value", "server_cls"), [("ollama", OllamaServer), ("mpltx", MpltxServer)]
+    )
+    def test_manager_accepts_cli_string(self, value, server_cls):
+        """Regression: the CLI passes plain strings; they must select the right server."""
+        manager = ModelServerManager(backend=value)
+        assert isinstance(manager.server, server_cls)
+
 
 class TestServerState:
     """Test ServerState dataclass defaults."""

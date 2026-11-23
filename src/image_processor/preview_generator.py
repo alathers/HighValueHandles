@@ -9,8 +9,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from src.lib.error_handling import ErrorType, ErrorReport, create_error_report, save_error_reports
-from src.lib.exceptions import (
+from lib.error_handling import ErrorType, ErrorReport, create_error_report, save_error_reports
+from lib.exceptions import (
     BourbonException,
     OCRError,
     AIModelError,
@@ -19,7 +19,7 @@ from src.lib.exceptions import (
     FileSystemError,
     ValidationError,
 )
-from src.models.bottle import Bottle, ExtractedMetadata
+from models.bottle import Bottle, ExtractedMetadata
 
 logger = logging.getLogger(__name__)
 

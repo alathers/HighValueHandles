@@ -13,6 +13,8 @@ from image_processor.batch_processor import BatchProcessor
 from image_processor.bottle_analyzer import BottleAnalyzer
 from image_processor.image_organizer import ImageOrganizer
 from image_processor.preview_generator import PreviewGenerator
+from lib.model_selector import ModelSelector
+from lib.model_server import ModelServerManager, ServerBackend
 from lib.ollama_client import OllamaClient
 
 logger = logging.getLogger(__name__)
@@ -303,21 +305,21 @@ def pre_flight_checks(args: argparse.Namespace) -> int:
 
     # Check Ollama/MPLTX service reachable and required models available
     try:
-        from lib.model_selector import ModelSelector, ModelStage
-        from lib.model_server import ModelServerManager
-
         # Build kwargs for ModelServerManager from CLI args
-        server_kwargs: dict = {
-            "backend": getattr(args, "server_backend", "mpltx"),
-        }
-        if getattr(args, "mpltx_home", None) is not None:
-            server_kwargs["mpltx_home"] = str(args.mpltx_home)
-        if getattr(args, "mpltx_port", None) is not None:
-            server_kwargs["mpltx_port"] = args.mpltx_port
-        if getattr(args, "mpltx_gpu_layers", None) is not None:
-            server_kwargs["mpltx_gpu_layers"] = args.mpltx_gpu_layers
-        if getattr(args, "mpltx_context_size", None) is not None:
-            server_kwargs["mpltx_context_size"] = args.mpltx_context_size
+        backend = ServerBackend.parse(getattr(args, "server_backend", "mpltx"))
+        server_kwargs: dict = {"backend": backend}
+        # Map CLI flags onto the constructor parameters of the selected backend.
+        if backend == ServerBackend.MPLTX:
+            if getattr(args, "mpltx_home", None) is not None:
+                server_kwargs["home_dir"] = str(args.mpltx_home)
+            if getattr(args, "mpltx_port", None) is not None:
+                server_kwargs["port"] = args.mpltx_port
+            if getattr(args, "mpltx_gpu_layers", None) is not None:
+                server_kwargs["gpu_layers"] = args.mpltx_gpu_layers
+            if getattr(args, "mpltx_context_size", None) is not None:
+                server_kwargs["context_size"] = args.mpltx_context_size
+        elif getattr(args, "ollama_url", None):
+            server_kwargs["base_url"] = args.ollama_url
 
         # Create and initialize the server manager
         server_manager = ModelServerManager(**server_kwargs)
@@ -836,10 +838,9 @@ def retry_command(args: argparse.Namespace) -> int:
 
     # Initialize components for re-processing
     try:
-        from lib.model_selector import ModelSelector, ModelStage
-        from lib.model_server import ModelServerManager
-
-        server_kwargs: dict = {"backend": "mpltx"}
+        server_kwargs: dict = {
+            "backend": ServerBackend.parse(getattr(args, "server_backend", "mpltx")),
+        }
         server_manager = ModelServerManager(**server_kwargs)
         server_manager.ensure_running()
         ollama_client = server_manager.get_client()

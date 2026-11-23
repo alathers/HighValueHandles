@@ -199,6 +199,66 @@ class TestPreFlightModelIntegration:
             assert exit_code == 2
 
 
+    def _run_pre_flight_capturing_kwargs(self, args):
+        args.image_folder.exists.return_value = True
+        args.image_folder.is_dir.return_value = True
+        mock_img = MagicMock()
+        mock_img.suffix = ".jpg"
+        args.image_folder.rglob.return_value = [mock_img]
+        args.output_dir = MagicMock()
+        args.output_dir.exists.return_value = False
+        with patch("cli.commands.ModelServerManager") as MockManager:
+            MockManager.return_value = MagicMock()
+            with patch("pytesseract.get_tesseract_version", return_value="5.0"):
+                pre_flight_checks(args)
+        MockManager.assert_called_once()
+        return MockManager.call_args.kwargs
+
+    def test_pre_flight_ollama_backend_string_maps_to_enum_and_base_url(self):
+        """Regression: --server-backend is a str; manager must get the enum + base_url."""
+        from lib.model_server import ServerBackend
+
+        args = self._make_args(
+            {"server_backend": "ollama", "ollama_url": "http://127.0.0.1:9999"}
+        )
+        kwargs = self._run_pre_flight_capturing_kwargs(args)
+        assert kwargs == {"backend": ServerBackend.OLLAMA, "base_url": "http://127.0.0.1:9999"}
+
+    def test_pre_flight_mpltx_flags_map_to_constructor_params(self):
+        """Regression: MPLTX CLI flags must use MpltxServer's parameter names."""
+        from lib.model_server import ServerBackend
+
+        args = self._make_args(
+            {
+                "server_backend": "mpltx",
+                "mpltx_home": "/tmp/mh",
+                "mpltx_port": 12345,
+                "mpltx_gpu_layers": 10,
+                "mpltx_context_size": 8192,
+            }
+        )
+        kwargs = self._run_pre_flight_capturing_kwargs(args)
+        assert kwargs == {
+            "backend": ServerBackend.MPLTX,
+            "home_dir": "/tmp/mh",
+            "port": 12345,
+            "gpu_layers": 10,
+            "context_size": 8192,
+        }
+
+    def test_pre_flight_rejects_unknown_backend(self):
+        args = self._make_args({"server_backend": "bogus"})
+        args.image_folder.exists.return_value = True
+        args.image_folder.is_dir.return_value = True
+        mock_img = MagicMock()
+        mock_img.suffix = ".jpg"
+        args.image_folder.rglob.return_value = [mock_img]
+        args.output_dir = MagicMock()
+        args.output_dir.exists.return_value = False
+        with patch("pytesseract.get_tesseract_version", return_value="5.0"):
+            assert pre_flight_checks(args) == 2
+
+
 # ---------------------------------------------------------------------------
 # Process command with usage summary
 # ---------------------------------------------------------------------------

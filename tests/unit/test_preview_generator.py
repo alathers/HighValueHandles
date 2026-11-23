@@ -10,10 +10,10 @@ from datetime import datetime
 
 import pytest
 
-from src.image_processor.preview_generator import PreviewGenerator
-from src.lib.error_handling import ErrorReport, ErrorType
-from src.lib.exceptions import BourbonException, OCRError
-from src.models.bottle import Bottle, ExtractedMetadata, Correction, ReferenceLink, Quantity
+from image_processor.preview_generator import PreviewGenerator
+from lib.error_handling import ErrorReport, ErrorType
+from lib.exceptions import BourbonException, OCRError
+from models.bottle import Bottle, ExtractedMetadata, Correction, ReferenceLink, Quantity
 
 
 class TestPreviewGeneratorInitialization:
@@ -408,8 +408,8 @@ class TestPreviewGeneratorErrorReport:
         assert report.error_type == ErrorType.UNKNOWN
         assert "system logs" in report.hint.lower()
 
-    @patch("src.image_processor.preview_generator.save_error_reports")
-    @patch("src.image_processor.preview_generator.datetime")
+    @patch("image_processor.preview_generator.save_error_reports")
+    @patch("image_processor.preview_generator.datetime")
     def test_save_error_report_default_dir(self, mock_datetime, mock_save):
         """Test saving error report to default directory."""
         # Mock fixed timestamp for predictable filename
@@ -429,8 +429,8 @@ class TestPreviewGeneratorErrorReport:
         assert result_path == Path("processed/error_report_20261113_120000.json")
         mock_save.assert_called_once()
 
-    @patch("src.image_processor.preview_generator.save_error_reports")
-    @patch("src.image_processor.preview_generator.datetime")
+    @patch("image_processor.preview_generator.save_error_reports")
+    @patch("image_processor.preview_generator.datetime")
     def test_save_error_report_custom_dir(self, mock_datetime, mock_save):
         """Test saving error report to custom directory."""
         # Mock fixed timestamp for predictable filename
