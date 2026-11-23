@@ -1,12 +1,22 @@
 # Implementation Plan: Model Selector
 
-> **Superseded (2026-11): Ollama is the only model-serving backend.** The MTPLX/MPLTX
-> backend described below (`MpltxServer`, `ServerBackend.MPLTX`, `mpltx_*` config
-> fields, `--server-backend mpltx` as the default) was removed: MTPLX runs only on
-> Apple Silicon and this tool must stay portable to Linux. `--server-backend`
-> accepts only `ollama`; `mtplx`/`mpltx` values and `mpltx_*` settings are
-> rejected with an explanation. Only the vision-analysis model is called (no
-> fallback chain, no gpt-oss metadata stage). See README.md for current behaviour.
+> **Superseded (2026-11-23).** This document describes the original design;
+> [README.md](../../README.md) describes the code as it is now:
+>
+> - Ollama is the only model-serving backend. The MTPLX/MPLTX backend
+>   (`MpltxServer`, `ServerBackend`, `mpltx_*` settings) and the
+>   `--server-backend` flag were removed; MTPLX runs only on Apple Silicon and
+>   this tool must stay portable to Linux.
+> - ORB/visual-similarity grouping was removed. Photos are grouped by EXIF
+>   capture time, and the vision model's same-bottle answer splits mixed groups.
+>   There is no `IMAGE_GROUPING` model stage.
+> - Only two stages call a model: `VISION_ANALYSIS` (default `qwen3.6:35b-a3b`)
+>   and `METADATA_GENERATION`, the gpt-oss fact check (default `gpt-oss:120b`;
+>   `--text-model`, `--no-verify`).
+> - There are no fallback models or fallback chains; a missing model stops the
+>   run at pre-flight.
+> - `WEB_RESEARCH` was removed as a model stage: web search is not a model. Web
+>   lookups are a separate, non-model step (`--web`, `--web-provider`).
 
 **Branch**: `002-model-selector` | **Date**: 2026-11-21 | **Spec**: [spec.md](spec.md)
 

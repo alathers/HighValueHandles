@@ -1,5 +1,27 @@
 # Research: Bourbon Image Processor
 
+> **Superseded in part (2026-11-23).** This document describes the original
+> design. The code has since changed; [README.md](../../README.md) describes what it
+> does now. In particular:
+>
+> - Lookahead and ORB/visual-similarity grouping were replaced by EXIF
+>   capture-time grouping plus the vision model's same-bottle split.
+>   `--lookahead` was removed (it now fails with exit code 2).
+> - Interactive merge and split (`[M]`/`[S]`) were removed. Review actions are
+>   `[A]ccept`, `[R]eject`, `[E]dit`, `[C]onflicts`, `[N]ext` and `[Q]uit`.
+> - `ServerBackend` and MTPLX were removed; Ollama is the only backend, and
+>   `--server-backend` / `BOURBON_SERVER_BACKEND` no longer exist.
+> - T100-T109 (vendor cache) are superseded by the web-lookup design: search
+>   providers (DuckDuckGo by default, or Brave, Ollama web search, SearXNG),
+>   verbatim quotes verified by code, a vendor image verified by the vision
+>   model (`-v`), and no OpenCV image matching.
+> - FR-018 ("retry up to 3 times") now means up to `retry.max_attempts`
+>   (`--retry-attempts`, default 3) attempts per model request, not per bottle.
+> - Configuration is the sectioned `bourbon.toml` (plus a user file, `BOURBON_*`
+>   variables and flags), shown by `bourbon-process config show`.
+> - MSRP is never taken from a price tag; the gpt-oss fact check and a publish
+>   gate with human approval decide what is publishable.
+
 **Feature**: Bourbon Image Processor
 **Date**: 2026-11-09
 **Status**: Complete

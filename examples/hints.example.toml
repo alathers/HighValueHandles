@@ -1,0 +1,30 @@
+# Hints for bourbon-process (--hints PATH, or processing.hints_file in bourbon.toml).
+#
+# One [bottle.<id>] table per bottle. The ID is the bottle ID the tool prints
+# and writes in error reports and batch previews (the first photo's file
+# name without extension, e.g. IMG_4643).
+#
+# note    Reading guidance only ("where to look"). It is shown to the vision
+#         model in a marked section that it must never copy values from, and
+#         is capped at 500 characters.
+# source  Who established the values below, and how. Required whenever
+#         [bottle.<id>.fields] is present.
+# fields  Values a person checked on the bottle itself. They are applied
+#         after analysis as corrections recorded with this file, the bottle
+#         ID and the source, and the fact check treats them as user-stated
+#         facts. If the label reading differs, the hint wins; the fact sheet
+#         keeps both values as a resolved conflict and the bottle page shows
+#         a warning naming both.
+#         Allowed: name, distillery, bottler, specific_release, batch_number,
+#         proof (number), abv (number), age, release_year (4-digit integer),
+#         msrp (number, US dollars).
+
+[bottle.IMG_4643]
+note = "Batch number is on the neck label in the third photo."
+source = "Owner inspected the bottle, 2026-11-20"
+
+[bottle.IMG_4643.fields]
+batch_number = "C923"
+
+[bottle.IMG_5120]
+note = "The back label is upside down in the second photo; the proof is printed there."

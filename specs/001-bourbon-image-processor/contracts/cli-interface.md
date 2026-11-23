@@ -1,12 +1,41 @@
 # CLI Interface Contract: Bourbon Image Processor
 
-**Version**: 1.0
-**Date**: 2026-11-09
-**Status**: Complete
+> **Superseded in part (2026-11-23).** This document describes the original
+> design. The code has since changed; [README.md](../../../README.md) describes what it
+> does now. In particular:
+>
+> - Lookahead and ORB/visual-similarity grouping were replaced by EXIF
+>   capture-time grouping plus the vision model's same-bottle split.
+>   `--lookahead` was removed (it now fails with exit code 2).
+> - Interactive merge and split (`[M]`/`[S]`) were removed. Review actions are
+>   `[A]ccept`, `[R]eject`, `[E]dit`, `[C]onflicts`, `[N]ext` and `[Q]uit`.
+> - `ServerBackend` and MTPLX were removed; Ollama is the only backend, and
+>   `--server-backend` / `BOURBON_SERVER_BACKEND` no longer exist.
+> - T100-T109 (vendor cache) are superseded by the web-lookup design: search
+>   providers (DuckDuckGo by default, or Brave, Ollama web search, SearXNG),
+>   verbatim quotes verified by code, a vendor image verified by the vision
+>   model (`-v`), and no OpenCV image matching.
+> - FR-018 ("retry up to 3 times") now means up to `retry.max_attempts`
+>   (`--retry-attempts`, default 3) attempts per model request, not per bottle.
+> - Configuration is the sectioned `bourbon.toml` (plus a user file, `BOURBON_*`
+>   variables and flags), shown by `bourbon-process config show`.
+> - MSRP is never taken from a price tag; the gpt-oss fact check and a publish
+>   gate with human approval decide what is publishable.
+
+**Version**: 2.0 (updated 2026-11-23; version 1.0 was 2026-11-09)
+**Status**: Matches the code as of 2026-11-23
 
 ## Overview
 
-This contract defines the command-line interface for the bourbon image processor. The CLI supports processing images, batch operations, retries, and configuration.
+This contract defines the command-line interface of `bourbon-process`. The
+console script is `bourbon-process = cli.commands:main`; `python -m
+cli.commands` (with `src/` on the path) is equivalent. Subcommands:
+`process`, `feedback`, `retry`, `config`. An argument list that names no
+subcommand runs `process`; no arguments at all prints the help and exits 1.
+
+Global options (before or after the subcommand): `--debug`, `--config PATH`,
+`--no-config`, `-h/--help`. There is no `--version` option; the version is
+recorded in each run's `run_<run_id>_settings.json`.
 
 ---
 
@@ -17,7 +46,7 @@ Primary command for processing bourbon bottle images from a folder.
 ### Synopsis
 
 ```bash
-python -m cli.commands process [options]
+bourbon-process process [options]
 ```
 
 ### Required Arguments
@@ -26,296 +55,297 @@ None (all arguments optional with defaults)
 
 ### Options
 
+Every option except `--dry-run`, `--refresh-web` (CLI only) and the global
+ones also has a config key and, as listed in README.md, a `BOURBON_*`
+variable. Argparse defaults are empty; values are validated by the settings
+layer (invalid values exit 1, naming their source).
+
 | Short | Long | Description | Default | Validation |
 |-------|------|-------------|---------|------------|
-| -f | --image-folder PATH | Folder containing bottle images to process | Current directory (`.`) | Must exist, be readable directory |
-| -b | --batch-size N\|all | Number of bottles per batch, or "all" for full-folder processing | 5 | Integer ≥ 1, or literal "all" |
-| -m | --model NAME | Ollama model for image analysis | qwen3-vl:32b | Must be valid Ollama model name |
-| -i | --interactive | Enable interactive CLI prompts for preview review | disabled (false) | Boolean flag |
-| -v | --include-vendor-images | Attempt to cache vendor reference images and collect reference links | disabled (false) | Boolean flag |
-| -u | --ollama-url URL | Custom Ollama API endpoint | http://localhost:11434 | Valid URL, reachable |
-| -o | --output-dir PATH | Output folder for processed files | processed/ | Must be writable path |
-| -r | --allow-retry | Enable automatic retry on processing failures (max 3 attempts) | enabled (true) | Boolean flag |
-| --lookahead N | Number of images to look ahead for multi-angle photos when batching | 3 | Integer 0-10 |
-| --concurrency N | Maximum concurrent API requests to Ollama | 3 | Integer 1-10 |
-| --debug | Enable debug logging (verbose output) | disabled (false) | Boolean flag |
-| --dry-run | Show what would be processed without actually processing | disabled (false) | Boolean flag |
-| -h | --help | Show help message and exit | N/A | N/A |
+| -f | --image-folder PATH | Folder containing bottle images (scanned recursively) | `.` | Must exist, contain a supported image |
+| -o | --output-dir PATH | Output folder | `processed` | Writable; not the image folder |
+| -b | --batch-size N\|all | Bottles per batch | 5 | Integer >= 1, or "all" |
+| | --concurrency N | Bottle groups analysed in parallel; output identical to sequential | 2 | 1-10 |
+| | --group-gap-seconds S | Most seconds between photos of one bottle (EXIF capture time) | 12 | > 0, <= 600 |
+| | --group-max-size N | Most photos per bottle (0 = no limit) | 3 | 0-20 |
+| | --split-budget-ratio R | Extra split-check analyses per group over the run (retries not counted) | 0.35 | 0-2 |
+| -m | --model TAG | Ollama vision model | qwen3.6:35b-a3b | Non-empty; vision-capable at pre-flight |
+| -u | --ollama-url URL | Ollama endpoint | http://localhost:11434 | http(s) URL with a valid port |
+| | --server-start-timeout S | Wait for a server this run starts | 30 | > 0 |
+| | --request-timeout S | Per-request vision timeout | 600 | > 0 |
+| | --keep-server / --no-keep-server | Leave a started server running | off | Boolean |
+| | --server-autostart / --no-server-autostart | Start a local Ollama if none runs | on | Boolean |
+| | --keep-models-loaded / --no-keep-models-loaded | Skip unloading models between the vision and text phases | off | Boolean |
+| | --pull / --no-pull | Download missing models after a disk check | off | Boolean |
+| | --min-free-gb GB | GiB to keep free after a pull | 5 | >= 0 |
+| -i | --interactive / --no-interactive | Review each bottle before saving | off | Boolean |
+| | --hints PATH | Hints TOML (notes and sourced field values) | none | Valid hints file |
+| -r | --allow-retry | Repeat model requests that may pass | on | Boolean |
+| | --no-retry | Make every model request once | | Boolean |
+| | --retry-attempts N | Attempts per model request | 3 | 1-5 |
+| | --verify / --no-verify | gpt-oss fact check | on | Boolean |
+| | --text-model TAG | Fact-check model, or "none" | gpt-oss:120b | Non-empty; completion-capable |
+| | --text-think LEVEL | Extraction reasoning effort | high | low, medium, high |
+| | --text-timeout S | Read timeout of one text-model call | 900 | > 0 |
+| | --web / --no-web | Web lookups | on | Boolean |
+| | --web-provider NAME | Search provider | auto | auto, duckduckgo, brave, ollama, searxng, none; key or URL present |
+| | --web-cache-dir PATH | Web cache | ${XDG_CACHE_HOME:-~/.cache}/bourbon-process/web | Path |
+| | --refresh-web | Ignore cached pages and searches for this run | off | Boolean |
+| -v | --include-vendor-images / --no-include-vendor-images | Vendor reference image per bottle | off | Needs web lookups |
+| | --dry-run | Check everything; start, pull, load and write nothing | off | Boolean |
+| | --debug | Debug logging and the model stage report | off | Boolean |
+| -h | --help | Show help and exit | | |
+
+`--lookahead`, `--server-backend`, `--vision-timeout` and `--pull-missing`
+were removed and are rejected by argparse (exit 2).
 
 ### Behavior
 
-1. **Initialization**:
-   - Validate input folder exists and contains images
-   - Check Ollama service availability at configured URL
-   - Verify specified model is available
-   - Create output directory if not exists
+1. **Initialization (pre-flight)**: resolve settings (defaults, config files,
+   environment, flags); check the image folder, the output folder, the hints
+   file and Tesseract; reuse or start Ollama; check that the vision model and,
+   when the fact check is on, the text model are installed (or pull them with
+   `--pull`) and have the needed capability; check the text model against
+   physical memory; warm the vision model.
+2. **Image Discovery**: scan the folder recursively for `.bmp .heic .jpeg .jpg
+   .png .tiff .webp`, skipping hidden folders and earlier outputs; group photos
+   into bottles by EXIF capture time.
+3. **Batch Processing**: per batch, OCR and one vision request per bottle (with
+   the same-bottle split check), quantity from duplicate photos, hint values,
+   then web research, vision-model unload, the fact check of each bottle and
+   the text-model unload.
+4. **Review**: with `--interactive`, approve, reject, edit or settle conflicts
+   for each bottle.
+5. **Preview Generation**: a Markdown preview report and a batch JSON for every
+   batch.
+6. **Output Generation**: one new folder per bottle (Markdown, JSON
+   `schema_version` 2, OCR text, `evidence/W<n>.txt`, images, optional
+   `images/vendor_ref.<ext>`); an `error_report_<bottle_id>.json` for each
+   failed or rejected bottle; `run_<run_id>_settings.json` for the run.
+7. **Retry Logic**: with retry on, each model request is tried up to
+   `--retry-attempts` times (pause 2 s, doubling, at most 30 s); a timeout is
+   retried once; the fact check makes at most 2 attempts per call and does
+   not retry a text-model timeout.
+8. **Completion Reporting**: processed and failed counts, the web provider,
+   web and fact-check status counts, publish-ready count, output paths and the
+   model usage summary.
 
-2. **Image Discovery**:
-   - Scan input folder recursively for supported image formats (.jpeg, .jpg, .png, .tiff, .heic)
-   - Sort images alphabetically by filename
-   - Group images using lookahead to detect multi-angle photo sequences
-
-3. **Batch Processing**:
-   - Process images in batches (size determined by `--batch-size`)
-   - Apply lookahead (default 3 images) to include related multi-angle photos
-   - For each image:
-     - Correct orientation if needed
-     - Extract text via OCR and vision model
-     - Generate bottle metadata
-     - Group related images into bottle sets
-     - Detect quantity (duplicates, multiple bottles in frame)
-
-4. **Preview Generation** (unless `--batch-size all`):
-   - After each batch, generate markdown preview report
-   - Show grouping decisions and extracted metadata
-   - If `--interactive`: prompt user to accept/reject/modify per grouping
-   - Apply corrections before writing output files
-
-5. **Output Generation**:
-   - Create sub-folder per bottle in output directory
-   - Save original images, markdown metadata, extracted text
-   - Optionally cache vendor reference image and collect reference links (if `--include-vendor-images`)
-   - Generate error reports for failed attempts
-
-6. **Retry Logic** (if `--allow-retry` enabled):
-   - Automatic retry on failures (up to 3 attempts)
-   - Backoff: 0s → 2s → 5s delays between retries
-   - After all retries exhausted, generate error report
-
-7. **Completion Reporting**:
-   - Summary of processed/failed bottles
-   - Paths to output files
-   - Any warnings or errors encountered
+Web lookups and the fact check never fail a bottle; their failures are
+recorded in the bottle's `web_research` and `facts.verification`.
 
 ### Exit Codes
 
 | Code | Meaning |
 |------|---------|
-| 0 | Success (all bottles processed or failed gracefully) |
-| 1 | General error (invalid arguments, missing dependencies) |
-| 2 | Ollama connection failed |
+| 0 | Success (also a successful `--dry-run`) |
+| 1 | Invalid setting, invalid hints file, output folder equal to the image folder, Tesseract missing, some bottles failed, or no arguments |
+| 2 | Model server or model unavailable, or text model larger than memory; also argparse usage errors |
 | 3 | No valid images found in input folder |
 | 4 | Processing failed for all bottles |
-| 5 | Output directory creation failed |
+| 5 | Output directory not writable |
+| 128+N | Stopped by signal N |
 
 ### Example Usage
 
 ```bash
 # Basic processing (current directory, batch size 5)
-python -m cli.commands process
+bourbon-process process
 
 # Process specific folder
-python -m cli.commands process --image-folder ./bourbon_photos
+bourbon-process process --image-folder ./bourbon_photos
 
-# Batch processing with interactive feedback
-python -m cli.commands process -f ./photos -b 5 -i
+# Batch processing with interactive review
+bourbon-process process -f ./photos -b 5 -i
 
-# Full-folder processing without preview reports
-python -m cli.commands process -f ./photos --batch-size all --include-vendor-images
+# One batch, vendor reference images
+bourbon-process process -f ./photos --batch-size all --include-vendor-images
 
-# Faster processing with lighter model
-python -m cli.commands process -f ./photos -m qwen2-vl:7b --concurrency 5
+# Smaller fact-check model, no web
+bourbon-process process -f ./photos --text-model gpt-oss:20b --no-web
 
-# Debug mode to troubleshoot issues
-python -m cli.commands process -f ./photos --dry-run --debug
+# Check everything without processing
+bourbon-process process -f ./photos --dry-run --debug
 ```
 
 ---
 
-## Command: `retry-from-report`
+## Command: `retry`
 
-Re-process bottles that failed in a previous attempt, using error report guidance.
+Re-process one bottle that failed in a previous run, from its error report.
+(Version 1.0 of this contract called it `retry-from-report`; that command
+never existed.)
 
 ### Synopsis
 
 ```bash
-python -m cli.commands retry-from-report --report PATH [options]
+bourbon-process retry --report PATH [options]
 ```
 
 ### Required Options
 
 | Short | Long | Description | Validation |
 |-------|------|-------------|------------|
-| --report PATH | Path to error report JSON file | Must exist, valid JSON |
+| | --report PATH | Path to `error_report_<bottle_id>.json` | Must exist; JSON with `schema_version` 2, `bottle_id`, `images`, `error_message` |
 
 ### Optional Options
 
-All options from `process` command are supported. Options specified here override defaults but do not override values from error report.
+`-o/--output-dir`, `--hints`, and the model, server, retry, fact-check and web
+options of `process` (`-m`, `-u`, `--server-start-timeout`,
+`--request-timeout`, `--keep-server`, `--server-autostart`,
+`--keep-models-loaded`, `-r`, `--no-retry`, `--retry-attempts`, `--verify`,
+`--text-model`, `--text-think`, `--text-timeout`, `--web`, `--web-provider`,
+`--web-cache-dir`, `--refresh-web`, `-v`). Not `--pull`.
 
 ### Behavior
 
-1. **Load Error Report**:
-   - Read error_report.json
-   - Extract failed bottle ID and images
-   - Extract error type, suggested fix, hint topic
-
-2. **Apply Corrections**:
-   - Search hints.md for hint topic (if present in error report)
-   - Apply suggested fix (if implementable programmatically)
-   - Allow user to specify corrections via prompts or flags
-
-3. **Re-process**:
-   - Re-run processing for failed bottle only
-   - Use same options as original attempt (unless overridden)
-   - Skip already-successful bottles
-
-4. **Generate Output**:
-   - Create/update bottle folder with new metadata
-   - Mark as re-processed in status tracking
-   - Update error report or delete if successful
+1. **Load Error Report**: read the report; refuse a report that is not
+   `schema_version` 2 or whose `suggested_fix` names a field that cannot be
+   corrected.
+2. **Re-process**: OCR and the vision request for the report's images, with
+   the hint note; then the hint values; then the report's `suggested_fix`
+   values as corrections for this bottle; then web research and the fact
+   check.
+3. **Generate Output**: a new bottle folder (existing output is never
+   replaced). The error report is left in place.
 
 ### Exit Codes
 
-Same as `process` command, plus:
-
 | Code | Meaning |
 |------|---------|
-| 10 | Error report file not found or invalid |
-| 11 | Bottle re-processing failed again after retry |
+| 0 | Success |
+| 1 | Error: invalid report or settings, model server unavailable, re-processing failed |
+| 2 | Error report not found |
 
 ### Example Usage
 
 ```bash
-# Retry from an error report
-python -m cli.commands retry-from-report --report processed/error_report.json
-
-# Retry with different model
-python -m cli.commands retry-from-report --report processed/error_report.json -m qwen3-vl:32b
+bourbon-process retry --report processed/error_report_IMG_1234.json
+bourbon-process retry --report processed/error_report_IMG_1234.json -m gemma4:26b
 ```
 
 ---
 
 ## Command: `feedback`
 
-Provide user feedback on a generated preview report (alternative to interactive prompts).
+Apply corrections and approvals to a saved batch (alternative to interactive
+review during `process`). Calls no model and no web site.
 
 ### Synopsis
 
 ```bash
-python -m cli.commands feedback --batch BATCH_ID [options]
+bourbon-process feedback [--batch BATCH_ID] [options]
 ```
 
-### Required Options
-
-| Short | Long | Description | Validation |
-|-------|------|-------------|------------|
-| --batch ID | Batch ID from preview report | Must exist, valid batch identifier |
-
-### Optional Options
+### Options
 
 | Short | Long | Description | Default |
 |-------|------|-------------|---------|
-| --corrections FILE | JSON file with corrections (alternative to interactive prompts) | None |
-| -i | --interactive | Interactive prompt for corrections per grouping | disabled (false) |
+| -o | --output-dir PATH | Folder with the batch files | processed |
+| | --batch ID | Batch ID, e.g. `20261122_193000_001` for `batch_20261122_193000_001_preview.md` | Most recent batch |
+| | --corrections FILE | JSON corrections file | None |
+| -i | --interactive / --no-interactive | Interactive review of the batch's bottles | off |
+| | --approve BOTTLE_ID | Approve a bottle for publishing (repeatable) | None |
 
 ### Behavior
 
-1. **Load Batch**:
-   - Load batch metadata using batch ID
-   - Load preview report
-   - Display current grouping decisions and metadata
-
-2. **Collect Feedback**:
-   - If interactive: prompt user for each grouping (accept/reject/modify)
-   - If corrections file: read JSON with structured corrections
-   - Accept corrections structured as:
-     ```json
-     {
-       "bottle_id": "bottle_abc123",
-       "correction_type": "MERGE_BOTTLES",
-       "target_bottle_id": "bottle_def456",
-       "reason": "Same batch number and proof"
-     }
-     ```
-
-3. **Apply Corrections**:
-   - Update bottle groupings
-   - Merge/split bottles as requested
-   - Update metadata fields if specified
-
-4. **Regenerate Output**:
-   - Create final output files with corrections applied
-   - Mark batch as completed with feedback
+1. **Load Batch**: read `batch_<id>.json`; refuse one that is not
+   `schema_version` 2.
+2. **Collect Feedback**: from the corrections file, or interactively
+   (`[A]ccept`, `[R]eject`, `[E]dit`, `[C]onflicts`, `[N]ext`, `[Q]uit`), plus
+   `--approve`. The corrections file is a JSON list:
+   ```json
+   [
+     {"bottle_id": "IMG_4643", "field_name": "batch_number", "original_value": "C92", "corrected_value": "C923"}
+   ]
+   ```
+   A correction applies only to that bottle, and only if its current value
+   equals `original_value`.
+3. **Apply**: corrections become user facts; the facts are re-reconciled
+   without a model call; approvals are recorded and the publish gate is
+   recomputed. Grouping is never changed (no merge or split).
+4. **Regenerate Output**: each changed bottle is saved again in a new folder;
+   the batch JSON is updated.
 
 ### Exit Codes
 
-Same as `process` command, plus:
-
 | Code | Meaning |
 |------|---------|
-| 20 | Batch ID not found |
-| 21 | Corrections JSON invalid |
+| 0 | Success (also when there was nothing to apply) |
+| 1 | Error: unreadable or older batch file, invalid corrections file, a correction or approval not applied, a changed bottle not saved |
+| 2 | Batch not found |
 
 ### Example Usage
 
 ```bash
-# Interactive feedback
-python -m cli.commands feedback --batch batch_001 -i
+# Interactive review of the latest batch
+bourbon-process feedback -i
 
-# Feedback from corrections file
-python -m cli.commands feedback --batch batch_001 --corrections my_feedback.json
+# Corrections file and an approval for one batch
+bourbon-process feedback --batch 20261122_193000_001 --corrections my_feedback.json --approve IMG_4643
+```
+
+---
+
+## Command: `config`
+
+```bash
+bourbon-process config show [--json]   # config files searched and read, every value and its source
+bourbon-process config template        # a commented bourbon.toml with every key
 ```
 
 ---
 
 ## Environment Variables
 
-Configurable via environment variables (lower priority than CLI arguments):
+Lower priority than CLI arguments, higher than config files. Each setting
+with a flag has one; the full list is in README.md. The most used:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `BORBON_IMAGE_MODEL` | Ollama model for image analysis | qwen3-vl:32b |
-| `OLLLAMA_URL` | Ollama API endpoint | http://localhost:11434 |
-| `BORBON_OUTPUT_DIR` | Output folder for processed files | processed/ |
-| `BORBON_CONCURRENCY` | Max concurrent API requests | 3 |
-| `BORBON_DEBUG` | Enable debug logging | false |
-| `OLLLLAMA_MAX_LOADED_MODELS` | Max models kept in memory by Ollama | 3 |
-| `OLLLLAMA_KEEP_ALIVE` | Keep-alive duration for models (seconds, -1 = indefinite) | -1 |
+| `BOURBON_MODEL` | Ollama vision model | qwen3.6:35b-a3b |
+| `BOURBON_TEXT_MODEL` | Fact-check text model | gpt-oss:120b |
+| `BOURBON_OLLAMA_URL` | Ollama API endpoint | http://localhost:11434 |
+| `BOURBON_OUTPUT_DIR` | Output folder | processed |
+| `BOURBON_CONCURRENCY` | Bottle groups analysed in parallel | 2 |
+| `BOURBON_WEB_PROVIDER` | Search provider | auto |
+| `BOURBON_DEBUG` | Debug logging | false |
+| `BOURBON_CONFIG` / `BOURBON_NO_CONFIG` | Config file to read / read none | |
+| `BRAVE_API_KEY`, `OLLAMA_API_KEY` | Search API keys (environment only) | unset |
 
 ### Precedence Order
 
 1. CLI arguments (highest)
 2. Environment variables
-3. Default values (lowest)
+3. `./bourbon.toml`
+4. `${XDG_CONFIG_HOME:-~/.config}/bourbon-process/config.toml`
+5. Default values (lowest)
+
+`--config PATH` replaces 3 and 4 with that file; `--no-config` skips both.
 
 ---
 
 ## Output Conventions
 
-### Progress Messages
-
-All progress messages written to stdout:
-- Processing start: `Processing {N} images from {folder}`
-- Bottle progress: `Processing bottle {current}/{total}: {images}`
-- Batch progress: `Batch {current}/{total}: {N} bottles`
-- Success: `✓ Successfully processed: {bottle_name} → {output_path}`
-- Failure: `✗ Failed to process: {images} → {error_type}`
-
-### Debug Messages (when `--debug` enabled)
-
-Written to stdout with more detail:
-- Ollama API calls: `POST {ollama_url}/api/generate with model {model}`
-- Orientation detection: `Detected orientation: {detected} → correcting...`
-- OCR output: `Extracted text: {raw_text}`
-- Config values: `Using config: {key}={value}`
-
-### Error Messages
-
-Written to stderr:
-- Invalid arguments: `Error: --batch-size must be positive integer or "all"`
-- Missing dependencies: `Error: Required dependency not installed: {package}`
-- Ollama error: `Error: Could not connect to Ollama at {url} - ensure service is running`
-
 ### Log Format
 
+All log lines go to stdout:
+
 ```
-{timestamp} {level} {module}: {message}
+{timestamp} {LEVEL} [{bottle id or -}] {module}: {message}
 ```
 
 Example:
 ```
-2026-11-09 14:30:22 INFO image_processor.bottle_analyzer: Processing bottle 1/15
-2026-11-09 14:30:45 DEBUG ollama_client: API call completed in 23.4s
+2026-11-23 14:30:22,123 INFO [IMG_4643] image_processor.bottle_analyzer: Processing bottle with 3 image(s)
+2026-11-23 14:31:05,456 INFO [-] image_processor.enrichment: Unloaded vision model qwen3.6:35b-a3b
+```
+
+Configuration errors go to stderr, one line per invalid value, each naming
+its source:
+
+```
+bourbon-process: configuration error:
+  - concurrency=0 (from flag --concurrency): ...
 ```
 
 ---
@@ -324,63 +354,68 @@ Example:
 
 ### Interactive Mode (`--interactive`)
 
-Prompts user for each grouping decision:
+For each bottle the terminal shows its facts, open conflicts and publish
+blockers, then:
 
 ```
-Processing Batch 1/3
-
-Group 1: Buffalo Trace (2 images: IMG_001.jpg, IMG_002.jpg)
-Detected: 1 bottle, Quantity: 2, Confidence: High
-Metadata: Buffalo Trace Distillery, 90 proof, $29.99, Batch BT24-07
-
-Action? [A]ccept / [R]eject / [M]erge / [S]plit / [E]dit: _
+Action [A/R/E/C/N/Q]?
 ```
 
 **Actions**:
-- `A` or `accept`: Accept grouping as-is
-- `R` or `reject`: Reject grouping (mark for manual review, skip this set)
-- `M` or `merge`: Merge with previous grouping (if applicable)
-- `S` or `split`: Split into multiple bottles (specify split points)
-- `E` or `edit`: Edit metadata interactively
+- `A`: approve for publishing (the other publish checks still apply)
+- `R`: reject (not saved; an error report is written)
+- `E`: edit fields; each edit is a correction for this bottle
+- `C`: settle each open conflict (pick a candidate, type a value, or skip)
+- `N`: keep as it is, not approved
+- `Q`: stop reviewing; remaining bottles are kept, not approved
+
+Merge and split are not available.
 
 ### Non-Interactive Mode
 
-Skip prompts, generate markdown preview report only:
+The preview report is written and the run continues:
 
 ```
-Generating preview report: processed/batch_1_preview.md
-Run `python -m cli.commands feedback --batch batch_001 -i` to review
+Saved batch preview report to processed/batch_20261123_120000_001_preview.md
 ```
+
+The report ends with the `feedback` and `retry` commands for that batch.
 
 ---
 
 ## Configuration File Format
 
-Optional config file at `.specify_config.toml` in root directory:
+Sectioned TOML, read from `${XDG_CONFIG_HOME:-~/.config}/bourbon-process/config.toml`
+and `./bourbon.toml` (or only `--config PATH`). Unknown sections and keys are
+errors; API keys are refused. `bourbon-process config template` prints every
+key with its default, environment variable and flag (the repository keeps
+it as `bourbon.example.toml`). An excerpt:
 
 ```toml
 [processing]
-default_batch_size = 5
-lookahead_images = 3
-concurrency = 3
+batch_size = 5
+concurrency = 2
 
-[ollama]
-url = "http://localhost:11434"
-model = "qwen3-vl:32b"
-max_loaded_models = 3
-keep_alive = -1
+[model]
+vision_model = "qwen3.6:35b-a3b"
+keep_models_loaded = false
 
-[output]
-directory = "processed"
-include_timestamps = true
+[text]
+enabled = true
+model = "gpt-oss:120b"
 
-[vendor]
-cache_images = false
-collect_reference_links = false
+[server]
+ollama_url = "http://localhost:11434"
 
 [retry]
-max_attempts = 3
 enabled = true
+max_attempts = 3
+
+[web]
+enabled = true
+provider = "auto"
+vendor_images = false
+deny_domains = []
 ```
 
 ---
@@ -389,134 +424,61 @@ enabled = true
 
 ### Option Validation
 
-- `--image-folder`: Must exist, be directory, be readable
-- `--batch-size`: Integer ≥ 1 OR literal "all"
-- `--model`: Must be included in list from `ollama list`
-- `--ollama-url`: Valid URL, must respond to GET `/api/tags`
-- `--output-dir`: Must be writable (or creatable)
-- `--lookahead`: Integer 0-10
-- `--concurrency`: Integer 1-10
+Done once by the settings layer for every source (file, environment, flag);
+all errors are reported together and the command exits 1. Ranges are in the
+options table above.
 
 ### Pre-flight Checks
 
 Before processing starts:
 1. Verify input folder contains at least 1 supported image
-2. Verify Ollama service is reachable at configured URL
-3. Verify specified model is available in Ollama
-4. Verify Tesseract OCR is installed and executable
-5. Verify output folder is writable (can create if not exists)
+2. Verify the output folder is not the input folder and is writable
+3. Verify the hints file, if any
+4. Verify Tesseract OCR is installed
+5. Verify Ollama is reachable (or can be started)
+6. Verify the vision model and, when the fact check is on, the text model are available and capable
+7. Check the text model against physical memory
 
 ### Post-flight Checks
 
-After processing completes:
-1. Verify all bottles written to output folder
-2. Verify error reports generated for failures
-3. Verify preview reports generated for batches (unless `--batch-size all`)
-4. Calculate and report success/failure statistics
+After processing completes, the run summary reports processed and failed
+bottles, error reports, web and fact-check status counts and the
+publish-ready count.
 
 ---
 
 ## Error Handling
 
-### Argument Errors
-
-Exceptions during argument validation:
-```bash
-Error: Invalid value for --batch-size: '-1' (must be >= 1 or 'all')
-Usage: python -m cli.commands process [options]
-  --batch-size N  Number of bottles per batch, or 'all' for full-folder processing
-```
-
-### Dependency Errors
-
-Missing required packages:
-```bash
-Error: Required dependency not installed: requests
-Install with: pip install requests
-```
-
-### Ollama Connection Errors
-
-Cannot reach Ollama:
-```bash
-Error: Could not connect to Ollama at http://localhost:11434
-Start Ollama with: ollama serve
-Check status with: curl http://localhost:11434/api/tags
-```
-
 ### Processing Errors (Non-Fatal)
 
-Individual bottle failures do not stop processing:
-```
-Warning: Failed to process bottle set {images} after 3 retries
-  Error type: OCR_FAILURE
-  Error: Tesseract unable to extract text
-  Suggested fix: Check image quality, re-capture
-  Error report: processed/{bottle_folder}/error_report.json
-  Hints topic: rotated_images (see processed/hints.md)
-Continuing with remaining bottles...
-```
+Individual bottle failures do not stop processing: the bottle gets
+`processed/error_report_<bottle_id>.json` and the run continues. Web lookup
+and fact-check failures are recorded in the bottle and never fail it.
 
 ### Processing Errors (Fatal)
 
 Errors that stop all processing:
 - Output directory not writable
-- Ollama service unavailable
+- Ollama service unavailable, or lost during the run
 - No valid images found
-- Model not found
-
----
-
-## Version Information
-
-### Display Version
-
-```bash
-python -m cli.commands --version
-```
-
-Output:
-```
-Bourbon Image Processor v1.0.0
-Python 3.11.0
-Ollama client library built-in
-```
+- Model missing, not capable, or incompatible
 
 ---
 
 ## Testing the CLI
 
-### Unit Tests (/tests/contract/test_cli_contracts.py)
-
-Test argument parsing, validation, and help generation.
-
-### Integration Tests (/tests/integration/test_cli_workflow.py)
-
-Test end-to-end CLI commands with real fixtures.
-
-### Contract Tests to Verify
-
-- [ ] `--help` generates valid help text
-- [ ] Invalid arguments exit with code 1 and show error message
-- [ ] Required arguments reject missing values
-- [ ] Pre-flight checks fail before processing
-- [ ] Exit codes match specification
-- [ ] Non-fatal errors allow continuation
-- [ ] Fatal errors stop processing
-- [ ] Interactive prompts work when `--interactive` enabled
-- [ ] Markdown preview reports generated without `--batch-size all`
-- [ ] Vendor image caching works when `--include-vendor-images` enabled
+- `tests/contract/test_cli_contracts.py`: subprocess tests of parsing, help, exit codes and pre-flight.
+- `tests/contract/test_cli_model_integration.py`: in-process runs with fake models, server, search and text model.
+- `tests/contract/test_output_formats.py` and `tests/contract/test_example_sample.py`: output layout and the example sample.
 
 ---
 
 ## Summary
 
 The CLI provides:
-- Single-command processing workflow (`process`)
-- Retry mechanism for failed attempts (`retry-from-report`)
-- Feedback loop for corrections (`feedback`)
-- Batch processing with configurable sizing
-- Interactive and non-interactive modes
-- Comprehensive error handling and reporting
-
-All commands are designed to fail explicitly with helpful error messages, use sensible defaults, and support configuration via CLI arguments, environment variables, and optional config files.
+- Processing with web lookups and a fact check (`process`)
+- Re-processing of failed bottles (`retry`)
+- Corrections and approvals for saved batches (`feedback`)
+- Effective configuration and a template (`config`)
+- Batch processing with configurable sizing, interactive and non-interactive review
+- Explicit errors with their source, and documented exit codes

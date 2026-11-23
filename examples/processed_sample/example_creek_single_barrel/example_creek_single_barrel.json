@@ -1,0 +1,641 @@
+{
+  "name": "Example Creek Single Barrel",
+  "distillery": "Example Creek Distillery",
+  "specific_release": "Single Barrel",
+  "msrp": null,
+  "proof": "100 Proof",
+  "abv": null,
+  "age": null,
+  "tasting_notes": null,
+  "label_price": "64.99",
+  "quantity": {
+    "count": 1,
+    "price": null,
+    "source": "extracted"
+  },
+  "extracted_at": "2026-11-23T12:00:00+00:00",
+  "run_id": "20261123_120000",
+  "reference_links": [
+    {
+      "url": "https://www.examplecreek.test/single-barrel",
+      "label": "Single Barrel | Example Creek",
+      "source_class": "official",
+      "retrieved_at": "2026-11-23T12:00:04+00:00",
+      "used_as_evidence": true
+    },
+    {
+      "url": "https://shop.test/example-creek-single-barrel",
+      "label": "Example Creek Single Barrel 750ml",
+      "source_class": "retailer",
+      "retrieved_at": "2026-11-23T12:00:07+00:00",
+      "used_as_evidence": false
+    }
+  ],
+  "corrections": [
+    {
+      "bottle_id": "IMG_0001",
+      "field_name": "batch_number",
+      "original_value": "C92",
+      "corrected_value": "C923",
+      "corrected_at": "2026-11-23T12:00:00+00:00",
+      "source": "hint:hints.toml#IMG_0001: Owner read the neck label on the bottle, 2026-11-20"
+    }
+  ],
+  "facts": {
+    "fields": {
+      "name": {
+        "value": "Example Creek Single Barrel",
+        "status": "supported",
+        "confidence": "medium",
+        "confidence_basis": "label(high)",
+        "citations": [
+          {
+            "source_id": "L1",
+            "quote": "Example Creek Single Barrel",
+            "quote_kind": "reading",
+            "derived": false
+          }
+        ],
+        "candidates": [
+          {
+            "value": "Example Creek Single Barrel",
+            "citations": [
+              {
+                "source_id": "L1",
+                "quote": "Example Creek Single Barrel",
+                "quote_kind": "reading",
+                "derived": false
+              }
+            ],
+            "origin": "label"
+          }
+        ],
+        "reason": null
+      },
+      "distillery": {
+        "value": "Example Creek Distillery",
+        "status": "supported",
+        "confidence": "high",
+        "confidence_basis": "label(high)+ocr",
+        "citations": [
+          {
+            "source_id": "L1",
+            "quote": "Example Creek Distillery",
+            "quote_kind": "reading",
+            "derived": false
+          },
+          {
+            "source_id": "O1",
+            "quote": "DISTILLED BY EXAMPLE CREEK DISTILLERY",
+            "quote_kind": "verbatim",
+            "derived": false
+          },
+          {
+            "source_id": "W1",
+            "quote": "distilled by Example Creek Distillery",
+            "quote_kind": "verbatim",
+            "derived": false
+          }
+        ],
+        "candidates": [
+          {
+            "value": "Example Creek Distillery",
+            "citations": [
+              {
+                "source_id": "L1",
+                "quote": "Example Creek Distillery",
+                "quote_kind": "reading",
+                "derived": false
+              },
+              {
+                "source_id": "O1",
+                "quote": "DISTILLED BY EXAMPLE CREEK DISTILLERY",
+                "quote_kind": "verbatim",
+                "derived": false
+              }
+            ],
+            "origin": "label"
+          },
+          {
+            "value": "Example Creek Distillery",
+            "citations": [
+              {
+                "source_id": "W1",
+                "quote": "distilled by Example Creek Distillery",
+                "quote_kind": "verbatim",
+                "derived": false
+              }
+            ],
+            "origin": "web"
+          }
+        ],
+        "reason": null
+      },
+      "bottler": {
+        "value": null,
+        "status": "unknown",
+        "confidence": null,
+        "confidence_basis": null,
+        "citations": [],
+        "candidates": [],
+        "reason": "Bottler not part of the label reading; not stated in OCR text or 2 fetched page(s)"
+      },
+      "specific_release": {
+        "value": "Single Barrel",
+        "status": "supported",
+        "confidence": "high",
+        "confidence_basis": "label(high)+ocr",
+        "citations": [
+          {
+            "source_id": "L1",
+            "quote": "Single Barrel",
+            "quote_kind": "reading",
+            "derived": false
+          },
+          {
+            "source_id": "O1",
+            "quote": "SINGLE BARREL",
+            "quote_kind": "verbatim",
+            "derived": false
+          }
+        ],
+        "candidates": [
+          {
+            "value": "Single Barrel",
+            "citations": [
+              {
+                "source_id": "L1",
+                "quote": "Single Barrel",
+                "quote_kind": "reading",
+                "derived": false
+              },
+              {
+                "source_id": "O1",
+                "quote": "SINGLE BARREL",
+                "quote_kind": "verbatim",
+                "derived": false
+              }
+            ],
+            "origin": "label"
+          }
+        ],
+        "reason": null
+      },
+      "batch_number": {
+        "value": "C923",
+        "status": "user",
+        "confidence": "high",
+        "confidence_basis": "user",
+        "citations": [
+          {
+            "source_id": "U1",
+            "quote": "hint:hints.toml#IMG_0001: Owner read the neck label on the bottle, 2026-11-20",
+            "quote_kind": "reading",
+            "derived": false
+          }
+        ],
+        "candidates": [
+          {
+            "value": "C92",
+            "citations": [
+              {
+                "source_id": "L1",
+                "quote": "C92",
+                "quote_kind": "reading",
+                "derived": false
+              },
+              {
+                "source_id": "O1",
+                "quote": "BATCH C92",
+                "quote_kind": "verbatim",
+                "derived": false
+              }
+            ],
+            "origin": "label"
+          },
+          {
+            "value": "C923",
+            "citations": [
+              {
+                "source_id": "U1",
+                "quote": "hint:hints.toml#IMG_0001: Owner read the neck label on the bottle, 2026-11-20",
+                "quote_kind": "reading",
+                "derived": false
+              }
+            ],
+            "origin": "user"
+          }
+        ],
+        "reason": null
+      },
+      "proof": {
+        "value": 100.0,
+        "status": "supported",
+        "confidence": "high",
+        "confidence_basis": "label(high)+ocr",
+        "citations": [
+          {
+            "source_id": "L1",
+            "quote": "100 Proof",
+            "quote_kind": "reading",
+            "derived": false
+          },
+          {
+            "source_id": "O1",
+            "quote": "100 PROOF",
+            "quote_kind": "verbatim",
+            "derived": false
+          }
+        ],
+        "candidates": [
+          {
+            "value": 100.0,
+            "citations": [
+              {
+                "source_id": "L1",
+                "quote": "100 Proof",
+                "quote_kind": "reading",
+                "derived": false
+              },
+              {
+                "source_id": "O1",
+                "quote": "100 PROOF",
+                "quote_kind": "verbatim",
+                "derived": false
+              }
+            ],
+            "origin": "label"
+          }
+        ],
+        "reason": null
+      },
+      "abv": {
+        "value": null,
+        "status": "unknown",
+        "confidence": null,
+        "confidence_basis": null,
+        "citations": [],
+        "candidates": [],
+        "reason": "Abv not read from label; not stated in OCR text or 2 fetched page(s)"
+      },
+      "age": {
+        "value": null,
+        "status": "unknown",
+        "confidence": null,
+        "confidence_basis": null,
+        "citations": [],
+        "candidates": [],
+        "reason": "Age not read from label; not stated in OCR text or 2 fetched page(s)"
+      },
+      "release_year": {
+        "value": null,
+        "status": "unknown",
+        "confidence": null,
+        "confidence_basis": null,
+        "citations": [],
+        "candidates": [],
+        "reason": "Release year not part of the label reading; not stated in OCR text or 2 fetched page(s)"
+      },
+      "mash_bill": {
+        "value": null,
+        "status": "unknown",
+        "confidence": null,
+        "confidence_basis": null,
+        "citations": [],
+        "candidates": [],
+        "reason": "Mash bill not part of the label reading; not stated in OCR text or 2 fetched page(s)"
+      },
+      "tasting_notes": {
+        "value": null,
+        "status": "unknown",
+        "confidence": null,
+        "confidence_basis": null,
+        "citations": [],
+        "candidates": [],
+        "reason": "Tasting notes not read from label; not stated in OCR text or 2 fetched page(s)"
+      },
+      "msrp": {
+        "value": null,
+        "status": "unknown",
+        "confidence": null,
+        "confidence_basis": null,
+        "citations": [],
+        "candidates": [],
+        "reason": "price on label ($64.99) recorded as retail, not MSRP; 2 page(s) fetched; 1 retail price(s) found (W2 $69.99); no source stated an MSRP"
+      }
+    },
+    "sources": [
+      {
+        "id": "L1",
+        "kind": "label",
+        "ref": "IMG_0001.jpg",
+        "url": null,
+        "title": null,
+        "tier": null,
+        "fetched_at": null,
+        "content_sha256": null,
+        "evidence_path": null
+      },
+      {
+        "id": "O1",
+        "kind": "ocr",
+        "ref": "IMG_0001.jpg",
+        "url": null,
+        "title": null,
+        "tier": null,
+        "fetched_at": null,
+        "content_sha256": "4dc2bd4547afe8d841c0634c7e1302f62faa7f9cb3c38fb71fb47dd54ee5b929",
+        "evidence_path": null
+      },
+      {
+        "id": "W1",
+        "kind": "web",
+        "ref": "https://www.examplecreek.test/single-barrel",
+        "url": "https://www.examplecreek.test/single-barrel",
+        "title": "Single Barrel | Example Creek",
+        "tier": "official",
+        "fetched_at": "2026-11-23T12:00:04+00:00",
+        "content_sha256": "620d9053df548f5ec659f25813bd72b624bfe622b5e851c8163d66f437cd1e1f",
+        "evidence_path": "evidence/W1.txt"
+      },
+      {
+        "id": "W2",
+        "kind": "web",
+        "ref": "https://shop.test/example-creek-single-barrel",
+        "url": "https://shop.test/example-creek-single-barrel",
+        "title": "Example Creek Single Barrel 750ml",
+        "tier": "retailer",
+        "fetched_at": "2026-11-23T12:00:07+00:00",
+        "content_sha256": "cce9bfe09417cf819fdbdd7b374b4818c16a3d0c2c5ff53008400766d9c31bb0",
+        "evidence_path": "evidence/W2.txt"
+      },
+      {
+        "id": "U1",
+        "kind": "user",
+        "ref": "hint:hints.toml#IMG_0001: Owner read the neck label on the bottle, 2026-11-20",
+        "url": null,
+        "title": null,
+        "tier": null,
+        "fetched_at": null,
+        "content_sha256": null,
+        "evidence_path": null
+      }
+    ],
+    "conflicts": [
+      {
+        "id": "batch_number-1",
+        "field": "batch_number",
+        "kind": "value_mismatch",
+        "candidates": [
+          {
+            "value": "C92",
+            "citations": [
+              {
+                "source_id": "L1",
+                "quote": "C92",
+                "quote_kind": "reading",
+                "derived": false
+              },
+              {
+                "source_id": "O1",
+                "quote": "BATCH C92",
+                "quote_kind": "verbatim",
+                "derived": false
+              }
+            ],
+            "origin": "label"
+          },
+          {
+            "value": "C923",
+            "citations": [
+              {
+                "source_id": "U1",
+                "quote": "hint:hints.toml#IMG_0001: Owner read the neck label on the bottle, 2026-11-20",
+                "quote_kind": "reading",
+                "derived": false
+              }
+            ],
+            "origin": "user"
+          }
+        ],
+        "note": "L1,O1 C92 vs user C923 (user value wins)",
+        "resolved_by": {
+          "source_id": "U1",
+          "quote": "hint:hints.toml#IMG_0001: Owner read the neck label on the bottle, 2026-11-20",
+          "quote_kind": "reading",
+          "derived": false
+        }
+      }
+    ],
+    "prices": [
+      {
+        "kind": "retail",
+        "amount": "64.99",
+        "currency": "USD",
+        "citation": {
+          "source_id": "L1",
+          "quote": "price visible on label",
+          "quote_kind": "reading",
+          "derived": false
+        },
+        "confidence": null
+      },
+      {
+        "kind": "retail",
+        "amount": "69.99",
+        "currency": "USD",
+        "citation": {
+          "source_id": "W2",
+          "quote": "Our price $69.99",
+          "quote_kind": "verbatim",
+          "derived": false
+        },
+        "confidence": null
+      }
+    ],
+    "verification": {
+      "status": "verified",
+      "reason": null,
+      "text_model": "gpt-oss:120b",
+      "think": "high",
+      "prompt_version": "facts-1",
+      "duration_s": 74.2,
+      "attempts": 2,
+      "degraded_think": false,
+      "rejected": [
+        {
+          "stage": "extract",
+          "reason": "release_not_near_quote",
+          "detail": "none of c92 within 600 characters of the quote",
+          "kind": "claim",
+          "field": "proof",
+          "value": "100",
+          "source_id": "W1",
+          "quote": "bottled at 100 proof"
+        }
+      ]
+    },
+    "copy": {
+      "sentences": [
+        {
+          "text": "Example Creek Single Barrel is distilled by Example Creek Distillery.",
+          "citations": [
+            1,
+            2
+          ],
+          "fields": [
+            "name",
+            "distillery"
+          ]
+        }
+      ],
+      "description_md": "Example Creek Single Barrel is distilled by Example Creek Distillery. [1][2]",
+      "stale": false,
+      "reason": null
+    },
+    "publish": {
+      "ready": false,
+      "blockers": [
+        "not approved by a reviewer"
+      ],
+      "group_warnings": []
+    },
+    "review": {
+      "approved": false,
+      "by": null,
+      "at": null
+    }
+  },
+  "web_research": {
+    "status": "ok",
+    "reason": null,
+    "provider": "duckduckgo",
+    "queries": [
+      "\"Example Creek Single Barrel\" Example Creek Distillery c923 MSRP",
+      "\"Example Creek Single Barrel\" Example Creek Distillery Single Barrel"
+    ],
+    "searched_at": "2026-11-23T12:00:00+00:00",
+    "pages": [
+      {
+        "url": "https://www.examplecreek.test/single-barrel",
+        "title": "Single Barrel | Example Creek",
+        "domain": "examplecreek.test",
+        "source_class": "official",
+        "retrieved_at": "2026-11-23T12:00:04+00:00",
+        "outcome": "cited",
+        "cited_for": [
+          "distillery"
+        ],
+        "reason": null,
+        "from_cache": false
+      },
+      {
+        "url": "https://shop.test/example-creek-single-barrel",
+        "title": "Example Creek Single Barrel 750ml",
+        "domain": "shop.test",
+        "source_class": "retailer",
+        "retrieved_at": "2026-11-23T12:00:07+00:00",
+        "outcome": "fetched_not_cited",
+        "cited_for": [],
+        "reason": "W2: only a retail price observation",
+        "from_cache": false
+      },
+      {
+        "url": "https://forum.test/t/example-creek",
+        "title": "Example Creek thread",
+        "domain": "forum.test",
+        "source_class": null,
+        "retrieved_at": null,
+        "outcome": "skipped",
+        "cited_for": [],
+        "reason": "deny-listed",
+        "from_cache": false
+      },
+      {
+        "url": "https://blog.test/bourbon-list",
+        "title": "Ten bourbons to try",
+        "domain": "blog.test",
+        "source_class": "reference",
+        "retrieved_at": null,
+        "outcome": "skipped",
+        "cited_for": [],
+        "reason": "robots.txt disallows fetching",
+        "from_cache": false
+      }
+    ],
+    "evidence": [
+      {
+        "source_id": "W1",
+        "url": "https://www.examplecreek.test/single-barrel",
+        "domain": "examplecreek.test",
+        "tier": "official",
+        "title": "Single Barrel | Example Creek",
+        "text": "Example Creek Single Barrel\nEach barrel is chosen by hand. Example Creek Single Barrel is distilled by Example Creek Distillery and bottled at 100 proof.",
+        "sha256": "620d9053df548f5ec659f25813bd72b624bfe622b5e851c8163d66f437cd1e1f",
+        "fetched_at": "2026-11-23T12:00:04+00:00",
+        "http_status": 200,
+        "query": "\"Example Creek Single Barrel\" Example Creek Distillery c923 MSRP",
+        "from_cache": false,
+        "truncated": false,
+        "structured_prices": []
+      },
+      {
+        "source_id": "W2",
+        "url": "https://shop.test/example-creek-single-barrel",
+        "domain": "shop.test",
+        "tier": "retailer",
+        "title": "Example Creek Single Barrel 750ml",
+        "text": "Example Creek Single Barrel 750ml\nOur price $69.99\nAdd to cart",
+        "sha256": "cce9bfe09417cf819fdbdd7b374b4818c16a3d0c2c5ff53008400766d9c31bb0",
+        "fetched_at": "2026-11-23T12:00:07+00:00",
+        "http_status": 200,
+        "query": "\"Example Creek Single Barrel\" Example Creek Distillery c923 MSRP",
+        "from_cache": false,
+        "truncated": false,
+        "structured_prices": []
+      }
+    ],
+    "vendor_image": null
+  },
+  "vendor_image": null,
+  "review_required": false,
+  "metadata": {
+    "name": "Example Creek Single Barrel",
+    "distillery": "Example Creek Distillery",
+    "label_price": "64.99",
+    "specific_release": "Single Barrel",
+    "proof": "100 Proof",
+    "abv": null,
+    "age": null,
+    "batch_number": "C92",
+    "tasting_notes": null,
+    "full_text": "EXAMPLE CREEK\nSINGLE BARREL\nKENTUCKY STRAIGHT BOURBON WHISKEY\n100 PROOF\nBATCH C92\nDISTILLED BY EXAMPLE CREEK DISTILLERY",
+    "selected_text": "EXAMPLE CREEK\nSINGLE BARREL\nKENTUCKY STRAIGHT BOURBON WHISKEY\n100 PROOF\nBATCH C92\nDISTILLED BY EXAMPLE CREEK DISTILLERY",
+    "source_images": [
+      "/path/to/photos/IMG_0001.jpg"
+    ],
+    "vision_model": "qwen3.6:35b-a3b",
+    "vision_confidence": "high",
+    "warnings": [
+      "hint overrides label read for batch_number: label 'C92', hint 'C923'"
+    ],
+    "same_bottle": null,
+    "vision_attempts": 1,
+    "ocr_by_image": {
+      "IMG_0001.jpg": "EXAMPLE CREEK\nSINGLE BARREL\nKENTUCKY STRAIGHT BOURBON WHISKEY\n100 PROOF\nBATCH C92\nDISTILLED BY EXAMPLE CREEK DISTILLERY"
+    }
+  },
+  "schema_version": 2,
+  "bottle_id": "IMG_0001",
+  "batch_number": "C923",
+  "model_used": "qwen3.6:35b-a3b",
+  "confidence": "HIGH",
+  "source_images": [
+    "/path/to/photos/IMG_0001.jpg"
+  ],
+  "images": [
+    "images/IMG_0001.jpg"
+  ],
+  "missing_images": [],
+  "total_value": null
+}
