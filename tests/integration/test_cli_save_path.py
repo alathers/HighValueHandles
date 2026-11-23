@@ -1,9 +1,11 @@
 """End-to-end tests of the ``process`` save path.
 
 Runs the real CLI ``main()`` with the real ImageOrganizer, BatchProcessor,
-BottleAnalyzer and PreviewGenerator. Mocked: pre-flight checks (server and
-Tesseract), the model server manager, OCR and the vision call. Nothing here
-talks to a model server.
+BottleAnalyzer, enrichment phase, FactChecker and PreviewGenerator. Mocked:
+pre-flight checks (server and Tesseract), the model server manager, OCR, the
+vision call, the text model (a scripted ``chat_text`` that finds nothing) and
+the web researcher (every search returns no results). Nothing here talks to a
+model server or the web.
 """
 
 import hashlib
@@ -17,7 +19,9 @@ import pytest
 from PIL import Image as PILImage
 
 from cli import commands
+from lib.ollama_client import ChatResult
 from models.bottle import Bottle, ExtractedMetadata
+from models.evidence import WebResearch
 
 LABELS = {
     "evan": dict(name="Evan Williams Black Label", distillery="Heaven Hill", label_price="15.99", proof="86 Proof"),
@@ -70,17 +74,44 @@ def _fake_vision(self, image_paths, ocr_text="", model=None, **_kwargs):
     )
 
 
+class _NoResultsResearcher:
+    """Stand-in web researcher: every search returns no results (no network)."""
+
+    provider = type("Provider", (), {"name": "duckduckgo"})()
+
+    def research_many(self, items, *, workers=1):
+        return [
+            WebResearch(status="no_results", reason="search returned no results", provider="duckduckgo",
+                        queries=[str(identity.get("name"))])
+            for identity, _photo in items
+        ]
+
+
+def _fake_text_chat(prompt, model=None, *, system=None, format=None, **_kwargs):
+    """Text model stand-in: EXTRACT finds nothing; COMPOSE writes no sentences."""
+    props = (format or {}).get("properties", {})
+    body = {"page_match": [], "claims": [], "prices": []} if "claims" in props else {"sentences": []}
+    return ChatResult(content=json.dumps(body), done_reason="stop", model=model or "")
+
+
+def _fake_manager():
+    manager = MagicMock()
+    manager.get_client.return_value.chat_text.side_effect = _fake_text_chat
+    return manager
+
+
 def _run(argv, vision=_fake_vision, user_input=None):
-    """Run ``main(argv)`` with server, OCR and vision mocked; return (rc, vision calls)."""
+    """Run ``main(argv)`` with server, OCR, vision, text model and web mocked; return (rc, vision calls)."""
     calls: list[list[Path]] = []
 
     def spy(self, image_paths, ocr_text="", model=None, **kwargs):
         calls.append([Path(p) for p in image_paths])
         return vision(self, image_paths, ocr_text, model, **kwargs)
 
-    manager = MagicMock()
+    manager = _fake_manager()
     with patch.object(commands, "pre_flight_checks", return_value=0), \
             patch.object(commands, "build_server_manager", return_value=manager), \
+            patch.object(commands, "_build_researcher", lambda settings, client: _NoResultsResearcher()), \
             patch("image_processor.text_extractor.TextExtractor.extract_with_retry",
                   lambda self, p, **k: f"OCR {Path(p).name}"), \
             patch("image_processor.bottle_analyzer.BottleAnalyzer.analyze_with_vision_model", spy), \
@@ -119,12 +150,28 @@ def test_end_to_end_writes_complete_bottle_folders(photos):
     assert data["confidence"] == "HIGH"
     assert data["model_used"] == commands.DEFAULT_VISION_MODEL
     assert Bottle.from_json((evan / "evan_williams_black_label.json").read_text()).name == data["name"]
+    # Schema v2: facts, web research, run id; nothing invented when nothing is found.
+    assert data["schema_version"] == 2
+    assert data["run_id"]
+    assert data["web_research"]["status"] == "no_results"
+    facts = data["facts"]
+    assert facts["fields"]["name"]["status"] == "supported"
+    assert facts["fields"]["msrp"]["status"] == "unknown"
+    assert [p["kind"] for p in facts["prices"]] == ["retail"]  # the label price, never an MSRP
+    assert facts["publish"]["ready"] is False
+    assert "not approved by a reviewer" in facts["publish"]["blockers"]
+    assert data["proof"] == "86 Proof"
+    assert data["reference_links"] == []
 
     txt = (evan / "evan_williams_black_label.txt").read_text()
     assert "OCR evan_front.jpg" in txt and "OCR evan_back.jpg" in txt
+    assert txt.endswith("web: 0 pages consulted, 0 cited\n")
     md = (evan / "evan_williams_black_label.md").read_text()
-    assert md.startswith("# Evan Williams Black Label")
+    assert md.startswith("# Evan Williams Black Label\n\n**Status:** NOT publish-ready:")
     assert "images/evan_back.jpg" in md
+    assert "- **MSRP:** Unknown:" in md
+    assert "- **Retail:** $15.99: Price visible on label (retail, not MSRP)" in md
+    assert "## Web Research Log" in md
 
     weller = json.loads((out / "weller_special_reserve" / "weller_special_reserve.json").read_text())
     assert weller["msrp"] is None
@@ -468,38 +515,76 @@ def test_feedback_resaves_only_corrected_bottles(photos, tmp_path):
     assert resaved["corrections"][0]["source"].startswith("feedback:")
 
 
-def test_feedback_on_a_pre_rename_batch_never_publishes_the_photo_price_as_msrp(photos, tmp_path):
-    """Older batch files stored the photo price as msrp; a resave keeps it only as label_price."""
+def test_feedback_refuses_a_schema_v1_batch(photos, tmp_path, caplog):
+    """Older batch files (no facts, corrections without bottle IDs) are refused with a clear message."""
     out = tmp_path / "out"
     batch_json, ids = _single_batch_run(photos, out)
     data = json.loads(batch_json.read_text())
-    for bottle in data["bottles"]:
-        bottle.pop("label_price", None)
-        bottle["msrp"] = "24.99"  # the old format: a price tag read from the photo
+    data.pop("schema_version")
     batch_json.write_text(json.dumps(data))
+    before = sorted(p.name for p in _bottle_dirs(out))
 
     rc = _feedback(out, batch_json, [{
         "bottle_id": ids["Evan Williams Black Label"],
         "field_name": "proof", "original_value": "86 Proof", "corrected_value": "90 Proof",
     }], tmp_path)
 
-    assert rc == 0
+    assert rc == 1
+    assert "schema_version None; this version reads only 2" in caplog.text
+    assert sorted(p.name for p in _bottle_dirs(out)) == before
+
+
+def test_feedback_correction_reaches_the_facts_and_updates_the_batch(photos, tmp_path):
+    """A corrections file becomes user facts; the batch JSON keeps the change for the next round."""
+    out = tmp_path / "out"
+    batch_json, ids = _single_batch_run(photos, out)
+    evan = ids["Evan Williams Black Label"]
+
+    assert _feedback(out, batch_json, [{
+        "bottle_id": evan, "field_name": "proof", "original_value": "86 Proof", "corrected_value": "90 Proof",
+    }], tmp_path) == 0
+
     resaved = json.loads((out / "evan_williams_black_label_2" / "evan_williams_black_label_2.json").read_text())
-    assert resaved["proof"] == "90 Proof"
-    assert resaved["msrp"] is None
+    proof = resaved["facts"]["fields"]["proof"]
+    assert (proof["status"], proof["value"]) == ("user", 90.0)
+    assert any(s["ref"].startswith("feedback:") for s in resaved["facts"]["sources"] if s["kind"] == "user")
+    batch = json.loads(batch_json.read_text())
+    assert batch["bottles"][0]["proof"] == "90 Proof"
+    # A second round starts from the corrected value.
+    assert _feedback(out, batch_json, [{
+        "bottle_id": evan, "field_name": "proof", "original_value": "90 Proof", "corrected_value": "91 Proof",
+    }], tmp_path) == 0
 
 
-def test_legacy_label_price_upgrade_keeps_a_human_msrp():
-    legacy = {"bottle_id": "A", "msrp": "24.99"}
-    corrected = {
-        "bottle_id": "B", "msrp": "59.99",
-        "corrections": [{"field_name": "msrp", "original_value": "", "corrected_value": "59.99"}],
-    }
-    current = {"bottle_id": "C", "msrp": None, "label_price": "19.99"}
-    commands._upgrade_legacy_label_price([legacy, corrected, current])
-    assert (legacy["msrp"], legacy["label_price"]) == (None, "24.99")
-    assert (corrected["msrp"], corrected["label_price"]) == ("59.99", None)
-    assert (current["msrp"], current["label_price"]) == (None, "19.99")
+def test_feedback_approve_records_approval_and_resaves(photos, tmp_path):
+    out = tmp_path / "out"
+    batch_json, ids = _single_batch_run(photos, out)
+    weller = ids["Weller Special Reserve"]
+    batch_id = batch_json.name[len("batch_"):-len(".json")]
+
+    rc = commands.feedback_command(commands.parse_args(["feedback", "-o", str(out), "--batch", batch_id,
+                                                        "--approve", weller]))
+
+    assert rc == 0
+    resaved = json.loads((out / "weller_special_reserve_2" / "weller_special_reserve_2.json").read_text())
+    review = resaved["facts"]["review"]
+    assert review["approved"] is True and review["by"] == "feedback" and review["at"]
+    assert "not approved by a reviewer" not in resaved["facts"]["publish"]["blockers"]
+    assert not (out / "evan_williams_black_label_2").exists()  # only the approved bottle is resaved
+    assert json.loads(batch_json.read_text())["bottles"][1]["facts"]["review"]["approved"] is True
+
+
+def test_feedback_approve_unknown_bottle_exits_1(photos, tmp_path):
+    out = tmp_path / "out"
+    batch_json, _ = _single_batch_run(photos, out)
+    batch_id = batch_json.name[len("batch_"):-len(".json")]
+    before = sorted(p.name for p in _bottle_dirs(out))
+
+    rc = commands.feedback_command(commands.parse_args(["feedback", "-o", str(out), "--batch", batch_id,
+                                                        "--approve", "IMG_9999"]))
+
+    assert rc == 1
+    assert sorted(p.name for p in _bottle_dirs(out)) == before
 
 
 def test_feedback_skips_bottles_rejected_in_the_batch(photos, tmp_path):
@@ -603,8 +688,8 @@ def test_interactive_edit_lands_on_the_reviewed_bottle(photos, tmp_path):
 
     rc, _ = _run(
         ["process", "-f", str(photos), "-o", str(out), "-b", "all", "--interactive"],
-        # Bottle 1: accept. Bottle 2: edit distillery only (name, distillery, msrp, proof, age, release).
-        user_input=["A", "E", "", "Edited Distillery", "", "", "", ""],
+        # Bottle 1: approve. Bottle 2: edit the distillery, then keep it without approval.
+        user_input=["A", "E", "distillery", "Edited Distillery", "", "N"],
     )
 
     assert rc == 0
@@ -614,11 +699,17 @@ def test_interactive_edit_lands_on_the_reviewed_bottle(photos, tmp_path):
     edited = [b for b in saved if b["distillery"] == "Edited Distillery"]
     untouched = [b for b in saved if b["distillery"] != "Edited Distillery"]
     assert len(edited) == 1 and len(untouched) == 1
-    assert "corrections" not in untouched[0]
+    assert untouched[0]["corrections"] == []
     (correction,) = edited[0]["corrections"]
     assert correction["source"] == "interactive"
     assert correction["field_name"] == "distillery"
     assert Path(edited[0]["source_images"][0]).stem in correction["bottle_id"]
+    # The edit is a user fact; the approval belongs to the other bottle only.
+    distillery = edited[0]["facts"]["fields"]["distillery"]
+    assert (distillery["status"], distillery["value"]) == ("user", "Edited Distillery")
+    assert edited[0]["facts"]["review"]["approved"] is False
+    assert untouched[0]["facts"]["review"]["approved"] is True
+    assert untouched[0]["facts"]["review"]["by"] == "interactive"
 
 
 
@@ -655,9 +746,10 @@ def test_concurrency_3_matches_concurrency_1_in_process(photos, stagg_photos, tm
     for concurrency in (1, 3):
         out = tmp_path / f"out{concurrency}"
         settings = make_settings(image_folder=photos, output_dir=out, concurrency=concurrency, batch_size=5)
-        manager = MagicMock()
+        manager = _fake_manager()
         with patch.object(commands, "pre_flight_checks", return_value=0), \
                 patch.object(commands, "build_server_manager", return_value=manager), \
+                patch.object(commands, "_build_researcher", lambda settings, client: _NoResultsResearcher()), \
                 patch("image_processor.text_extractor.TextExtractor.extract_with_retry",
                       lambda self, p, **k: f"OCR {Path(p).name}"), \
                 patch("image_processor.bottle_analyzer.BottleAnalyzer.analyze_with_vision_model", vision):

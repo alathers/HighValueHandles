@@ -26,8 +26,10 @@ from typing import Any
 from image_processor.batch_processor import BatchProcessor, BottleLogFilter, describe_error
 from image_processor.bottle_analyzer import BottleAnalyzer
 from image_processor.corrections import CORRECTABLE_FIELDS, apply_corrections
+from image_processor.enrichment import Enricher, approve_facts, refresh_facts
+from image_processor.fact_checker import FactChecker
 from image_processor.image_organizer import OUTPUT_MARKER, ImageOrganizer
-from image_processor.preview_generator import PreviewGenerator
+from image_processor.preview_generator import OUTPUT_SCHEMA_VERSION, PreviewGenerator
 from lib.constants import DEFAULT_VISION_MODEL
 from lib.exceptions import FATAL_MODEL_ERRORS, ModelServerError, VisionAnalysisError
 from lib.hints import HintBook, apply_hint_overrides
@@ -38,7 +40,7 @@ from lib.model_availability import (
     memory_verdict,
     total_memory_bytes,
 )
-from lib.model_selector import ModelSelector, active_stages
+from lib.model_selector import ModelSelector, ModelStage, active_stages
 from lib.model_server import ModelServerManager
 from lib.settings import (
     THINK_LEVELS,
@@ -52,6 +54,7 @@ from lib.settings import (
     settings_to_dict,
 )
 from models.bottle import Correction
+from models.facts import FactSheet
 from models.image import group_bottle_id
 
 logger = logging.getLogger(__name__)
@@ -475,6 +478,131 @@ def _text_model_memory_check(manager: ModelServerManager, text_model: str) -> in
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Enrichment (web research + fact check)
+# ---------------------------------------------------------------------------
+
+
+def _web_skip_reason(settings: Settings) -> str:
+    """Why this run has no web researcher (recorded in every bottle's web research)."""
+    if not settings.web.enabled:
+        return "web lookups disabled (--no-web or web.enabled = false)"
+    return settings.web.provider_reason or "no web search provider configured"
+
+
+def _build_researcher(settings: Settings, client: Any) -> Any:  # noqa: ANN401
+    """The run's web researcher, or None when web lookups are off or no provider resolves.
+
+    One fetcher and one cache per run, so the per-host rate limits and the
+    request budget are shared by every bottle. API keys are read from the
+    environment by the provider and never logged.
+    """
+    web = settings.web
+    if not web.enabled or (web.provider_resolved or "none") == "none":
+        return None
+    import requests
+
+    from image_processor.vendor_image import make_vision_verifier
+    from image_processor.web_research import WebOptions, WebResearcher
+    from lib.search_providers import build_provider
+    from lib.web_cache import WebCache, default_cache_dir
+    from lib.web_fetch import HttpFetcher
+
+    cache = WebCache(Path(web.cache_dir) if web.cache_dir else default_cache_dir(os.environ), refresh=web.refresh)
+    provider = build_provider(
+        web.provider_resolved,
+        os.environ,
+        requests.Session(),
+        searxng_url=web.searxng_url or "",
+        cache=cache,
+        cache_ttl_hours=web.search_cache_ttl_hours,
+    )
+    if provider is None:
+        return None
+    fetcher = HttpFetcher(
+        session=requests.Session(),
+        cache=cache,
+        timeout=(5, web.fetch_timeout_seconds),
+        max_page_bytes=web.max_page_bytes,
+        max_image_bytes=web.max_image_bytes,
+        per_host_interval=web.per_host_interval_seconds,
+        max_requests=web.max_requests_per_run,
+        refresh=web.refresh,
+        cache_ttl_hours=web.cache_ttl_hours,
+    )
+    options = WebOptions(
+        max_queries=web.max_queries,
+        max_results=web.max_results,
+        max_pages=web.max_pages,
+        max_llm_pages=web.max_llm_pages,
+        deny_domains=tuple(web.deny_domains),
+        allow_domains=tuple(web.allow_domains),
+        vendor_images=web.vendor_images,
+    )
+    verifier = (
+        make_vision_verifier(client, settings.model.vision_model, read_timeout=settings.server.request_timeout)
+        if web.vendor_images
+        else None
+    )
+    return WebResearcher(
+        provider=provider,
+        fetcher=fetcher,
+        options=options,
+        provider_reason=web.provider_reason,
+        vendor_verifier=verifier,
+    )
+
+
+def _build_fact_checker(settings: Settings, client: Any, selector: Any) -> FactChecker:  # noqa: ANN401
+    """The run's fact checker (deterministic, label/OCR/user facts only, when the text stage is off)."""
+    text = settings.text
+
+    def record(model: str, duration: float, success: bool, think: str | None) -> None:
+        if selector is not None and hasattr(selector, "record_usage"):
+            selector.record_usage(
+                ModelStage.METADATA_GENERATION, model, success=success, duration=duration, think=think
+            )
+
+    return FactChecker(
+        client if text.active else None,
+        model=text.model,
+        think_extract=text.think_extract,
+        think_compose=text.think_compose,
+        num_ctx=text.num_ctx,
+        timeout_s=text.timeout_seconds,
+        max_attempts=min(2, settings.retry.policy().max_attempts),
+        keep_alive="30m" if settings.model.keep_models_loaded else "10m",
+        usage_recorder=record,
+    )
+
+
+def build_enricher(ctx: RunContext, client: Any) -> Enricher:  # noqa: ANN401
+    """The enrichment phase for this run (web research, unloads, fact check).
+
+    A researcher that cannot be built is logged and the run continues with
+    web research ``skipped`` (web lookups never fail a run).
+    """
+    settings = ctx.settings
+    skip_reason = _web_skip_reason(settings)
+    try:
+        researcher = _build_researcher(settings, client)
+    except Exception as e:
+        logger.error("Web lookups are off for this run: the researcher could not be built: %s", e)
+        researcher, skip_reason = None, f"web researcher could not be built: {type(e).__name__}"
+    manager = ctx.server_manager
+    return Enricher(
+        researcher=researcher,
+        fact_checker=_build_fact_checker(settings, client, ctx.model_selector),
+        server_manager=manager,
+        vision_model=settings.model.vision_model,
+        text_model=settings.text.model if settings.text.active else None,
+        keep_models_loaded=settings.model.keep_models_loaded,
+        workers=settings.concurrency,
+        unload=getattr(manager, "unload_model", None),
+        web_skip_reason=skip_reason,
+    )
+
+
 def _same_directory(a: Any, b: Any) -> bool:  # noqa: ANN401
     """True if both paths name the same directory (False if unresolvable).
 
@@ -868,7 +996,8 @@ def _run_pipeline(ctx: RunContext) -> int:
             executor=executor,
             hints=ctx.hints,
         )
-        exit_code = _process_batches(ctx, image_groups, bottle_analyzer, batch_processor)
+        enricher = build_enricher(ctx, client)
+        exit_code = _process_batches(ctx, image_groups, bottle_analyzer, batch_processor, enricher)
     except BaseException:
         if batch_processor is not None:
             batch_processor.cancel.set()
@@ -887,8 +1016,9 @@ def _process_batches(
     image_groups: list,
     bottle_analyzer: BottleAnalyzer,
     batch_processor: BatchProcessor,
+    enricher: Enricher | None = None,
 ) -> int:
-    """Run every batch: analysis, hint overrides, review, previews, saving and reports."""
+    """Run every batch: analysis, quantity, hint overrides, enrichment, review, previews, saving."""
     settings = ctx.settings
     preview_generator = PreviewGenerator(output_dir=settings.output_dir, mark_output_dir=ctx.mark_output_dir)
     totals = _RunTotals()
@@ -924,53 +1054,35 @@ def _process_batches(
         # Hint field values: sourced human corrections, before review and saving.
         for bottle_dict, metadata in zip(batch_result.bottle_dicts, batch_result.metadata_list, strict=True):
             seen_ids.add(PreviewGenerator.bottle_id_for(bottle_dict, metadata))
+            bottle_dict["run_id"] = ctx.run_id
         apply_hint_overrides(
             batch_result.bottle_dicts, batch_result.metadata_list, ctx.hints, settings.hints_file
         )
 
-        # Interactive mode: prompt user for corrections
+        # Web research and fact check (never fails a bottle).
+        if enricher is not None and batch_result.bottle_dicts:
+            try:
+                enricher.enrich_batch(batch_result.bottle_dicts, batch_result.metadata_list, run_id=ctx.run_id)
+            except Exception:
+                logger.exception("Enrichment failed for batch %s; bottles are saved without facts", batch_idx)
+
+        # Interactive mode: corrections, conflicts, approvals
         rejected: set[str] = set()
         if settings.interactive:
-            try:
-                correction_dicts, rejected_bottles_from_prompt = preview_generator.interactive_prompt(
-                    batch_result.bottle_dicts,
-                    batch_result.metadata_list,
-                )
+            rejected = _interactive_review(preview_generator, batch_result)
 
-                if correction_dicts:
-                    corrections = _corrections_from_prompt(correction_dicts)
-                    _, unapplied = apply_corrections(
-                        batch_result.bottle_dicts, batch_result.metadata_list, corrections
-                    )
-                    _log_unapplied(unapplied)
-                    logger.info(
-                        "Applied %d of %d corrections from interactive feedback",
-                        len(corrections) - len(unapplied), len(corrections),
-                    )
-
-                # Rejected bottles are not saved and count as failed
-                rejected = set(rejected_bottles_from_prompt)
-                batch_result.failed_bottles.extend(rejected_bottles_from_prompt)
-                if rejected_bottles_from_prompt:
-                    logger.info("Rejected %d bottles from interactive feedback", len(rejected_bottles_from_prompt))
-
-            except Exception:
-                logger.exception("Interactive correction failed")
-
-        # Batch preview report and JSON, after review so they hold the
-        # corrected values and every rejected bottle (skipped when processing
-        # all in a single batch).
-        if str(settings.batch_size).lower() != "all":
-            try:
-                preview_path = preview_generator.save_batch_preview(
-                    batch_result.bottle_dicts,
-                    batch_result.metadata_list,
-                    batch_id=f"{ctx.run_id}_{batch_idx:03d}",
-                    rejected_bottles=list(batch_result.failed_bottles),
-                )
-                logger.info("Saved batch preview report to %s", preview_path)
-            except Exception:
-                logger.exception("Failed to generate batch preview report")
+        # Batch preview report and JSON (feedback reads the JSON), after
+        # review so they hold the corrected values and every rejected bottle.
+        try:
+            preview_path = preview_generator.save_batch_preview(
+                batch_result.bottle_dicts,
+                batch_result.metadata_list,
+                batch_id=f"{ctx.run_id}_{batch_idx:03d}",
+                rejected_bottles=list(batch_result.failed_bottles),
+            )
+            logger.info("Saved batch preview report to %s", preview_path)
+        except Exception:
+            logger.exception("Failed to generate batch preview report")
 
         _save_batch_bottles(batch_result, rejected, preview_generator, bottle_analyzer, totals)
         _report_failed_bottles(batch_result, batch, rejected, preview_generator, totals)
@@ -988,6 +1100,7 @@ def _process_batches(
     logger.info("Processed successfully: %s", totals.processed)
     logger.info("Failed: %s", totals.failed)
     logger.info("Error reports generated: %s", len(totals.error_reports))
+    _log_enrichment_summary(settings, enricher, totals)
     logger.info("%s", batch_processor.split_summary())
     nudge = batch_processor.group_size_nudge()
     if nudge:
@@ -1007,6 +1120,130 @@ def _process_batches(
     return 1
 
 
+def _interactive_review(preview_generator: PreviewGenerator, batch_result: Any) -> set[str]:  # noqa: ANN401
+    """Interactive review of a batch: apply edits and conflict choices, re-reconcile, record approvals.
+
+    Returns the rejected bottle IDs (also added to the batch's failed
+    bottles). If the review itself fails (e.g. end of input), nothing from
+    it is applied: no bottle is approved.
+    """
+    try:
+        correction_dicts, rejected_ids, approvals = preview_generator.interactive_prompt(
+            batch_result.bottle_dicts, batch_result.metadata_list
+        )
+    except Exception:
+        logger.exception("Interactive review failed; bottles are kept without approval")
+        return set()
+
+    if correction_dicts:
+        _apply_review_corrections(
+            batch_result.bottle_dicts, batch_result.metadata_list, _corrections_from_prompt(correction_dicts),
+            "interactive feedback",
+        )
+    _apply_approvals(batch_result.bottle_dicts, batch_result.metadata_list, approvals, "interactive")
+
+    rejected = set(rejected_ids)
+    batch_result.failed_bottles.extend(rejected_ids)
+    if rejected_ids:
+        logger.info("Rejected %d bottles from interactive feedback", len(rejected_ids))
+    return rejected
+
+
+def _apply_review_corrections(
+    bottle_dicts: list[dict], metadata_list: list, corrections: list[Correction], what: str
+) -> tuple[list[tuple[Correction, str]], set[int]]:
+    """Apply corrections by bottle ID, then fold them into each touched bottle's facts.
+
+    Returns:
+        ``(unapplied, touched)``: corrections not applied (logged, with
+        reasons) and the indexes of bottles that received a correction.
+    """
+    before = _correction_counts(bottle_dicts)
+    _, unapplied = apply_corrections(bottle_dicts, metadata_list, corrections)
+    _log_unapplied(unapplied)
+    logger.info("Applied %d of %d corrections from %s", len(corrections) - len(unapplied), len(corrections), what)
+    touched = {
+        i for i, d in enumerate(bottle_dicts)
+        if isinstance(d, dict) and len(d.get("corrections") or []) > (before[i] if i < len(before) else 0)
+    }
+    for index in sorted(touched):
+        try:
+            refresh_facts(bottle_dicts[index])
+        except Exception:
+            logger.exception("Could not re-reconcile the facts of bottle %s", bottle_dicts[index].get("bottle_id", "?"))
+    return unapplied, touched
+
+
+def _apply_approvals(
+    bottle_dicts: list[dict], metadata_list: list, approvals: Any, by: str  # noqa: ANN401
+) -> tuple[set[int], list[str]]:
+    """Record reviewer approvals in the bottles' facts (gate recomputed).
+
+    Returns:
+        ``(approved, problems)``: indexes of approved bottles, and one message
+        per approval that could not be recorded (unknown ID, no facts).
+    """
+    index_by_id: dict[str, int] = {}
+    duplicate_ids: set[str] = set()
+    for i, d in enumerate(bottle_dicts):
+        key = PreviewGenerator.bottle_id_for(d, metadata_list[i] if i < len(metadata_list) else None)
+        if key in index_by_id:
+            duplicate_ids.add(key)
+        index_by_id[key] = i
+    approved: set[int] = set()
+    problems: list[str] = []
+    for bottle_id in approvals or []:
+        if str(bottle_id) in duplicate_ids:
+            # Same rule as apply_corrections: an ambiguous ID approves nothing.
+            problems.append(f"bottle ID {bottle_id} is not unique in this batch")
+            continue
+        index = index_by_id.get(str(bottle_id))
+        if index is None:
+            problems.append(f"no bottle with ID {bottle_id}")
+            continue
+        raw = bottle_dicts[index].get("facts")
+        if not raw:
+            problems.append(f"bottle {bottle_id} has no fact sheet to approve")
+            continue
+        try:
+            sheet = approve_facts(FactSheet.from_dict(raw), by)
+        except Exception as e:
+            problems.append(f"bottle {bottle_id}: fact sheet could not be read ({e})")
+            continue
+        bottle_dicts[index]["facts"] = sheet.to_dict()
+        approved.add(index)
+        state = "publish-ready" if sheet.publish.get("ready") else (
+            "still blocked: " + "; ".join(sheet.publish.get("blockers") or [])
+        )
+        logger.info("Bottle %s approved by %s (%s)", bottle_id, by, state)
+    for problem in problems:
+        logger.error("Approval not recorded: %s", problem)
+    return approved, problems
+
+
+def _log_enrichment_summary(settings: Settings, enricher: Enricher | None, totals: "_RunTotals") -> None:
+    """Run summary lines: provider, web and verification status counts, publish-ready count."""
+    if enricher is not None and enricher.provider_name:
+        provider = enricher.provider_name
+    elif not settings.web.enabled:
+        provider = "none (web lookups off)"
+    else:
+        provider = f"none ({_web_skip_reason(settings)})"
+    logger.info("Web search provider: %s", provider)
+
+    def counts(c: dict[str, int]) -> str:
+        return ", ".join(f"{k}={v}" for k, v in sorted(c.items())) or "none"
+
+    logger.info("Web research: %s", counts(totals.web_status))
+    logger.info("Fact check (%s): %s", settings.text.model if settings.text.active else "off", counts(totals.verification))
+    logger.info(
+        "Publish-ready: %d of %d saved bottle(s)%s",
+        totals.ready, totals.processed,
+        "" if totals.ready == totals.processed else
+        " (each needs a person's approval: --interactive [A]ccept or feedback --approve <bottle_id>)",
+    )
+
+
 @dataclass
 class _RunTotals:
     """Outcome counters and written paths for one ``process`` run."""
@@ -1015,6 +1252,20 @@ class _RunTotals:
     failed: int = 0
     saved_folders: list[Path] = dataclass_field(default_factory=list)
     error_reports: list[Path] = dataclass_field(default_factory=list)
+    web_status: dict[str, int] = dataclass_field(default_factory=dict)
+    verification: dict[str, int] = dataclass_field(default_factory=dict)
+    ready: int = 0
+
+    def count_bottle(self, bottle: Any) -> None:  # noqa: ANN401
+        """Count a saved bottle's web, verification and publish status."""
+        web = getattr(bottle, "web_research", None)
+        key = web.status if web is not None else "not run"
+        self.web_status[key] = self.web_status.get(key, 0) + 1
+        facts = getattr(bottle, "facts", None)
+        key = facts.verification.status if facts is not None else "not run"
+        self.verification[key] = self.verification.get(key, 0) + 1
+        if facts is not None and facts.publish.get("ready"):
+            self.ready += 1
 
 
 def _assign_bottle_ids(groups: list) -> None:
@@ -1075,7 +1326,7 @@ def _save_batch_bottles(
     """
     from models.bottle import Bottle
 
-    for bottle_dict, metadata in zip(batch_result.bottle_dicts, batch_result.metadata_list):
+    for bottle_dict, metadata in zip(batch_result.bottle_dicts, batch_result.metadata_list, strict=False):
         bottle_id = PreviewGenerator.bottle_id_for(bottle_dict, metadata)
         images = list(bottle_dict.get("images") or metadata.source_images)
         if bottle_id in rejected:
@@ -1105,6 +1356,7 @@ def _save_batch_bottles(
             logger.info("✓ Successfully processed: %s → %s", bottle.name, folder)
             totals.saved_folders.append(folder)
             totals.processed += 1
+            totals.count_bottle(bottle)
         except Exception as exc:
             totals.failed += 1
             logger.exception(
@@ -1187,52 +1439,63 @@ def _correction_counts(bottle_dicts: list[dict]) -> list[int]:
     return [len(d.get("corrections") or []) if isinstance(d, dict) else 0 for d in bottle_dicts]
 
 
-def _resave_corrected_bottles(
+def _resave_bottles(
     preview_generator: PreviewGenerator,
     bottle_dicts: list[dict],
     metadata_list: list,
-    counts_before: list[int],
+    indexes: set[int],
     rejected: set[str],
 ) -> tuple[int, list[str]]:
-    """Save each bottle that just received a correction as a new output folder.
+    """Save each listed bottle (corrected or approved) as a new output folder.
 
-    ``apply_corrections`` appends to a bottle's
-    ``corrections`` list, so a bottle is resaved only if that list grew.
-    Bottles listed as rejected (in the batch JSON or during this review) and
-    bottles no correction touched are left alone; existing folders are never
-    overwritten (``save_bottle_files`` picks a new ``_N`` name).
+    Bottles listed as rejected (in the batch JSON or during this review) are
+    left alone; existing folders are never overwritten
+    (``save_bottle_files`` picks a new ``_N`` name).
 
     Returns:
         ``(resaved, failed)``: the number of bottles resaved, and the IDs of
-        corrected bottles whose new folder could not be written (so the
-        caller can report that the correction reached no output).
+        bottles whose new folder could not be written (so the caller can
+        report that the change reached no output).
     """
     from models.bottle import Bottle
 
     resaved = 0
     failed: list[str] = []
-    for index, bottle_dict in enumerate(bottle_dicts):
-        # A batch JSON without (enough) metadata still gets its corrected bottles saved.
+    for index in sorted(indexes):
+        bottle_dict = bottle_dicts[index]
+        # A batch JSON without (enough) metadata still gets its bottles saved.
         metadata = metadata_list[index] if index < len(metadata_list) else None
         bottle_id = PreviewGenerator.bottle_id_for(bottle_dict, metadata)
-        recorded = bottle_dict.get("corrections") or []
-        before = counts_before[index] if index < len(counts_before) else 0
-        if len(recorded) <= before:
-            continue
         if bottle_id in rejected:
-            logger.warning(
-                "Bottle %s is rejected, so its correction(s) were not saved to any output", bottle_id
-            )
+            logger.warning("Bottle %s is rejected, so its changes were not saved to any output", bottle_id)
             continue
         try:
-            bottle = Bottle.from_analysis(bottle_dict, metadata, corrections=recorded)
-            output_folder = preview_generator.save_bottle_files(bottle, metadata)
-            logger.info("Resaved bottle %s to %s", bottle_id, output_folder)
+            bottle = Bottle.from_analysis(
+                bottle_dict, metadata, quantity=bottle_dict.get("quantity"),
+                corrections=bottle_dict.get("corrections") or [],
+            )
+            output_folder = preview_generator.save_bottle_files(
+                bottle, metadata, model_used=bottle_dict.get("model_used"), confidence=bottle_dict.get("confidence"),
+            )
+            logger.info(
+                "Resaved bottle %s to %s (%s)", bottle_id, output_folder,
+                "publish-ready" if bottle.publish_ready else "not publish-ready",
+            )
             resaved += 1
         except Exception:
             logger.exception("Failed to resave bottle %s", bottle_id)
             failed.append(bottle_id)
     return resaved, failed
+
+
+def _write_json_atomically(path: Path, data: Any) -> None:  # noqa: ANN401
+    """Replace ``path`` with ``data`` as JSON (temp file in the same folder, then rename)."""
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _corrections_from_prompt(correction_dicts: list[dict]) -> list[Correction]:
@@ -1298,58 +1561,42 @@ def _load_corrections_file(path: Path) -> list[Correction]:
     return corrections
 
 
-def _upgrade_legacy_label_price(bottle_dicts: list[dict]) -> None:
-    """Move a pre-``label_price`` batch's photo price out of ``msrp`` (in place).
-
-    Batches written before the rename stored the price read from the photos
-    as ``msrp``. That is a shop price, never an MSRP, so a resaved bottle must
-    not publish it as one: it becomes ``label_price`` and ``msrp`` becomes
-    unknown. An ``msrp`` a person set (a recorded correction of ``msrp``) is
-    kept.
-    """
-    for bottle_dict in bottle_dicts:
-        if not isinstance(bottle_dict, dict) or "label_price" in bottle_dict:
-            continue
-        human_msrp = any(
-            isinstance(c, dict) and c.get("field_name") == "msrp" for c in bottle_dict.get("corrections") or []
+def _schema_problem(data: Any, what: str) -> str | None:  # noqa: ANN401
+    """Why ``data`` (a batch JSON or error report) cannot be read by this version, or None."""
+    if not isinstance(data, dict):
+        return f"{what} is not a JSON object"
+    version = data.get("schema_version")
+    if version != OUTPUT_SCHEMA_VERSION:
+        return (
+            f"{what} has schema_version {version!r}; this version reads only {OUTPUT_SCHEMA_VERSION}. "
+            "It was written by an older bourbon-process (no facts, no bottle IDs on corrections); "
+            "re-run `bourbon-process process` on the photos"
         )
-        if human_msrp:
-            bottle_dict["label_price"] = None
-            continue
-        price = bottle_dict.get("msrp")
-        bottle_dict["label_price"] = price
-        bottle_dict["msrp"] = None
-        if price not in (None, ""):
-            logger.warning(
-                "Bottle %s: older batch file stored the photo price %s as msrp; it is kept as "
-                "label_price and the MSRP is unknown",
-                bottle_dict.get("bottle_id", "?"), price,
-            )
+    return None
 
 
 def feedback_command(target: "Settings | RunContext | argparse.Namespace") -> int:
-    """Apply feedback and corrections to a processed batch.
+    """Apply corrections and approvals to a processed batch.
 
     Uses ``settings.output_dir``, ``batch``, ``corrections``, ``interactive``
     and ``approve``; no model, server or web setting. Corrections (from
     ``--corrections`` or interactive review) are applied by bottle ID only
-    (:func:`image_processor.corrections.apply_corrections`); every correction
-    that could not be applied is logged with its reason.
+    (:func:`image_processor.corrections.apply_corrections`) and become user
+    facts: each touched bottle's facts are re-reconciled without any model
+    call (a description citing a changed field is marked stale). ``--approve
+    ID`` records a reviewer approval (``by='feedback'``) and recomputes the
+    publish gate. Every changed bottle is saved again in a new folder, and
+    the batch JSON is updated so a later feedback round starts from the
+    corrected values. Only schema-version-2 batch files are accepted.
 
     Returns:
-        Exit code: 0 (success), 1 (general error, or a correction was not
-        applied), 2 (batch not found).
+        Exit code: 0 (success), 1 (general error, an older batch file, or a
+        correction or approval that was not applied), 2 (batch not found).
     """
     from models.bottle import ExtractedMetadata
 
     settings = _as_context(target).settings
     output_dir = Path(settings.output_dir)
-
-    if settings.approve:
-        # Recorded only; the fact-check stage applies approvals.
-        logger.info(
-            "--approve is applied by the fact-check stage (requested for: %s)", ", ".join(settings.approve)
-        )
 
     # Determine batch to load
     if settings.batch:
@@ -1376,6 +1623,14 @@ def feedback_command(target: "Settings | RunContext | argparse.Namespace") -> in
         return 2
     try:
         batch_data = json.loads(batch_json_file.read_text(encoding="utf-8"))
+    except Exception:
+        logger.exception("Failed to load batch JSON file %s", batch_json_file)
+        return 1
+    problem = _schema_problem(batch_data, f"Batch file {batch_json_file}")
+    if problem:
+        logger.error("%s", problem)
+        return 1
+    try:
         bottle_dicts: list[dict] = list(batch_data.get("bottles") or [])
         previously_rejected = {str(r) for r in batch_data.get("rejected") or []}
         metadata_list = [ExtractedMetadata.from_dict(m) for m in batch_data.get("metadata") or []]
@@ -1383,10 +1638,10 @@ def feedback_command(target: "Settings | RunContext | argparse.Namespace") -> in
         logger.exception("Failed to load batch JSON file %s", batch_json_file)
         return 1
     logger.info("Loaded %d bottles from batch JSON", len(bottle_dicts))
-    _upgrade_legacy_label_price(bottle_dicts)
 
     corrections: list[Correction] = []
     rejected = set(previously_rejected)
+    interactive_approvals: list[str] = []
     if settings.corrections:
         corrections_file = Path(settings.corrections)
         if not corrections_file.exists():
@@ -1400,7 +1655,7 @@ def feedback_command(target: "Settings | RunContext | argparse.Namespace") -> in
         logger.info("Loaded %d corrections from %s", len(corrections), corrections_file)
     elif settings.interactive:
         try:
-            correction_dicts, rejected_bottles = PreviewGenerator(
+            correction_dicts, rejected_bottles, interactive_approvals = PreviewGenerator(
                 output_dir=output_dir
             ).interactive_prompt(bottle_dicts, metadata_list)
         except Exception:
@@ -1409,30 +1664,46 @@ def feedback_command(target: "Settings | RunContext | argparse.Namespace") -> in
         corrections = _corrections_from_prompt(correction_dicts)
         rejected |= {str(r) for r in rejected_bottles or []}
 
-    if not corrections:
-        logger.info("No corrections applied")
+    if not corrections and not settings.approve and not interactive_approvals:
+        logger.info("No corrections or approvals given")
         return 0
 
-    before = _correction_counts(bottle_dicts)
-    _, unapplied = apply_corrections(bottle_dicts, metadata_list, corrections)
-    _log_unapplied(unapplied)
-    logger.info("Applied %d of %d corrections", len(corrections) - len(unapplied), len(corrections))
+    changed: set[int] = set()
+    unapplied: list[tuple[Correction, str]] = []
+    if corrections:
+        unapplied, changed = _apply_review_corrections(bottle_dicts, metadata_list, corrections, "feedback")
 
-    _, failed = _resave_corrected_bottles(
-        PreviewGenerator(output_dir=output_dir),
-        bottle_dicts,
-        metadata_list,
-        before,
-        rejected,
-    )
+    approved_interactive, problems_i = _apply_approvals(bottle_dicts, metadata_list, interactive_approvals, "interactive")
+    approved_cli, problems = _apply_approvals(bottle_dicts, metadata_list, settings.approve, "feedback")
+    changed |= approved_interactive | approved_cli
+    problems += problems_i
+    for index in sorted(approved_interactive | approved_cli):
+        metadata = metadata_list[index] if index < len(metadata_list) else None
+        bottle_id = PreviewGenerator.bottle_id_for(bottle_dicts[index], metadata)
+        if bottle_id in rejected:
+            problems.append(f"bottle {bottle_id} is rejected; its approval reaches no output")
+
+    _, failed = _resave_bottles(PreviewGenerator(output_dir=output_dir), bottle_dicts, metadata_list, changed, rejected)
+    if changed:
+        batch_data["bottles"] = bottle_dicts
+        batch_data["rejected"] = sorted(rejected)
+        batch_data["updated_at"] = datetime.now().astimezone().isoformat()
+        try:
+            _write_json_atomically(batch_json_file, batch_data)
+            logger.info("Updated %s with the applied changes", batch_json_file)
+        except OSError:
+            logger.exception("Could not update the batch file %s", batch_json_file)
+            failed.append(batch_json_file.name)
     if unapplied:
         logger.error("%d correction(s) were not applied (see above)", len(unapplied))
+    if problems:
+        logger.error("%d approval(s) were not recorded (see above)", len(problems))
     if failed:
         logger.error(
-            "Corrected bottle(s) could not be saved, so their corrections reached no output: %s",
+            "Changed bottle(s) could not be saved, so their changes reached no output: %s",
             ", ".join(failed),
         )
-    if unapplied or failed:
+    if unapplied or failed or problems:
         return 1
     logger.info("Feedback processing complete")
     return 0
@@ -1467,6 +1738,10 @@ def retry_command(target: "Settings | RunContext | argparse.Namespace") -> int:
         return 1
 
     logger.info("Loading error report: %s", report_path)
+    problem = _schema_problem(error_report, f"Error report {report_path}")
+    if problem:
+        logger.error("%s", problem)
+        return 1
 
     # Validate error report structure
     required_fields = ["bottle_id", "images", "error_message"]
@@ -1556,7 +1831,8 @@ def _retry_bottle(
 
     The bottle goes through the same steps as in ``process``: OCR and the
     vision request under the retry policy (with the hint note), then the
-    hint field values, then the report's ``suggested_fix``.
+    hint field values, then the report's ``suggested_fix``, then the
+    enrichment phase (web research and fact check), then saving.
 
     Returns:
         Exit code: 0 (success) or 1 (failure).
@@ -1609,6 +1885,15 @@ def _retry_bottle(
                 logger.error("Not saving bottle %s: its suggested_fix could not be applied", bottle_id)
                 return 1
             logger.info("Applied %d corrections from suggested_fix", len(corrections))
+
+        try:
+            enricher = build_enricher(ctx, client)
+            enricher.enrich_batch(
+                [bottle_dict], [metadata],
+                run_id=ctx.run_id or "retry_" + datetime.now().astimezone().strftime("%Y%m%d_%H%M%S"),
+            )
+        except Exception:
+            logger.exception("Enrichment failed for bottle %s; it is saved without facts", bottle_id)
 
         bottle = Bottle.from_analysis(
             bottle_dict,

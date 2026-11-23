@@ -33,8 +33,46 @@ from lib.model_availability import GiB
 from lib.model_server import OllamaServer
 from lib.settings import SettingsError, resolve_settings
 from tests.helpers import make_settings
+from tests.unit.test_enrichment import (
+    COMPOSE_REPLY,
+    EXTRACT_REPLY,
+    LABEL,
+    FakeTextLLM,
+    web_research,
+)
 
 logger = logging.getLogger(__name__)
+
+
+class _GenericText:
+    """Text model stand-in for runs that are not about the fact check: finds nothing."""
+
+    def chat_text(self, prompt, model=None, *, format=None, **_kwargs):
+        from lib.ollama_client import ChatResult
+
+        props = (format or {}).get("properties", {})
+        body = {"page_match": [], "claims": [], "prices": []} if "claims" in props else {"sentences": []}
+        return ChatResult(content=json.dumps(body), done_reason="stop", model=model or "")
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_enrichment(monkeypatch):
+    """No web researcher (default DuckDuckGo would be real network) and a fake text model.
+
+    Tests about the enrichment wiring patch these again with scripted fakes.
+    """
+    import cli.commands as commands
+
+    monkeypatch.setattr(commands, "_build_researcher", lambda settings, client: None)
+    real = commands._build_fact_checker
+
+    def build(settings, client, selector):
+        checker = real(settings, client, selector)
+        if checker.llm is not None:
+            checker.llm = _GenericText()
+        return checker
+
+    monkeypatch.setattr(commands, "_build_fact_checker", build)
 
 
 def _settings(tmp_path, *, text=False, **overrides):
@@ -821,7 +859,7 @@ class TestRetryCommandServer:
         image.write_bytes(b"\xff\xd8\xff\xe0\x00\x10JFIF")
         report = tmp_path / "error_report.json"
         report.write_text(
-            json.dumps({"bottle_id": "b1", "images": [str(image)], "error_message": "boom", **extra})
+            json.dumps({"bottle_id": "b1", "images": [str(image)], "error_message": "boom", "schema_version": 2, **extra})
         )
         return report
 
@@ -951,7 +989,6 @@ class TestVisionFailureExitCodes:
 
     def test_failed_bottle_reason_logged_and_all_failed_exit_4(self, caplog):
         from image_processor.batch_processor import BatchResult
-
         from lib.exceptions import VisionResponseError
 
         result = BatchResult(batch_id=1)
@@ -972,7 +1009,7 @@ class TestVisionFailureExitCodes:
         image = tmp_path / "IMG_0001.jpg"
         image.write_bytes(b"\xff\xd8\xff\xe0\x00\x10JFIF")
         report = tmp_path / "error_report.json"
-        report.write_text(json.dumps({"bottle_id": "b1", "images": [str(image)], "error_message": "boom"}))
+        report.write_text(json.dumps({"bottle_id": "b1", "images": [str(image)], "error_message": "boom", "schema_version": 2}))
         args = parse_args(["retry", "--report", str(report), "-o", str(tmp_path / "out")])
         with patch("cli.commands.ModelServerManager") as MockManager, \
                 patch("cli.commands.BottleAnalyzer") as MockAnalyzer, \
@@ -1097,7 +1134,7 @@ class TestRetryCommandSettings:
         image = tmp_path / f"{bottle_id}.jpg"
         image.write_bytes(b"\xff\xd8\xff\xe0\x00\x10JFIF")
         report = tmp_path / "error_report.json"
-        report.write_text(json.dumps({"bottle_id": bottle_id, "images": [str(image)], "error_message": "boom"}))
+        report.write_text(json.dumps({"bottle_id": bottle_id, "images": [str(image)], "error_message": "boom", "schema_version": 2}))
         return report, image
 
     def test_retry_passes_hint_note_policy_and_applies_hint_fields(self, tmp_path):
@@ -1162,14 +1199,259 @@ class TestFailureReportRetryCount:
 
 
 class TestFeedbackApprove:
-    def test_approve_is_recorded_and_logged_only(self, tmp_path, caplog):
+    def test_v1_batch_is_refused(self, tmp_path, caplog):
         from cli.commands import feedback_command
 
         out = tmp_path / "out"
         out.mkdir()
         (out / "batch_b1.json").write_text(json.dumps({"bottles": [], "metadata": []}))
-        args = parse_args(["feedback", "-o", str(out), "--batch", "b1", "--approve", "IMG_1", "--approve", "IMG_2"])
-        with caplog.at_level(logging.INFO, logger="cli.commands"):
-            assert feedback_command(args) == 0
-        assert "--approve is applied by the fact-check stage" in caplog.text
-        assert sorted(p.name for p in out.iterdir()) == ["batch_b1.json"]  # nothing else written
+        args = parse_args(["feedback", "-o", str(out), "--batch", "b1", "--approve", "IMG_1"])
+        with caplog.at_level(logging.ERROR, logger="cli.commands"):
+            assert feedback_command(args) == 1
+        assert "schema_version None; this version reads only 2" in caplog.text
+        assert sorted(p.name for p in out.iterdir()) == ["batch_b1.json"]  # nothing written
+
+    def test_an_ambiguous_bottle_id_approves_nothing(self, caplog):
+        """Two bottles share an ID: like corrections, the approval is refused for both."""
+        from cli.commands import _apply_approvals
+        from tests.unit.test_enrichment import checked_bottle
+
+        a, ma, _ = checked_bottle()
+        b, mb, _ = checked_bottle()
+        with caplog.at_level(logging.ERROR, logger="cli.commands"):
+            approved, problems = _apply_approvals([a, b], [ma, mb], ["IMG_1"], "feedback")
+        assert approved == set()
+        assert problems == ["bottle ID IMG_1 is not unique in this batch"]
+        assert a["facts"]["review"]["approved"] is False and b["facts"]["review"]["approved"] is False
+
+    def test_nothing_to_do_exits_0(self, tmp_path):
+        from cli.commands import feedback_command
+
+        out = tmp_path / "out"
+        out.mkdir()
+        (out / "batch_b1.json").write_text(json.dumps({"schema_version": 2, "bottles": [], "metadata": []}))
+        assert feedback_command(parse_args(["feedback", "-o", str(out), "--batch", "b1"])) == 0
+
+
+# ---------------------------------------------------------------------------
+# Enrichment wiring (web research + fact check), in process
+# ---------------------------------------------------------------------------
+
+
+class _ScriptedResearcher:
+    provider = type("Provider", (), {"name": "duckduckgo"})()
+
+    def __init__(self):
+        self.items = []
+
+    def research_many(self, items, *, workers=1):
+        self.items.extend(items)
+        return [web_research() for _ in items]
+
+
+def _label_vision(self, image_paths, ocr_text="", model=None, **_kwargs):
+    from models.bottle import ExtractedMetadata
+
+    return ExtractedMetadata(source_images=[str(p) for p in image_paths], vision_model=model,
+                             vision_confidence="high", **LABEL)
+
+
+class TestEnrichmentWiring:
+    @pytest.fixture
+    def run(self, tmp_path, monkeypatch):
+        """Run ``process`` in process on one photo with a scripted researcher and text model."""
+        from PIL import Image as PILImage
+
+        import cli.commands as commands
+
+        photos = tmp_path / "photos"
+        photos.mkdir()
+        PILImage.new("RGB", (32, 48), (120, 60, 20)).save(photos / "IMG_1.jpg", "JPEG")
+        out = tmp_path / "out"
+        researcher = _ScriptedResearcher()
+        llm = FakeTextLLM(EXTRACT_REPLY, COMPOSE_REPLY)
+        manager = MagicMock()
+        manager.get_client.return_value.chat_text.side_effect = llm.chat_text
+        monkeypatch.setattr(commands, "_build_researcher", lambda settings, client: researcher)
+        monkeypatch.setattr(commands, "_build_fact_checker", _REAL_BUILD_FACT_CHECKER)
+
+        def go(*extra):
+            with patch.object(commands, "pre_flight_checks", return_value=0), \
+                    patch.object(commands, "build_server_manager", return_value=manager), \
+                    patch("image_processor.text_extractor.TextExtractor.extract_with_retry", lambda self, p, **k: ""), \
+                    patch("image_processor.bottle_analyzer.BottleAnalyzer.analyze_with_vision_model", _label_vision):
+                rc = commands.main(["process", "-f", str(photos), "-o", str(out), "-b", "5", *extra])
+            return rc, out, manager, researcher, llm
+
+        return go
+
+    def test_bottle_json_has_facts_web_research_run_id_and_evidence(self, run, caplog):
+        import hashlib
+
+        with caplog.at_level(logging.INFO):
+            rc, out, manager, researcher, llm = run()
+        assert rc == 0
+        (folder,) = [p for p in out.iterdir() if p.is_dir() and not p.name.startswith(".")]
+        data = json.loads((folder / f"{folder.name}.json").read_text())
+        assert data["schema_version"] == 2
+        assert data["run_id"] and data["run_id"] in next(out.glob("run_*_settings.json")).name
+        assert data["facts"]["verification"]["status"] == "verified"
+        assert data["facts"]["fields"]["msrp"]["value"] == "59.99"
+        assert data["msrp"] == "59.99"
+        assert data["web_research"]["provider"] == "duckduckgo"
+        assert [p["outcome"] for p in data["web_research"]["pages"]] == ["cited", "fetched_not_cited", "skipped"]
+        w1 = next(e for e in data["web_research"]["evidence"] if e["source_id"] == "W1")
+        assert hashlib.sha256((folder / "evidence" / "W1.txt").read_bytes()).hexdigest() == w1["sha256"]
+        assert [link["used_as_evidence"] for link in data["reference_links"]] == [True, False]
+        # Model swaps: the vision model is freed before the text model, which is freed after.
+        assert [c.args[0] for c in manager.unload_model.call_args_list] == [
+            commands_default_vision(), "gpt-oss:120b",
+        ]
+        assert len(llm.calls) == 2 and llm.calls[0]["keep_alive"] == "10m"
+        identity, photo = researcher.items[0]
+        assert identity["name"] == LABEL["name"] and photo.name == "IMG_1.jpg"
+        # Run summary
+        assert "Web search provider: duckduckgo" in caplog.text
+        assert "Web research: ok=1" in caplog.text
+        assert "Fact check (gpt-oss:120b): verified=1" in caplog.text
+        assert "Publish-ready: 0 of 1 saved bottle(s)" in caplog.text
+        assert f"web page {web_research().pages[0].url}: cited" in caplog.text
+
+    def test_keep_models_loaded_skips_unloads(self, run):
+        rc, _out, manager, _r, llm = run("--keep-models-loaded")
+        assert rc == 0
+        manager.unload_model.assert_not_called()
+        assert llm.calls[0]["keep_alive"] == "30m"
+
+    def test_feedback_approve_after_a_run(self, run):
+        from cli.commands import feedback_command
+
+        rc, out, *_ = run()
+        assert rc == 0
+        (batch_json,) = out.glob("batch_*.json")
+        batch_id = batch_json.name[len("batch_"):-len(".json")]
+        assert feedback_command(parse_args(["feedback", "-o", str(out), "--batch", batch_id,
+                                            "--approve", "IMG_1"])) == 0
+        resaved = json.loads(next(out.glob("*_2/*_2.json")).read_text())
+        assert resaved["facts"]["review"]["approved"] is True
+        assert resaved["facts"]["review"]["by"] == "feedback"
+        # Still blocked by the proof conflict: approval never overrides the other checks.
+        assert resaved["facts"]["publish"]["ready"] is False
+        assert any("unresolved conflict proof-1" in b for b in resaved["facts"]["publish"]["blockers"])
+
+    def test_no_verify_keeps_web_out_of_fields(self, run):
+        rc, out, manager, _r, llm = run("--no-verify")
+        assert rc == 0
+        assert llm.calls == []
+        manager.unload_model.assert_not_called()
+        data = json.loads(next(p for p in out.rglob("*.json") if p.parent != out).read_text())
+        assert data["facts"]["verification"]["status"] == "skipped"
+        assert data["msrp"] is None
+        assert data["facts"]["fields"]["age"]["status"] == "unknown"
+
+    def test_retry_runs_enrichment(self, tmp_path, monkeypatch):
+        import cli.commands as commands
+        from models.bottle import ExtractedMetadata
+
+        image = tmp_path / "IMG_1.jpg"
+        image.write_bytes(b"\xff\xd8\xff\xe0\x00\x10JFIF")
+        report = tmp_path / "error_report.json"
+        report.write_text(json.dumps({"schema_version": 2, "bottle_id": "IMG_1", "images": [str(image)],
+                                      "error_message": "boom"}))
+        researcher = _ScriptedResearcher()
+        llm = FakeTextLLM(EXTRACT_REPLY, COMPOSE_REPLY)
+        monkeypatch.setattr(commands, "_build_researcher", lambda settings, client: researcher)
+        monkeypatch.setattr(commands, "_build_fact_checker", _REAL_BUILD_FACT_CHECKER)
+        out = tmp_path / "out"
+        metadata = ExtractedMetadata(source_images=[str(image)], vision_confidence="high", **LABEL)
+        bottle_dict = {"name": LABEL["name"], "distillery": LABEL["distillery"], "proof": LABEL["proof"],
+                       "label_price": LABEL["label_price"], "msrp": None, "images": [str(image)]}
+        with patch("cli.commands.ModelServerManager") as MockManager, \
+                patch("cli.commands.BottleAnalyzer") as MockAnalyzer:
+            MockManager.return_value.ensure_running.return_value = True
+            MockManager.return_value.get_client.return_value.chat_text.side_effect = llm.chat_text
+            MockAnalyzer.return_value.process_single_bottle.return_value = (bottle_dict, metadata)
+            MockAnalyzer.return_value.detect_quantity.return_value = 1
+            assert retry_command(parse_args(["retry", "--report", str(report), "-o", str(out)])) == 0
+            unloads = [c.args[0] for c in MockManager.return_value.unload_model.call_args_list]
+        (saved_json,) = [p for p in out.rglob("*.json") if p.parent != out]
+        saved = json.loads(saved_json.read_text())
+        assert saved["facts"]["verification"]["status"] == "verified"
+        assert saved["web_research"]["status"] == "ok"
+        assert saved["run_id"].startswith("retry_")
+        assert saved["msrp"] == "59.99"
+        assert (saved_json.parent / "evidence" / "W1.txt").is_file()
+        assert unloads == [commands_default_vision(), "gpt-oss:120b"]
+        assert len(researcher.items) == 1
+
+    def test_retry_refuses_v1_report(self, tmp_path, caplog):
+        image = tmp_path / "IMG_1.jpg"
+        image.write_bytes(b"x")
+        report = tmp_path / "error_report.json"
+        report.write_text(json.dumps({"bottle_id": "IMG_1", "images": [str(image)], "error_message": "boom"}))
+        with patch("cli.commands.ModelServerManager") as MockManager, caplog.at_level(logging.ERROR):
+            assert retry_command(parse_args(["retry", "--report", str(report)])) == 1
+        MockManager.assert_not_called()
+        assert "schema_version None" in caplog.text
+
+
+class TestEnricherBuilders:
+    def test_researcher_none_when_web_off_or_provider_none(self):
+        from cli.commands import _web_skip_reason
+
+        off = make_settings(web={"enabled": False})
+        assert _REAL_BUILD_RESEARCHER(off, MagicMock()) is None
+        assert "disabled" in _web_skip_reason(off)
+        none = make_settings(web={"provider_resolved": "none", "provider_reason": "web.provider = 'none'"})
+        assert _REAL_BUILD_RESEARCHER(none, MagicMock()) is None
+        assert _web_skip_reason(none) == "web.provider = 'none'"
+
+    def test_duckduckgo_researcher_built_without_network(self, tmp_path):
+        settings = make_settings(web={"provider_resolved": "duckduckgo", "cache_dir": tmp_path / "cache",
+                                      "vendor_images": True, "max_pages": 3})
+        researcher = _REAL_BUILD_RESEARCHER(settings, MagicMock())
+        assert researcher.provider.name == "duckduckgo"
+        assert researcher.options.max_pages == 3
+        assert researcher.options.vendor_images is True
+        assert researcher.vendor_verifier is not None
+        assert researcher.fetcher.cache.root == tmp_path / "cache"
+
+    def test_fact_checker_settings(self):
+        from lib.model_selector import ModelStage
+
+        selector = MagicMock()
+        settings = make_settings(retry={"enabled": False}, model={"keep_models_loaded": True})
+        client = object()
+        checker = _REAL_BUILD_FACT_CHECKER(settings, client, selector)
+        assert checker.llm is client
+        assert checker.max_attempts == 1
+        assert checker.keep_alive == "30m"
+        assert checker.model == settings.text.model
+        checker.usage_recorder("gpt-oss:120b", 1.5, True, "high")
+        selector.record_usage.assert_called_once_with(
+            ModelStage.METADATA_GENERATION, "gpt-oss:120b", success=True, duration=1.5, think="high"
+        )
+        off = make_settings(text={"enabled": False})
+        assert _REAL_BUILD_FACT_CHECKER(off, client, selector).llm is None
+        assert _REAL_BUILD_FACT_CHECKER(make_settings(), client, selector).max_attempts == 2
+
+    def test_researcher_build_failure_skips_web(self, monkeypatch):
+        import cli.commands as commands
+
+        def boom(settings, client):
+            raise ValueError("bad searxng url")
+
+        monkeypatch.setattr(commands, "_build_researcher", boom)
+        enricher = commands.build_enricher(RunContext(make_settings()), MagicMock())
+        assert enricher.researcher is None
+        assert "could not be built" in enricher.web_skip_reason
+
+
+def commands_default_vision():
+    return DEFAULT_VISION_MODEL
+
+
+import cli.commands as _commands_module  # noqa: E402
+
+_REAL_BUILD_RESEARCHER = _commands_module._build_researcher
+_REAL_BUILD_FACT_CHECKER = _commands_module._build_fact_checker

@@ -11,7 +11,9 @@ from unittest.mock import Mock, patch
 import pytest
 
 from image_processor.preview_generator import PreviewGenerator
-from models.bottle import Bottle, ExtractedMetadata, Correction, ReferenceLink, Quantity
+from models.bottle import Bottle, Correction, ExtractedMetadata, Quantity, ReferenceLink
+from models.facts import FactSheet
+from tests.unit.test_enrichment import checked_bottle
 
 
 class TestPreviewGeneratorInitialization:
@@ -41,10 +43,9 @@ class TestPreviewGeneratorInitialization:
 
 
 class TestPreviewGeneratorMarkdownGeneration:
-    """Test markdown generation for individual bottles."""
+    """Markdown of bottles without a fact sheet (built directly, not by the pipeline)."""
 
     def test_generate_bottle_markdown_basic(self, tmp_path):
-        """Test basic markdown generation for a bottle."""
         metadata = ExtractedMetadata(
             full_text="Sample OCR text",
             selected_text="Sample OCR text",
@@ -57,28 +58,18 @@ class TestPreviewGeneratorMarkdownGeneration:
             msrp=Decimal("99.99"),
             metadata=metadata,
         )
-        # Add abv attribute dynamically to work around Bottle model limitation
-        bottle.abv = None
-        generator = PreviewGenerator(tmp_path)
+        markdown = PreviewGenerator(tmp_path).generate_bottle_markdown(bottle)
 
-        markdown = generator.generate_bottle_markdown(bottle)
-
-        assert "# Test Bourbon" in markdown
-        assert "## Distillery" in markdown
-        assert "Test Distillery" in markdown
-        assert "## MSRP" in markdown
-        assert "$99.99" in markdown
+        assert markdown.startswith("# Test Bourbon\n")
+        assert "**Status:** NOT publish-ready: not fact-checked (no fact sheet)" in markdown
+        assert "| Distillery | Test Distillery | - | not fact-checked |" in markdown
+        assert "- **MSRP:** $99.99" in markdown
         assert "## Images" in markdown
-        assert "image1.jpg" in markdown
-        assert "image2.jpg" in markdown
+        assert "1. image1.jpg (primary)" in markdown
+        assert "2. image2.jpg" in markdown
 
     def test_generate_bottle_markdown_with_all_fields(self, tmp_path):
-        """Test markdown with all optional fields populated."""
-        metadata = ExtractedMetadata(
-            full_text="OCR text",
-            selected_text="OCR text",
-            source_images=[Path("image.jpg")],
-        )
+        metadata = ExtractedMetadata(full_text="OCR text", selected_text="OCR text", source_images=[Path("image.jpg")])
         bottle = Bottle(
             name="Complete Bourbon",
             distillery="Complete Distillery",
@@ -89,113 +80,68 @@ class TestPreviewGeneratorMarkdownGeneration:
             tasting_notes="Caramel, vanilla, and oak notes with a smooth finish.",
             reference_links=[
                 ReferenceLink(label="Buy Now", url="https://example.com/buy"),
-                ReferenceLink(label="Review", url="https://example.com/review"),
+                ReferenceLink(label="Review", url="https://example.com/review", source_class="reference",
+                              retrieved_at="2026-11-23T01:02:03+00:00", used_as_evidence=True),
             ],
             quantity=Quantity(count=2, price=Decimal("149.99")),
             corrections=[
-                Correction(
-                    bottle_id="IMG_1",
-                    field_name="age",
-                    original_value="10 years",
-                    corrected_value="12 years",
-                )
+                Correction(bottle_id="IMG_1", field_name="age", original_value="10 years", corrected_value="12 years")
             ],
             metadata=metadata,
         )
-        generator = PreviewGenerator(tmp_path)
+        markdown = PreviewGenerator(tmp_path).generate_bottle_markdown(bottle)
 
-        markdown = generator.generate_bottle_markdown(bottle)
-
-        assert "**Proof:** 100" in markdown
-        assert "**Age:** 12 years" in markdown
-        assert "**Release:** Limited Edition 2025" in markdown
-        assert "## Tasting Notes" in markdown
-        assert "Caramel, vanilla, and oak" in markdown
-        assert "## References" in markdown
-        assert "[Buy Now](https://example.com/buy)" in markdown
+        assert "| Proof | 100 |" in markdown
+        assert "| Age | 12 years |" in markdown
+        assert "| Release | Limited Edition 2025 |" in markdown
+        assert "| Tasting notes | Caramel, vanilla, and oak notes with a smooth finish. |" in markdown
+        assert "- [Buy Now](https://example.com/buy) (unclassified, retrieved -, not cited)" in markdown
+        assert "- [Review](https://example.com/review) (reference, retrieved 2026-11-23, cited)" in markdown
         assert "Value per bottle: $149.99" in markdown
         assert "Total value: $299.98" in markdown
-        assert "## Corrections" in markdown
-        assert "**age**" in markdown
+        assert '- **age**: "10 years" -> "12 years" (interactive)' in markdown
 
     def test_generate_bottle_markdown_without_optional_fields(self, tmp_path):
-        """Test markdown generation when optional fields are missing."""
-        metadata = ExtractedMetadata(
-            full_text="OCR text",
-            selected_text="OCR text",
-            source_images=[Path("image.jpg")],
-        )
+        metadata = ExtractedMetadata(full_text="OCR text", selected_text="OCR text", source_images=[Path("image.jpg")])
         bottle = Bottle(
-            name="Minimal Bourbon",
-            distillery="Minimal Distillery",
-            specific_release="Regular",
-            msrp=Decimal("50.00"),
-            metadata=metadata,
+            name="Minimal Bourbon", distillery="Minimal Distillery", specific_release="Regular",
+            msrp=Decimal("50.00"), metadata=metadata,
         )
-        bottle.abv = None
-        generator = PreviewGenerator(tmp_path)
+        markdown = PreviewGenerator(tmp_path).generate_bottle_markdown(bottle)
 
-        markdown = generator.generate_bottle_markdown(bottle)
-
-        # Verify optional sections are not present
-        assert "## Tasting Notes" not in markdown
-        assert "## References" not in markdown
+        assert "| Tasting notes | Unknown: not fact-checked |" in markdown
+        assert "No web pages were used." in markdown
         assert "## Corrections" not in markdown
-        # Verify required sections are present
         assert "## Quantity" in markdown
 
     def test_generate_bottle_markdown_with_single_quantity(self, tmp_path):
-        """Test quantity section shows correctly when quantity is 1."""
-        metadata = ExtractedMetadata(
-            full_text="Text",
-            selected_text="Text",
-            source_images=[Path("image.jpg")],
-        )
         bottle = Bottle(
-            name="Single Bottle",
-            distillery="Distillery",
-            specific_release="Regular",
-            msrp=Decimal("75.00"),
+            name="Single Bottle", distillery="Distillery", specific_release="Regular", msrp=Decimal("75.00"),
             quantity=Quantity(count=1, price=Decimal("75.00")),
-            metadata=metadata,
+            metadata=ExtractedMetadata(source_images=[Path("image.jpg")]),
         )
-        bottle.abv = None
-        generator = PreviewGenerator(tmp_path)
-
-        markdown = generator.generate_bottle_markdown(bottle)
+        markdown = PreviewGenerator(tmp_path).generate_bottle_markdown(bottle)
 
         assert "Total quantity: 1" in markdown
         assert "Value per bottle" not in markdown
         assert "Total value: $75.00" in markdown
 
     def test_generate_bottle_markdown_with_multiple_quantity(self, tmp_path):
-        """Test quantity section shows per-bottle value when quantity > 1."""
-        metadata = ExtractedMetadata(
-            full_text="Text",
-            selected_text="Text",
-            source_images=[Path("image.jpg")],
-        )
         bottle = Bottle(
-            name="Case of Bourbon",
-            distillery="Distillery",
-            specific_release="Regular",
-            msrp=Decimal("75.00"),
+            name="Case of Bourbon", distillery="Distillery", specific_release="Regular", msrp=Decimal("75.00"),
             quantity=Quantity(count=12, price=Decimal("75.00")),
-            metadata=metadata,
+            metadata=ExtractedMetadata(source_images=[Path("image.jpg")]),
         )
-        bottle.abv = None
-        generator = PreviewGenerator(tmp_path)
-
-        markdown = generator.generate_bottle_markdown(bottle)
+        markdown = PreviewGenerator(tmp_path).generate_bottle_markdown(bottle)
 
         assert "Total quantity: 12" in markdown
         assert "Value per bottle: $75.00" in markdown
         assert "Total value: $900.00" in markdown
 
     def test_unknown_msrp_renders_unknown_not_zero(self, tmp_path):
-        """No visible price: the .md says Unknown and the JSON has nulls, never $0.00."""
+        """No MSRP: the .md says Unknown and the JSON has nulls, never $0.00."""
         bottle = Bottle.from_analysis(
-            {"name": "George T. Stagg", "abv": "65.1%"},
+            {"name": "George T. Stagg", "abv": "65.1%", "label_price": "99.99"},
             ExtractedMetadata(source_images=[Path("IMG_4668.jpeg")]),
             quantity=2,
         )
@@ -203,16 +149,18 @@ class TestPreviewGeneratorMarkdownGeneration:
 
         markdown = generator.generate_bottle_markdown(bottle)
 
-        assert "## MSRP\nUnknown" in markdown
+        assert "- **MSRP:** Unknown: not fact-checked" in markdown
+        assert "- **Retail:** $99.99: Price visible on label (retail, not MSRP)" in markdown
         assert "Total value: Unknown" in markdown
         assert "Value per bottle" not in markdown
         assert "$0.00" not in markdown
-        assert "- **ABV:** 65.1%" in markdown
+        assert "| ABV | 65.1% |" in markdown
 
         folder = generator.save_bottle_files(bottle)
         data = json.loads((folder / f"{folder.name}.json").read_text())
         assert data["msrp"] is None
         assert data["total_value"] is None
+        assert data["label_price"] == "99.99"
 
     def test_extracted_timestamp_has_offset(self, tmp_path):
         bottle = Bottle.from_analysis({"name": "X"})
@@ -299,10 +247,10 @@ class TestPreviewGeneratorSaveBottleFiles:
         assert _visible_entries(folder) == ["images", "test_bourbon.json", "test_bourbon.md", "test_bourbon.txt"]
         assert _visible_entries(folder / "images") == ["image1.jpg", "image2.jpg"]
         assert (folder / "images" / "image1.jpg").read_bytes() == img1.read_bytes()
-        assert (folder / "test_bourbon.txt").read_text(encoding="utf-8") == "OCR text\nmore"
+        assert (folder / "test_bourbon.txt").read_text(encoding="utf-8") == "OCR text\nmore\n\nweb: not researched\n"
 
         data = json.loads((folder / "test_bourbon.json").read_text(encoding="utf-8"))
-        assert data["msrp"] == "99.99"
+        assert data["msrp"] == "99.99"  # a Bottle built directly keeps its msrp
         assert len(data["metadata"]["source_images"]) == 2
         assert data["images"] == ["images/image1.jpg", "images/image2.jpg"]
         assert data["source_images"] == [str(img1), str(img2)]
@@ -310,7 +258,7 @@ class TestPreviewGeneratorSaveBottleFiles:
         assert data["bottle_id"] == "image1"
         assert data["model_used"] == "qwen3.6:35b-a3b"
         assert data["confidence"] == "HIGH"
-        assert data["schema_version"] == 1
+        assert data["schema_version"] == 2
         restored = Bottle.from_json((folder / "test_bourbon.json").read_text(encoding="utf-8"))
         assert restored.name == "Test Bourbon"
         assert restored.msrp == Decimal("99.99")
@@ -429,7 +377,7 @@ class TestPreviewGeneratorSaveBottleFiles:
         folder = PreviewGenerator(output_dir=tmp_path / "out").save_bottle_files(bottle, metadata)
 
         assert _visible_entries(folder / "images") == ["image.jpg"]
-        assert (folder / "plain.txt").read_text(encoding="utf-8") == "ocr"
+        assert (folder / "plain.txt").read_text(encoding="utf-8") == "ocr\n\nweb: not researched\n"
 
     def test_duplicate_basenames_get_suffix(self, tmp_path):
         a = _jpeg(tmp_path / "a" / "IMG_1.jpg")
@@ -495,7 +443,7 @@ class TestBottleMarkdownProcessingDetails:
 
         assert "1. [a.jpg](images/a.jpg) (primary)" in md
         assert "2. [b.jpg](images/b.jpg)" in md
-        assert "- **Batch:** B-17" in md
+        assert "| Batch | B-17 |" in md
         assert "- **Images Processed**: 2" in md
         assert "- **Extraction Confidence**: LOW" in md
         assert "- **Warning**: photos show different products" in md
@@ -810,10 +758,13 @@ class TestPreviewGeneratorBatchReport:
         )
 
         assert "## Feedback Instructions" in markdown
-        assert "**A** - Accept" in markdown
+        assert "**A** - Approve" in markdown
         assert "**R** - Reject" in markdown
         assert "**E** - Edit" in markdown
+        assert "**C** - Settle conflicts" in markdown
+        assert "**N** - Keep" in markdown
         assert "**Q** - Quit" in markdown
+        assert "--approve <bottle_id>" in markdown
         assert "Merge" not in markdown and "Split" not in markdown
         assert "bourbon-process feedback --batch 1" in markdown
         assert "bottle_id" in markdown
@@ -911,205 +862,105 @@ class TestPreviewGeneratorSaveBatchPreview:
         assert "IMG_7" in result_path.read_text(encoding="utf-8")
         data = json.loads((target / "batch_20261122_120000_001.json").read_text(encoding="utf-8"))
         assert data["batch_id"] == "20261122_120000_001"
+        assert data["schema_version"] == 2
         assert data["bottles"] == bottle_dicts
         assert data["rejected"] == ["IMG_7"]
         assert ExtractedMetadata.from_dict(data["metadata"][0]).full_text == "Text"
 
 
 class TestPreviewGeneratorInteractivePrompt:
-    """Test interactive user prompting."""
+    """Interactive review: A approves, R rejects, E/C record corrections, N keeps, Q quits."""
+
+    @staticmethod
+    def _plain(n=1):
+        metadata = ExtractedMetadata(full_text="Text", selected_text="Text", source_images=[Path("bottle1.jpg")])
+        return [{"name": f"Bottle {i}", "distillery": "Dist", "quantity": 1} for i in range(1, n + 1)], [metadata] * n
 
     @patch("builtins.input")
     @patch("builtins.print")
-    def test_interactive_prompt_accept_all(self, mock_print, mock_input, tmp_path):
-        """Test accepting all bottles in interactive mode."""
+    def test_accept_approves_every_bottle(self, mock_print, mock_input, tmp_path):
         mock_input.return_value = "A"
+        bottles, metas = self._plain(2)
+        bottles[1]["bottle_id"] = "bottle2"
 
-        metadata = ExtractedMetadata(
-            full_text="Text",
-            selected_text="Text",
-            source_images=[Path("bottle1.jpg"), Path("bottle2.jpg")],
-        )
-        bottle_dicts = [
-            {"name": "Bottle One", "distillery": "Dist A", "msrp": "99.99", "quantity": 1},
-            {"name": "Bottle Two", "distillery": "Dist B", "msrp": "149.99", "quantity": 1},
-        ]
-        metadata_list = [metadata, metadata]
+        corrections, rejected, approvals = PreviewGenerator(tmp_path).interactive_prompt(bottles, metas)
 
-        generator = PreviewGenerator(tmp_path)
-        corrections, rejected = generator.interactive_prompt(
-            bottle_dicts, metadata_list
-        )
-
-        assert corrections == []
-        assert rejected == []
+        assert (corrections, rejected, approvals) == ([], [], ["bottle1", "bottle2"])
         assert mock_input.call_count == 2
 
     @patch("builtins.input")
     @patch("builtins.print")
-    def test_interactive_prompt_reject_bottle(self, mock_print, mock_input, tmp_path):
-        """Test rejecting bottles in interactive mode."""
+    def test_reject_bottle(self, mock_print, mock_input, tmp_path):
         mock_input.return_value = "R"
-
-        metadata = ExtractedMetadata(
-            full_text="Text",
-            selected_text="Text",
-            source_images=[Path("bottle1.jpg")],
-        )
-        bottle_dicts = [
-            {"name": "Bottle One", "distillery": "Dist A", "msrp": "99.99", "quantity": 1}
-        ]
-        metadata_list = [metadata]
-
-        generator = PreviewGenerator(tmp_path)
-        corrections, rejected = generator.interactive_prompt(
-            bottle_dicts, metadata_list
-        )
-
-        assert corrections == []
-        assert len(rejected) == 1
-        assert rejected[0] == "bottle1"
+        corrections, rejected, approvals = PreviewGenerator(tmp_path).interactive_prompt(*self._plain())
+        assert (corrections, rejected, approvals) == ([], ["bottle1"], [])
 
     @patch("builtins.input")
     @patch("builtins.print")
-    def test_interactive_prompt_edit(self, mock_print, mock_input, tmp_path):
-        """Test editing bottle fields in interactive mode."""
-        def input_side_effect(*args):
-            # First call selects Edit mode
-            # Subsequent calls provide new values
-            if mock_input.call_count == 1:
-                return "E"
-            elif mock_input.call_count == 2:
-                return ""  # Keep name
-            elif mock_input.call_count == 3:
-                return "New Distillery"  # Change distillery
-            elif mock_input.call_count == 4:
-                return ""  # Keep MSRP
-            elif mock_input.call_count == 5:
-                return ""  # Keep proof
-            elif mock_input.call_count == 6:
-                return ""  # Keep age
-            elif mock_input.call_count == 7:
-                return ""  # Keep release
-            return "A"
+    def test_next_keeps_without_approval(self, mock_print, mock_input, tmp_path):
+        mock_input.return_value = "n"
+        corrections, rejected, approvals = PreviewGenerator(tmp_path).interactive_prompt(*self._plain(2))
+        assert (corrections, rejected, approvals) == ([], [], [])
+        assert mock_input.call_count == 2
 
-        mock_input.side_effect = input_side_effect
+    @patch("builtins.input")
+    @patch("builtins.print")
+    def test_edit_produces_a_correction_with_bottle_id(self, mock_print, mock_input, tmp_path):
+        mock_input.side_effect = ["E", "nmae", "distillery", "New Distillery", "", "N"]
+        bottles = [{"name": "Test Bottle", "distillery": "Old Distillery", "proof": "100", "age": "12"}]
+        metas = [ExtractedMetadata(source_images=[Path("bottle1.jpg")])]
 
-        metadata = ExtractedMetadata(
-            full_text="Text",
-            selected_text="Text",
-            source_images=[Path("bottle1.jpg")],
-        )
-        bottle_dicts = [
-            {
-                "name": "Test Bottle",
-                "distillery": "Old Distillery",
-                "msrp": "99.99",
-                "proof": "100",
-                "age": "12",
-                "specific_release": "Regular",
-            }
-        ]
-        metadata_list = [metadata]
+        corrections, rejected, approvals = PreviewGenerator(tmp_path).interactive_prompt(bottles, metas)
 
-        generator = PreviewGenerator(tmp_path)
-        corrections, rejected = generator.interactive_prompt(
-            bottle_dicts, metadata_list
-        )
-
-        assert len(corrections) == 1
-        assert corrections[0]["bottle_id"] == "bottle1"
-        assert corrections[0]["field_name"] == "distillery"
-        assert corrections[0]["original_value"] == "Old Distillery"
-        assert corrections[0]["corrected_value"] == "New Distillery"
+        (correction,) = corrections
+        assert correction["bottle_id"] == "bottle1"
+        assert correction["field_name"] == "distillery"
+        assert correction["original_value"] == "Old Distillery"
+        assert correction["corrected_value"] == "New Distillery"
+        assert (rejected, approvals) == ([], [])
         # The prompt only records the edit; apply_corrections changes the bottle.
-        assert bottle_dicts[0]["distillery"] == "Old Distillery"
+        assert bottles[0]["distillery"] == "Old Distillery"
 
     @patch("builtins.input")
     @patch("builtins.print")
-    def test_interactive_prompt_quit(self, mock_print, mock_input, tmp_path):
-        """Test quitting early from interactive mode."""
+    def test_second_edit_of_a_field_starts_from_the_first(self, mock_print, mock_input, tmp_path):
+        mock_input.side_effect = ["E", "age", "10", "age", "11", "", "A"]
+        corrections, _rejected, approvals = PreviewGenerator(tmp_path).interactive_prompt(
+            [{"bottle_id": "B1", "name": "X", "age": "12"}], [ExtractedMetadata(source_images=[Path("b.jpg")])]
+        )
+        assert [(c["original_value"], c["corrected_value"]) for c in corrections] == [("12", "10"), ("10", "11")]
+        assert approvals == ["B1"]  # approved after the edits
+
+    @patch("builtins.input")
+    @patch("builtins.print")
+    def test_quit(self, mock_print, mock_input, tmp_path):
         mock_input.return_value = "Q"
-
-        metadata = ExtractedMetadata(
-            full_text="Text",
-            selected_text="Text",
-            source_images=[Path("bottle1.jpg"), Path("bottle2.jpg"), Path("bottle3.jpg")],
-        )
-        bottle_dicts = [
-            {"name": "Bottle 1", "distillery": "Dist", "msrp": "99.99", "quantity": 1},
-            {"name": "Bottle 2", "distillery": "Dist", "msrp": "99.99", "quantity": 1},
-            {"name": "Bottle 3", "distillery": "Dist", "msrp": "99.99", "quantity": 1},
-        ]
-        metadata_list = [metadata, metadata, metadata]
-
-        generator = PreviewGenerator(tmp_path)
-        corrections, rejected = generator.interactive_prompt(
-            bottle_dicts, metadata_list
-        )
-
-        # Should only process first bottle before quitting
-        assert corrections == []
-        assert rejected == []
+        corrections, rejected, approvals = PreviewGenerator(tmp_path).interactive_prompt(*self._plain(3))
+        assert (corrections, rejected, approvals) == ([], [], [])
         assert mock_input.call_count == 1
 
     @patch("builtins.input")
     @patch("builtins.print")
-    def test_interactive_prompt_invalid_action_asks_again(
-        self, mock_print, mock_input, tmp_path
-    ):
+    def test_invalid_action_asks_again(self, mock_print, mock_input, tmp_path):
         """An unknown key or a bare Enter is never taken as Accept: the prompt repeats."""
         mock_input.side_effect = ["X", "", "R"]
-
-        metadata = ExtractedMetadata(
-            full_text="Text",
-            selected_text="Text",
-            source_images=[Path("bottle1.jpg")],
-        )
-        bottle_dicts = [
-            {"name": "Test Bottle", "distillery": "Dist", "msrp": "99.99", "quantity": 1}
-        ]
-        metadata_list = [metadata]
-
-        generator = PreviewGenerator(tmp_path)
-        corrections, rejected = generator.interactive_prompt(
-            bottle_dicts, metadata_list
-        )
-
-        assert corrections == []
-        assert rejected == ["bottle1"]
+        corrections, rejected, approvals = PreviewGenerator(tmp_path).interactive_prompt(*self._plain())
+        assert (corrections, rejected, approvals) == ([], ["bottle1"], [])
         assert mock_input.call_count == 3
 
     @patch("builtins.input")
     @patch("builtins.print")
-    def test_interactive_prompt_case_insensitive(self, mock_print, mock_input, tmp_path):
-        """Test action is case-insensitive."""
-        mock_input.return_value = "a"  # lowercase a
-
-        metadata = ExtractedMetadata(
-            full_text="Text",
-            selected_text="Text",
-            source_images=[Path("bottle1.jpg")],
-        )
-        bottle_dicts = [
-            {"name": "Test Bottle", "distillery": "Dist", "msrp": "99.99", "quantity": 1}
-        ]
-        metadata_list = [metadata]
-
-        generator = PreviewGenerator(tmp_path)
-        corrections, rejected = generator.interactive_prompt(
-            bottle_dicts, metadata_list
-        )
-
-        assert corrections == []
-        assert rejected == []
+    def test_case_insensitive(self, mock_print, mock_input, tmp_path):
+        mock_input.return_value = "a"
+        _c, _r, approvals = PreviewGenerator(tmp_path).interactive_prompt(*self._plain())
+        assert approvals == ["bottle1"]
 
 
 class TestInteractivePromptActions:
-    """Review offers only A/R/E/Q and shows the confidence recorded for the bottle."""
+    """The review shows facts, conflicts and blockers, and offers A/R/E/C/N/Q."""
 
-    @patch("builtins.input", return_value="A")
-    def test_shows_recorded_confidence_not_a_derived_one(self, mock_input, tmp_path, capsys):
+    @patch("builtins.input", return_value="N")
+    def test_shows_recorded_confidence_and_actions(self, mock_input, tmp_path, capsys):
         bottle = {
             "bottle_id": "IMG_1", "name": "Stagg", "distillery": "Buffalo Trace", "msrp": "99.99",
             "proof": "130", "age": "15", "confidence": "LOW",
@@ -1117,10 +968,12 @@ class TestInteractivePromptActions:
         PreviewGenerator(tmp_path).interactive_prompt([bottle], [ExtractedMetadata(source_images=[Path("IMG_1.jpg")])])
         out = capsys.readouterr().out
         assert "Confidence:  LOW" in out
-        assert "[A]ccept | [R]eject | [E]dit | [Q]uit" in out
+        assert "[A]ccept (approve for publishing) | [R]eject | [E]dit | [C]onflicts | " in out
+        assert "[N]ext (keep, not approved) | [Q]uit" in out
+        assert "NOT publish-ready: not fact-checked" in out
         assert "[M]erge" not in out and "[S]plit" not in out
 
-    @patch("builtins.input", return_value="A")
+    @patch("builtins.input", return_value="N")
     def test_missing_confidence_is_unknown(self, mock_input, tmp_path, capsys):
         PreviewGenerator(tmp_path).interactive_prompt([{"name": "X"}], [ExtractedMetadata(source_images=[Path("a.jpg")])])
         assert "Confidence:  Unknown" in capsys.readouterr().out
@@ -1128,18 +981,365 @@ class TestInteractivePromptActions:
     @pytest.mark.parametrize("action", ["M", "S"])
     def test_merge_and_split_are_not_actions(self, action, tmp_path):
         """M/S are unknown keys: the prompt asks again and records nothing for them."""
-        with patch("builtins.input", side_effect=[action, "A", action, "Q"]) as mock_input, \
+        with patch("builtins.input", side_effect=[action, "N", action, "Q"]) as mock_input, \
                 patch("builtins.print"):
-            corrections, rejected = PreviewGenerator(tmp_path).interactive_prompt(
+            corrections, rejected, approvals = PreviewGenerator(tmp_path).interactive_prompt(
                 [{"name": "A"}, {"name": "B"}],
                 [ExtractedMetadata(source_images=[Path("a.jpg")]), ExtractedMetadata(source_images=[Path("b.jpg")])],
             )
-        assert corrections == []
-        assert rejected == []
+        assert (corrections, rejected, approvals) == ([], [], [])
         assert mock_input.call_count == 4
 
     def test_handle_interactive_choice_removed(self):
         assert not hasattr(PreviewGenerator, "handle_interactive_choice")
+
+    def test_shows_facts_conflicts_and_blockers(self, tmp_path, capsys):
+        bottle, metadata, _sheet = checked_bottle()
+        with patch("builtins.input", return_value="N"):
+            PreviewGenerator(tmp_path).interactive_prompt([bottle], [metadata])
+        out = capsys.readouterr().out
+        assert "NOT publish-ready: unresolved conflict proof-1 (proof)" in out
+        assert "Distillery     high    Example Creek Distillery" in out
+        assert "Proof          -       CONFLICT (see below)" in out
+        assert "proof-1 (proof): L1 100 vs W1 101" in out
+        assert "MSRP           medium  $59.99" in out
+        assert "Label price: $64.99 (retail, not MSRP)" in out
+        assert "web: 3 pages consulted, 1 cited" in out
+
+
+def _review_and_apply(bottle, metadata, inputs, tmp_path):
+    """Run the prompt with ``inputs``, then apply its results the way the CLI does."""
+    from cli.commands import _apply_approvals, _apply_review_corrections, _corrections_from_prompt
+
+    with patch("builtins.input", side_effect=inputs), patch("builtins.print"):
+        corrections, rejected, approvals = PreviewGenerator(tmp_path).interactive_prompt([bottle], [metadata])
+    if corrections:
+        _apply_review_corrections([bottle], [metadata], _corrections_from_prompt(corrections), "test")
+    _apply_approvals([bottle], [metadata], approvals, "interactive")
+    return corrections, rejected, approvals, FactSheet.from_dict(bottle["facts"])
+
+
+class TestInteractiveFactsReview:
+    """[C]onflicts, [A]ccept and [E]dit end in re-reconciled facts and a recomputed gate."""
+
+    def test_conflict_resolved_by_picking_a_candidate(self, tmp_path):
+        bottle, metadata, sheet = checked_bottle()
+        assert any("unresolved conflict proof-1" in b for b in sheet.publish["blockers"])
+
+        corrections, _r, approvals, new = _review_and_apply(bottle, metadata, ["C", "2", "N"], tmp_path)
+
+        (correction,) = corrections
+        assert correction["field_name"] == "proof"
+        assert correction["corrected_value"] == "101 Proof"
+        assert correction["original_value"] == ""
+        assert approvals == []
+        assert new.fields["proof"].status == "user"
+        assert new.fields["proof"].value == 101.0
+        conflict = next(c for c in new.conflicts if c.id == "proof-1")
+        assert conflict.resolved
+        assert not any("unresolved conflict" in b for b in new.publish["blockers"])
+        assert new.publish["blockers"] == ["not approved by a reviewer"]
+        assert bottle["proof"] == "101 Proof"
+        assert bottle["corrections"][0]["source"] == "interactive"
+
+    def test_conflict_resolved_by_typing_a_value_then_approved(self, tmp_path):
+        bottle, metadata, _sheet = checked_bottle()
+
+        _c, _r, approvals, new = _review_and_apply(bottle, metadata, ["C", "=100", "A"], tmp_path)
+
+        assert approvals == ["IMG_1"]
+        assert new.fields["proof"].value == 100.0
+        assert new.review["approved"] is True and new.review["by"] == "interactive"
+        assert new.publish["ready"] is True  # every check passes once a person settled and approved it
+        assert new.publish["blockers"] == []
+
+    def test_conflict_skip_changes_nothing(self, tmp_path):
+        bottle, metadata, sheet = checked_bottle()
+        corrections, _r, _a, new = _review_and_apply(bottle, metadata, ["C", "", "N"], tmp_path)
+        assert corrections == []
+        assert new.publish["blockers"] == sheet.publish["blockers"]
+
+    def test_accept_approves_but_gate_still_blocks(self, tmp_path):
+        bottle, metadata, _sheet = checked_bottle()
+        _c, _r, approvals, new = _review_and_apply(bottle, metadata, ["A"], tmp_path)
+        assert approvals == ["IMG_1"]
+        assert new.review["approved"] is True
+        assert "not approved by a reviewer" not in new.publish["blockers"]
+        assert new.publish["ready"] is False  # the conflict still blocks
+
+    def test_edit_of_a_field_the_copy_cites_marks_it_stale(self, tmp_path):
+        bottle, metadata, sheet = checked_bottle()
+        assert "age" in sheet.copy.cited_fields()
+
+        corrections, _r, _a, new = _review_and_apply(bottle, metadata, ["E", "age", "9 years", "", "N"], tmp_path)
+
+        (correction,) = corrections
+        assert (correction["bottle_id"], correction["original_value"]) == ("IMG_1", "8 years")
+        assert new.fields["age"].status == "user"
+        assert new.copy.stale is True
+        assert any(b.startswith("description is stale") for b in new.publish["blockers"])
+        assert bottle["age"] == "9 years"
+
+    def test_conflicts_action_without_conflicts(self, tmp_path, capsys):
+        with patch("builtins.input", side_effect=["C", "N"]):
+            corrections, _r, _a = PreviewGenerator(tmp_path).interactive_prompt(
+                [{"name": "X"}], [ExtractedMetadata(source_images=[Path("a.jpg")])]
+            )
+        assert corrections == []
+        assert "No unresolved conflicts." in capsys.readouterr().out
+
+
+class TestBottleMarkdownGolden:
+    """The full document for a fact-checked bottle (everything before the volatile tail)."""
+
+    def test_golden(self):
+        bottle_dict, metadata, _ = checked_bottle()
+        md = Bottle.from_analysis(bottle_dict, metadata).to_markdown()
+        assert md[: md.index("## Quantity")] == GOLDEN_MARKDOWN
+
+    def test_untrusted_text_is_escaped(self):
+        from image_processor.preview_generator import md_escape, md_link
+
+        assert md_escape("a | b ] c [d] `e` *f* <script>") == r"a \| b \] c \[d\] \`e\` \*f\* &lt;script&gt;"
+        assert md_escape("line\nbreak") == "line break"
+        assert md_link("x", "javascript:alert(1)") == "x"
+        assert md_link("t", "https://a.test/p (1)") == "[t](https://a.test/p%20%281%29)"
+
+    def test_model_written_description_is_escaped(self):
+        """A sentence can never smuggle a link, table pipe or HTML into the document; markers stay plain."""
+        bottle_dict, metadata, sheet = checked_bottle()
+        sheet.copy.sentences[1] = {**sheet.copy.sentences[1], "text": "Aged [8](http://evil.test) | <b>years</b>."}
+        bottle_dict["facts"] = sheet.to_dict()
+        md = Bottle.from_analysis(bottle_dict, metadata).to_markdown()
+        desc = md[md.index("## Description"):md.index("## Sources")]
+        assert r"Aged \[8\](http://evil.test) \| &lt;b&gt;years&lt;/b&gt;. [3]" in desc
+        assert "](http://evil.test)" not in desc.replace(r"\]", "")
+
+    def test_review_prints_strip_terminal_escape_sequences(self):
+        from image_processor.preview_generator import _term
+
+        assert _term("ok\x1b[2J\x07 quote\nnext") == "ok[2J quote next"
+
+    def test_web_log_renders_cited_not_cited_and_skipped_with_reasons(self):
+        bottle_dict, metadata, _ = checked_bottle()
+        md = Bottle.from_analysis(bottle_dict, metadata).to_markdown()
+        log = md[md.index("## Web Research Log"):]
+        assert "| 1 | [examplecreek.test](https://examplecreek.test/single-barrel) | official | 2026-11-23 | cited | cited for distillery, age, msrp |" in log
+        assert "| 2 | [shop.test](https://shop.test/ec-sb) | retailer | 2026-11-23 | fetched_not_cited | W2: no verifiable quote accepted (quote_not_found) |" in log
+        assert "| 3 | forum.test | - | - | skipped | deny-listed |" in log  # never fetched: no link
+
+    def test_skipped_web_run_renders_the_section_with_the_reason(self):
+        from models.evidence import WebResearch
+
+        bottle = Bottle.from_analysis({
+            "name": "X",
+            "web_research": WebResearch(status="skipped", reason="identity too uncertain to search").to_dict(),
+        })
+        md = bottle.to_markdown()
+        log = md[md.index("## Web Research Log"):md.index("## Quantity")]
+        assert "- Status: skipped (identity too uncertain to search)" in log
+        assert "- Provider: none" in log
+        assert "- Queries: none sent" in log
+        assert "web: 0 pages consulted, 0 cited (skipped: identity too uncertain to search)" in log
+        assert "No pages were consulted." in log
+
+    def test_user_asserted_msrp(self):
+        from image_processor.fact_checker import FactChecker
+        from models.facts import FactInput, UserFact
+
+        sheet = FactChecker.deterministic(
+            FactInput("B", {"name": "X"}, "high", ["a.jpg"], {}, (UserFact("msrp", "49.99", "feedback:c.json"),)),
+            "no text model",
+        )
+        md = Bottle.from_analysis({"name": "X", "facts": sheet.to_dict()}).to_markdown()
+        assert "- **MSRP:** $49.99: user-asserted (feedback:c.json)" in md
+        assert "| MSRP | $49.99 (user-asserted) | high |" in md
+
+
+class TestSaveV2Files:
+    def test_evidence_files_written_with_matching_sha256(self, tmp_path):
+        import hashlib
+
+        bottle_dict, metadata, _ = checked_bottle()
+        image = _jpeg(tmp_path / "IMG_1.jpg")
+        bottle_dict["images"] = [str(image)]
+        metadata.source_images = [image]
+        folder = PreviewGenerator(tmp_path / "out").save_bottle_files(Bottle.from_analysis(bottle_dict, metadata))
+
+        data = json.loads((folder / f"{folder.name}.json").read_text())
+        for ev in data["web_research"]["evidence"]:
+            path = folder / "evidence" / f"{ev['source_id']}.txt"
+            assert hashlib.sha256(path.read_bytes()).hexdigest() == ev["sha256"]
+        sources = {s["id"]: s for s in data["facts"]["sources"]}
+        assert sources["W1"]["evidence_path"] == "evidence/W1.txt"
+        assert (folder / sources["W1"]["evidence_path"]).is_file()
+        txt = (folder / f"{folder.name}.txt").read_text()
+        assert txt.endswith("web: 3 pages consulted, 1 cited\n")
+        assert data["batch_number"] is None  # from the facts (unknown), not a guess
+
+    def test_extra_files_are_written_inside_the_atomic_save(self, tmp_path):
+        bottle = _bottle(images=[_jpeg(tmp_path / "image.jpg")])
+        out = tmp_path / "out"
+        folder = PreviewGenerator(out).save_bottle_files(
+            bottle, bottle.metadata, extra_files=[("notes/a.txt", "héllo"), ("raw.bin", b"\x00\x01")]
+        )
+        assert (folder / "notes" / "a.txt").read_bytes() == "héllo".encode()
+        assert (folder / "raw.bin").read_bytes() == b"\x00\x01"
+
+    @pytest.mark.parametrize("bad", ["../escape.txt", "/abs.txt", "a/../../b.txt"])
+    def test_extra_file_outside_the_folder_fails_and_leaves_nothing(self, tmp_path, bad):
+        from lib.exceptions import FileSystemError
+
+        bottle = _bottle(images=[_jpeg(tmp_path / "image.jpg")])
+        out = tmp_path / "out"
+        with pytest.raises(FileSystemError):
+            PreviewGenerator(out).save_bottle_files(bottle, bottle.metadata, extra_files=[(bad, "x")])
+        assert _visible_entries(out) == []
+        assert not list(out.glob(".*.partial"))
+        assert not (tmp_path / "escape.txt").exists()
+
+    def test_failure_writing_extra_files_leaves_nothing(self, tmp_path):
+        from lib.exceptions import FileSystemError
+
+        bottle = _bottle(images=[_jpeg(tmp_path / "image.jpg")])
+        out = tmp_path / "out"
+        with pytest.raises(FileSystemError, match="written twice"):
+            PreviewGenerator(out).save_bottle_files(bottle, bottle.metadata, extra_files=[("a.txt", "1"), ("a.txt", "2")])
+        assert _visible_entries(out) == []
+        assert not list(out.glob(".*.partial"))
+
+    def test_vendor_ref_saved_with_vendor_category(self, tmp_path):
+        from models.evidence import VendorImage
+
+        cache = _jpeg(tmp_path / "cache" / "abc123.jpg", (1, 1, 1))
+        vendor = VendorImage(cache_path=str(cache), image_url="https://examplecreek.test/i.jpg",
+                             page_url="https://examplecreek.test/sb", retrieved_at="2026-11-23T00:00:00+00:00",
+                             verdict={"same_product": True, "confidence": "high", "same_release": "yes"})
+        image = _jpeg(tmp_path / "IMG_1.jpg")
+        bottle = Bottle.from_analysis(
+            {"name": "Example Creek", "images": [str(image)], "vendor_image": vendor.to_dict()},
+            ExtractedMetadata(source_images=[image]),
+        )
+        folder = PreviewGenerator(tmp_path / "out").save_bottle_files(bottle)
+
+        assert (folder / "images" / "vendor_ref.jpg").read_bytes() == cache.read_bytes()
+        data = json.loads((folder / f"{folder.name}.json").read_text())
+        assert data["vendor_image"]["path"] == "images/vendor_ref.jpg"
+        assert data["vendor_image"]["category"] == "VENDOR"
+        assert data["vendor_image"]["usage"] == "reference only - not licensed for publication"
+        assert data["vendor_image"]["image_url"] == "https://examplecreek.test/i.jpg"
+        assert data["images"] == ["images/IMG_1.jpg"]  # the photos; the vendor image is separate
+        md = (folder / f"{folder.name}.md").read_text()
+        assert "2. [vendor_ref.jpg](images/vendor_ref.jpg) (vendor reference, not for publication)" in md
+        assert "- **Images Processed**: 1" in md
+
+    def test_missing_vendor_cache_is_recorded_not_fatal(self, tmp_path):
+        bottle = Bottle.from_analysis({"name": "X", "vendor_image": {"cache_path": str(tmp_path / "gone.jpg")}})
+        folder = PreviewGenerator(tmp_path / "out").save_bottle_files(bottle)
+        data = json.loads((folder / f"{folder.name}.json").read_text())
+        assert data["vendor_image"]["path"] is None
+        assert not (folder / "images" / "vendor_ref.jpg").exists()
+
+
+class TestBatchPreviewV2Columns:
+    def test_ready_conflicts_unknowns_verification_msrp_columns(self, tmp_path):
+        bottle_dict, metadata, sheet = checked_bottle()
+        markdown = PreviewGenerator(tmp_path).generate_batch_preview_report([bottle_dict], [metadata], batch_id="b1")
+
+        assert "| Bottle Name | Quantity | Images | Confidence | Ready | Conflicts | Unknowns | Verification | MSRP (source) |" in markdown
+        unknowns = sum(1 for f in sheet.fields.values() if f.status == "unknown")
+        assert (f"| Example Creek Single Barrel | 1 | 1 | HIGH | N | 1 | {unknowns} | verified | "
+                "$59.99 (W1 examplecreek.test) |") in markdown
+        assert "**web: 3 pages consulted, 1 cited**" in markdown
+        assert "**Label price:** $64.99 (retail, not MSRP)" in markdown
+        assert "**Status:** NOT publish-ready: unresolved conflict proof-1" in markdown
+
+    def test_bottle_without_facts(self, tmp_path):
+        markdown = PreviewGenerator(tmp_path).generate_batch_preview_report(
+            [{"name": "Plain"}], [ExtractedMetadata(source_images=[Path("a.jpg")])]
+        )
+        assert "| Plain | 1 | 1 | LOW | N | - | - | not run | Unknown (not fact-checked) |" in markdown
+        assert "**web: not researched**" in markdown
+
+
+GOLDEN_MARKDOWN = (
+    '# Example Creek Single Barrel\n'
+    '\n'
+    '**Status:** NOT publish-ready: unresolved conflict proof-1 (proof): L1 100 vs W1 101; core field proof or abv not supported at medium confidence or better; not approved by a reviewer\n'
+    '\n'
+    '## Needs Review\n'
+    '\n'
+    '- **proof** (proof-1): L1 100 vs W1 101\n'
+    '  1. 100 (label): [1] L1 "100 Proof"\n'
+    '  2. 101 (web): [2] W1 "bottled at 101 proof"\n'
+    '\n'
+    '## Facts\n'
+    '\n'
+    '| Field | Value | Confidence | Sources |\n'
+    '|---|---|---|---|\n'
+    '| Name | Example Creek Single Barrel | medium | [1] label "Example Creek Single Barrel" |\n'
+    '| Distillery | Example Creek Distillery | high | [1] label "Example Creek Distillery"; [2] W1 "Distilled by Example Creek Distillery" |\n'
+    '| Bottler | Unknown: Bottler not part of the label reading; not stated in 2 fetched page(s) | - | - |\n'
+    '| Release | Unknown: Specific release not read from label; not stated in 2 fetched page(s) | - | - |\n'
+    '| Batch | Unknown: Batch number not read from label; not stated in 2 fetched page(s) | - | - |\n'
+    '| Proof | CONFLICT: see Needs Review | - | - |\n'
+    '| ABV | Unknown: Abv not read from label; not stated in 2 fetched page(s) | - | - |\n'
+    '| Age | 8 years | medium | [2] W1 "Aged 8 years \\| small \\`batch\\`" |\n'
+    '| Release year | Unknown: Release year not part of the label reading; not stated in 2 fetched page(s) | - | - |\n'
+    '| Mash bill | Unknown: Mash bill not part of the label reading; not stated in 2 fetched page(s); 1 claim(s) rejected (W2 quote_not_found) | - | - |\n'
+    '| Tasting notes | Unknown: Tasting notes not read from label; not stated in 2 fetched page(s) | - | - |\n'
+    '| MSRP | $59.99 | medium | [2] W1 "Suggested retail price (MSRP) of $59.99" |\n'
+    '\n'
+    '## Prices\n'
+    '\n'
+    '- **MSRP:** $59.99: [examplecreek.test](https://examplecreek.test/single-barrel), "Suggested retail price (MSRP) of $59.99", retrieved 2026-11-23 (confidence medium)\n'
+    '- **Retail:** $64.99: Price visible on label (retail, not MSRP)\n'
+    '\n'
+    '## Description (draft)\n'
+    '\n'
+    'Example Creek Single Barrel is distilled by Example Creek Distillery. [1][2] It is aged 8 years. [3]\n'
+    '\n'
+    '_Markers number the facts the sentence relies on (not the Sources list): [1] Name, [2] Distillery, [3] Age, [4] MSRP._\n'
+    '\n'
+    '## Sources\n'
+    '\n'
+    '1. **L1** label reading (vision model) of IMG_1.jpg\n'
+    '2. **W1** [Single Barrel \\| Example Creek](https://examplecreek.test/single-barrel) (official, examplecreek.test, retrieved 2026-11-23); excerpt: `evidence/W1.txt`\n'
+    '   - "Distilled by Example Creek Distillery"\n'
+    '   - "bottled at 101 proof"\n'
+    '   - "Aged 8 years \\| small \\`batch\\`"\n'
+    '   - "Suggested retail price (MSRP) of $59.99"\n'
+    '3. **W2** [Example Creek SB](https://shop.test/ec-sb) (retailer, shop.test, retrieved 2026-11-23); excerpt: `evidence/W2.txt`\n'
+    '\n'
+    '## Verification\n'
+    '\n'
+    '- Status: verified\n'
+    '- Model: gpt-oss:120b\n'
+    '- Think: extract high\n'
+    '- Prompt version: facts-1\n'
+    '- Claims accepted: 3; prices accepted: 1; proposals rejected: 1 (listed in the JSON)\n'
+    '- Duration: 12.5 s; model calls: 2\n'
+    '\n'
+    '## References\n'
+    '\n'
+    '- [Single Barrel \\| Example Creek](https://examplecreek.test/single-barrel) (official, retrieved 2026-11-23, cited)\n'
+    '- [Example Creek SB](https://shop.test/ec-sb) (retailer, retrieved 2026-11-23, not cited)\n'
+    '\n'
+    '## Web Research Log\n'
+    '\n'
+    '- Provider: duckduckgo\n'
+    '- Status: ok\n'
+    '- Searched: 2026-11-23T10:00:00+00:00\n'
+    '- Queries: "example creek single barrel"\n'
+    '- web: 3 pages consulted, 1 cited\n'
+    '\n'
+    '| # | Site | Class | Retrieved | Outcome | Used for / Reason |\n'
+    '|---|---|---|---|---|---|\n'
+    '| 1 | [examplecreek.test](https://examplecreek.test/single-barrel) | official | 2026-11-23 | cited | cited for distillery, age, msrp |\n'
+    '| 2 | [shop.test](https://shop.test/ec-sb) | retailer | 2026-11-23 | fetched_not_cited | W2: no verifiable quote accepted (quote_not_found) |\n'
+    '| 3 | forum.test | - | - | skipped | deny-listed |\n'
+    '\n'
+)
 
 
 class TestOutputMarkers:

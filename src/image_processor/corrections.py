@@ -49,6 +49,7 @@ CORRECTABLE_FIELDS: frozenset[str] = frozenset(
         "abv",
         "age",
         "release_year",
+        "mash_bill",
         "msrp",
         "tasting_notes",
     }

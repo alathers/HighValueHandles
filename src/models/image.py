@@ -9,9 +9,9 @@ from typing import Optional
 class ImageCategory(Enum):
     """Categorized image types for processing and organization.
 
-    Scanning currently leaves every photo UNKNOWN; the categories are kept
-    because vendor reference images (VENDOR) and receipts (BILL, evidence of
-    the price paid, never of MSRP) need them.
+    Scanning currently leaves every photo UNKNOWN. VENDOR marks the vendor
+    reference photo a ``-v`` run copies to ``images/vendor_ref.<ext>``; BILL
+    is kept for receipts (evidence of the price paid, never of MSRP).
     """
 
     ANGLE = auto()
@@ -24,7 +24,9 @@ class ImageCategory(Enum):
     """Close-up detail shot."""
 
     VENDOR = auto()
-    """Vendor reference image."""
+    """Vendor reference image (``images/vendor_ref.<ext>``): a product photo from a
+    vendor page that the vision model judged to show the same bottle. It is
+    for the reviewer only and is not licensed for publication."""
 
     BILL = auto()
     """Receipt or bill image."""

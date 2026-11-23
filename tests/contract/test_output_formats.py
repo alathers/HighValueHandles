@@ -11,7 +11,6 @@ from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
-
 from image_processor.preview_generator import OUTPUT_SCHEMA_VERSION, PreviewGenerator
 from lib.exceptions import OCRError
 from models.bottle import (
@@ -42,8 +41,8 @@ class TestBottleMarkdownOutput:
 
         assert markdown.startswith("# Test Bottle")
 
-    def test_bottle_markdown_distillery_section(self):
-        """Test distillery is displayed with bold label."""
+    def test_bottle_markdown_distillery_row(self):
+        """The distillery is a row of the Facts table."""
         bottle = Bottle(
             name="Test Bottle",
             distillery="Test Distillery",
@@ -52,11 +51,10 @@ class TestBottleMarkdownOutput:
         )
         markdown = bottle.to_markdown()
 
-        assert "**Distillery:**" in markdown
-        assert "Test Distillery" in markdown
+        assert "| Distillery | Test Distillery |" in markdown
 
-    def test_bottle_markdown_msrp_section(self):
-        """Test MSRP is displayed with dollar sign."""
+    def test_bottle_markdown_msrp_line(self):
+        """MSRP is shown in the Prices section with a dollar sign."""
         bottle = Bottle(
             name="Test Bottle",
             distillery="Test Distillery",
@@ -65,66 +63,28 @@ class TestBottleMarkdownOutput:
         )
         markdown = bottle.to_markdown()
 
-        assert "**MSRP:**" in markdown
-        assert "$49.99" in markdown
+        assert "- **MSRP:** $49.99" in markdown
 
-    def test_bottle_markdown_proof_section(self):
-        """Test proof is displayed when present."""
-        bottle = Bottle(
-            name="Test Bottle",
-            distillery="Test Distillery",
-            specific_release="Test",
-            msrp=Decimal("49.99"),
-            proof="93 Proof",
-        )
-        markdown = bottle.to_markdown()
-
-        assert "**Proof:**" in markdown
-        assert "93 Proof" in markdown
-
-    def test_bottle_markdown_age_section(self):
-        """Test age is displayed when present."""
-        bottle = Bottle(
-            name="Test Bottle",
-            distillery="Test Distillery",
-            specific_release="Test",
-            msrp=Decimal("49.99"),
-            age="12 Years",
-        )
-        markdown = bottle.to_markdown()
-
-        assert "**Age:**" in markdown
-        assert "12 Years" in markdown
-
-    def test_bottle_markdown_release_information_section(self):
-        """Test Release Information H2 section exists."""
+    def test_bottle_markdown_optional_rows(self):
+        """Proof, age, release and tasting notes are Facts rows when present."""
         bottle = Bottle(
             name="Test Bottle",
             distillery="Test Distillery",
             specific_release="Single Barrel",
             msrp=Decimal("49.99"),
-        )
-        markdown = bottle.to_markdown()
-
-        assert "## Release Information" in markdown
-        assert "Single Barrel" in markdown
-
-    def test_bottle_markdown_tasting_notes_section(self):
-        """Test Tasting Notes H2 section exists."""
-        bottle = Bottle(
-            name="Test Bottle",
-            distillery="Test Distillery",
-            specific_release="Test",
-            msrp=Decimal("49.99"),
+            proof="93 Proof",
+            age="12 Years",
             tasting_notes="Caramel, vanilla, and oak",
         )
         markdown = bottle.to_markdown()
 
-        assert "## Tasting Notes" in markdown
-        assert "Caramel, vanilla, and oak" in markdown
+        assert "| Proof | 93 Proof |" in markdown
+        assert "| Age | 12 Years |" in markdown
+        assert "| Release | Single Barrel |" in markdown
+        assert "| Tasting notes | Caramel, vanilla, and oak |" in markdown
 
     def test_bottle_markdown_complete_structure(self):
-        """Test complete markdown structure matches expected format."""
+        """Sections appear in the documented order; an unchecked bottle is never publish-ready."""
         bottle = Bottle(
             name="Test Bottlename",
             distillery="Test Distillery Name",
@@ -136,16 +96,20 @@ class TestBottleMarkdownOutput:
         )
         markdown = bottle.to_markdown()
 
-        # Verify required sections
-        assert markdown.startswith("# Test Bottlename")
-        assert "**Distillery:** Test Distillery Name" in markdown
-        assert "**MSRP:** $59.99" in markdown
-        assert "**Proof:** 100 Proof" in markdown
-        assert "**Age:** 10 Years" in markdown
-        assert "## Release Information" in markdown
-        assert "Single Barrel Release" in markdown
-        assert "## Tasting Notes" in markdown
+        assert markdown.startswith("# Test Bottlename\n\n**Status:** NOT publish-ready: not fact-checked")
+        order = [
+            "## Needs Review", "## Facts", "## Prices", "## Description (draft)", "## Sources",
+            "## Verification", "## References", "## Web Research Log", "## Quantity", "## Images",
+            "## Processing Details",
+        ]
+        positions = [markdown.index(h) for h in order]
+        assert positions == sorted(positions)
         assert "Rich amber color" in markdown
+        assert "Web research was not run for this bottle." in markdown
+
+    def test_to_markdown_matches_generate_bottle_markdown(self, tmp_path):
+        bottle = Bottle(name="T", distillery="D", specific_release="", msrp=None)
+        assert bottle.to_markdown() == PreviewGenerator(tmp_path).generate_bottle_markdown(bottle)
 
 
 class TestBottleJSONOutput:
@@ -285,6 +249,45 @@ class TestBottleJSONOutput:
         assert parsed.age == original.age
 
 
+class TestBottleJSONSchemaV2:
+    """The saved bottle JSON (``save_bottle_files``) has a fixed v2 key set."""
+
+    KEYS = {
+        "schema_version", "bottle_id", "name", "distillery", "specific_release", "msrp", "proof", "abv", "age",
+        "tasting_notes", "label_price", "quantity", "extracted_at", "run_id", "reference_links", "corrections",
+        "facts", "web_research", "vendor_image", "review_required", "metadata", "batch_number", "model_used",
+        "confidence", "source_images", "images", "missing_images", "total_value",
+    }
+
+    def test_key_set_and_version(self, tmp_path):
+        from image_processor.fact_checker import FactChecker
+        from models.facts import FactInput
+
+        image = tmp_path / "IMG_1.jpg"
+        image.write_bytes(b"x")
+        sheet = FactChecker.deterministic(
+            FactInput("IMG_1", {"name": "Test"}, "high", ["IMG_1.jpg"], {}), "no text model"
+        )
+        bottle = Bottle.from_analysis(
+            {"name": "Test", "images": [str(image)], "facts": sheet.to_dict(), "run_id": "r1",
+             "web_research": {"status": "skipped", "reason": "web lookups disabled"}},
+            ExtractedMetadata(source_images=[str(image)]),
+        )
+        folder = PreviewGenerator(tmp_path / "out").save_bottle_files(bottle)
+        data = json.loads((folder / f"{folder.name}.json").read_text())
+        assert set(data) == self.KEYS
+        assert data["schema_version"] == OUTPUT_SCHEMA_VERSION == 2
+        assert data["reference_links"] == []
+        assert data["corrections"] == []
+        assert data["facts"]["publish"]["ready"] is False
+        assert data["web_research"]["status"] == "skipped"
+        assert data["run_id"] == "r1"
+
+    def test_batch_json_has_schema_version(self, tmp_path):
+        PreviewGenerator(tmp_path).save_batch_preview([], [], batch_id="b1")
+        assert json.loads((tmp_path / "batch_b1.json").read_text())["schema_version"] == 2
+
+
 class TestFailureReportJSONSchema:
     """Per-bottle failure report written by ``PreviewGenerator.save_failure_report``.
 
@@ -315,7 +318,7 @@ class TestFailureReportJSONSchema:
         except OCRError as error:
             _, data = self._write(tmp_path, error, stage="analysis", retry_count=2)
 
-        assert data["schema_version"] == OUTPUT_SCHEMA_VERSION
+        assert data["schema_version"] == OUTPUT_SCHEMA_VERSION == 2
         assert data["bottle_id"] == "IMG_1"
         assert all(Path(p).is_absolute() for p in data["images"])
         assert data["error_message"].startswith("OCRError: no text")
@@ -360,7 +363,7 @@ class TestOutputFilePersistence:
 
         content = output_file.read_text()
         assert "# Test Bottle" in content
-        assert "**Distillery:** Test Distillery" in content
+        assert "| Distillery | Test Distillery |" in content
 
     def test_json_file_write_and_read(self, tmp_path):
         """Test JSON file can be written and read back."""

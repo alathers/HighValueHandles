@@ -5,7 +5,35 @@ from pathlib import Path
 
 import pytest
 
-from models.bottle import Bottle, Correction, ExtractedMetadata, Quantity, parse_money
+from image_processor.fact_checker import FactChecker
+from models.bottle import (
+    Bottle,
+    Correction,
+    ExtractedMetadata,
+    Quantity,
+    ReferenceLink,
+    parse_money,
+)
+from models.evidence import PageRecord, VendorImage, WebEvidence, WebResearch
+from models.facts import FactInput, UserFact
+
+
+def _sheet(user=(), web=(), label=None):
+    """A deterministic fact sheet (no model): label reading plus user facts."""
+    inp = FactInput(
+        bottle_id="IMG_1",
+        label=label or {"name": "X", "distillery": "D"},
+        vision_confidence="high",
+        images=["IMG_1.jpg"],
+        ocr_by_image={},
+        user_facts=tuple(UserFact(f, v, "interactive") for f, v in user),
+        web=tuple(web),
+    )
+    return FactChecker.deterministic(inp, "test")
+
+
+def _msrp_facts(amount):
+    return _sheet(user=[("msrp", amount)]).to_dict()
 
 
 class TestExtractedMetadataVisionFields:
@@ -112,17 +140,32 @@ class TestBottleFromAnalysis:
     """Bottle.from_analysis() is the one way to build a Bottle from analyzer output."""
 
     def test_int_quantity_priced_at_msrp(self):
-        bottle = Bottle.from_analysis({"name": "Pappy", "msrp": "$1,299.00"}, quantity=2)
+        bottle = Bottle.from_analysis({"name": "Pappy", "facts": _msrp_facts("$1,299.00")}, quantity=2)
 
         assert bottle.msrp == Decimal("1299.00")
         assert bottle.quantity == Quantity(count=2, price=Decimal("1299.00"), source="extracted")
         assert bottle.total_value == Decimal("2598.00")
 
-    @pytest.mark.parametrize(
-        ("msrp", "expected"), [(None, None), ("N/A", None), (45.5, Decimal("45.50")), ("0.00", Decimal("0.00"))]
-    )
-    def test_msrp_parsing(self, msrp, expected):
-        assert Bottle.from_analysis({"name": "X", "msrp": msrp}).msrp == expected
+    @pytest.mark.parametrize("msrp", [None, "N/A", 45.5, "0.00", "$59.99"])
+    def test_msrp_without_facts_or_a_person_is_ignored(self, msrp):
+        """A bare dict msrp (label or shop price) never becomes an MSRP."""
+        bottle = Bottle.from_analysis({"name": "X", "msrp": msrp, "label_price": "59.99"})
+        assert bottle.msrp is None
+        assert bottle.quantity.price is None
+
+    def test_msrp_without_facts_set_by_a_person_is_kept(self):
+        correction = {"bottle_id": "B", "field_name": "msrp", "original_value": "", "corrected_value": "45.00",
+                      "source": "feedback:c.json"}
+        bottle = Bottle.from_analysis({"name": "X", "msrp": "45.00", "corrections": [correction]})
+        assert bottle.msrp == Decimal("45.00")
+
+    def test_msrp_comes_only_from_facts(self):
+        facts = _sheet().to_dict()  # no MSRP fact
+        bottle = Bottle.from_analysis({"name": "X", "msrp": "99.99", "label_price": "79.99", "facts": facts})
+        assert bottle.msrp is None
+        assert bottle.label_price == Decimal("79.99")
+        assert bottle.to_dict()["label_price"] == "79.99"
+        assert Bottle.from_analysis({"name": "X", "facts": _msrp_facts("45.5")}).msrp == Decimal("45.50")
 
     def test_missing_fields_get_placeholders(self):
         bottle = Bottle.from_analysis({"name": None, "distillery": "  ", "proof": "", "age": None})
@@ -189,7 +232,7 @@ class TestBottleFromAnalysis:
 
     def test_round_trips_through_json(self):
         bottle = Bottle.from_analysis(
-            {"name": "X", "distillery": "D", "msrp": "19.99", "images": ["/p/a.jpg"]}, quantity=2
+            {"name": "X", "distillery": "D", "facts": _msrp_facts("19.99"), "images": ["/p/a.jpg"]}, quantity=2
         )
 
         restored = Bottle.from_json(bottle.to_json())
@@ -224,7 +267,7 @@ class TestUnknownMsrp:
     def test_unknown_msrp_markdown(self):
         markdown = Bottle.from_analysis({"name": "Stagg"}, quantity=2).to_markdown()
         assert "**MSRP:** Unknown" in markdown
-        assert "**Total Value:** Unknown" in markdown
+        assert "Total value: Unknown" in markdown
         assert "$0.00" not in markdown
 
     def test_older_files_with_zero_msrp_still_load(self):
@@ -244,7 +287,9 @@ class TestTotalValue:
     """total_value is quantity * price, or None when the price is unknown (no ohr estimate)."""
 
     def test_total_value_is_count_times_price(self):
-        assert Bottle.from_analysis({"name": "X", "msrp": "45.00"}, quantity=3).total_value == Decimal("135.00")
+        bottle = Bottle.from_analysis({"name": "X", "facts": _msrp_facts("45.00")}, quantity=3)
+        assert bottle.total_value == Decimal("135.00")
+        assert Bottle.from_analysis({"name": "X"}, quantity=3).total_value is None
 
     def test_ohr_is_gone(self):
         bottle = Bottle.from_analysis({"name": "X"})
@@ -261,8 +306,100 @@ class TestAbv:
         bottle = Bottle.from_analysis({"name": "X", "abv": "55.2%"}, metadata)
         assert bottle.abv == "55.2%"
         assert Bottle.from_dict(bottle.to_dict()).abv == "55.2%"
-        assert "**ABV:** 55.2%" in bottle.to_markdown()
+        assert "| ABV | 55.2% | - | not fact-checked |" in bottle.to_markdown()
 
     def test_abv_from_metadata_when_dict_lacks_it(self):
         bottle = Bottle.from_analysis({"name": "X"}, ExtractedMetadata(abv="45%"))
         assert bottle.abv == "45%"
+
+
+def _evidence(sid, url, title="Example Creek Single Barrel"):
+    return WebEvidence.create(
+        text=f"Example Creek Single Barrel is bottled at 100 proof. ({sid})", source_id=sid, url=url,
+        domain=url.split("/")[2], tier="official" if "examplecreek" in url else "retailer", title=title,
+        fetched_at="2026-11-23T00:00:00+00:00", http_status=200, query="example creek", from_cache=False,
+        truncated=False,
+    )
+
+
+def _research():
+    w1 = _evidence("W1", "https://shop.test/ec")
+    w2 = _evidence("W2", "https://examplecreek.test/sb")
+    return WebResearch(
+        status="ok", provider="duckduckgo", queries=["example creek single barrel"],
+        searched_at="2026-11-23T00:00:00+00:00",
+        pages=[
+            PageRecord(url=w1.url, title="Shop", domain="shop.test", source_class="retailer",
+                       retrieved_at=w1.fetched_at, outcome="fetched_not_cited", reason="W1: no verified fact cites it"),
+            PageRecord(url=w2.url, title="Official", domain="examplecreek.test", source_class="official",
+                       retrieved_at=w2.fetched_at, outcome="cited", cited_for=["proof"]),
+            PageRecord(url="https://forum.test/x", title=None, domain="forum.test", source_class=None,
+                       retrieved_at=None, outcome="skipped", reason="deny-listed"),
+        ],
+        evidence=[w1, w2],
+        vendor_image=VendorImage(cache_path="/tmp/x.jpg", image_url="https://examplecreek.test/i.jpg",
+                                 page_url=w2.url, retrieved_at="2026-11-23T00:00:00+00:00",
+                                 verdict={"same_product": True, "confidence": "high"}),
+    )
+
+
+class TestSchemaV2:
+    def _sheet_citing_w2(self):
+        from models.facts import Citation
+
+        sheet = _sheet(label={"name": "Example Creek Single Barrel", "distillery": "Example Creek", "proof": "100"},
+                       web=_research().evidence)
+        sheet.fields["proof"].citations.append(Citation("W2", "bottled at 100 proof"))
+        return sheet
+
+    def test_v2_round_trip(self):
+        research = _research()
+        sheet = self._sheet_citing_w2()
+        bottle = Bottle.from_analysis(
+            {
+                "name": "Example Creek Single Barrel", "facts": sheet.to_dict(), "web_research": research.to_dict(),
+                "vendor_image": research.vendor_image.to_dict(), "run_id": "20261123_000000",
+                "label_price": "64.99",
+            },
+            ExtractedMetadata(source_images=["/p/IMG_1.jpg"]),
+        )
+        data = bottle.to_dict()
+        assert {"facts", "web_research", "vendor_image", "run_id", "reference_links", "label_price",
+                "corrections", "review_required"} <= set(data)
+        restored = Bottle.from_dict(data)
+        assert restored.facts.to_dict() == sheet.to_dict()
+        assert restored.web_research.to_dict() == research.to_dict()
+        assert [p.outcome for p in restored.web_research.pages] == ["fetched_not_cited", "cited", "skipped"]
+        assert restored.web_research.pages[2].reason == "deny-listed"
+        assert restored.vendor_image["usage"] == "reference only - not licensed for publication"
+        assert restored.run_id == "20261123_000000"
+        assert restored.label_price == Decimal("64.99")
+        assert restored.msrp is None
+        assert restored.reference_links == bottle.reference_links
+
+    def test_reference_links_cited_first(self):
+        bottle = Bottle.from_analysis(
+            {"name": "X", "facts": self._sheet_citing_w2().to_dict(), "web_research": _research().to_dict()}
+        )
+        assert [link.url for link in bottle.reference_links] == [
+            "https://examplecreek.test/sb", "https://shop.test/ec",
+        ]
+        first, second = bottle.reference_links
+        assert first == ReferenceLink(
+            url="https://examplecreek.test/sb", label="Example Creek Single Barrel", source_class="official",
+            retrieved_at="2026-11-23T00:00:00+00:00", used_as_evidence=True,
+        )
+        assert second.used_as_evidence is False and second.source_class == "retailer"
+
+    def test_reference_links_always_emitted(self):
+        assert Bottle.from_analysis({"name": "X"}).to_dict()["reference_links"] == []
+        assert ReferenceLink.from_dict({"url": "https://a.test", "label": "A"}).used_as_evidence is False
+
+    def test_review_required(self):
+        from models.facts import Candidate, Citation, Conflict
+
+        sheet = _sheet()
+        assert Bottle.from_analysis({"name": "X", "facts": sheet.to_dict()}).review_required is False
+        sheet.conflicts.append(Conflict("proof-1", "proof", "value_mismatch",
+                                        [Candidate(90.0, [Citation("L1", "90", "reading")], "label")], "x"))
+        assert Bottle.from_analysis({"name": "X", "facts": sheet.to_dict()}).review_required is True
