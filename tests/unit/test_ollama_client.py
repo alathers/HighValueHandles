@@ -14,18 +14,24 @@ import requests
 from PIL import Image as PILImage
 
 from lib.exceptions import (
+    FATAL_MODEL_ERRORS,
     OllamaConnectionError,
+    TextAnalysisError,
+    TextModelUnavailableError,
+    TextResponseError,
+    TextTimeoutError,
+    TextTransientError,
     VisionAnalysisError,
     VisionModelUnavailableError,
     VisionTimeoutError,
+    VisionTransientError,
 )
 from lib.ollama_client import (
-    ChatCompletionResponse,
-    EmbeddingResponse,
+    ChatResult,
     OllamaClient,
-    VisionChatResult,
-    get_ollama_client,
+    is_gpt_oss_model,
     prepare_image_b64,
+    resolve_think,
 )
 
 
@@ -66,352 +72,12 @@ class TestOllamaClientInitialization:
         assert client.base_url == "http://localhost:11434"
 
 
-class TestOllamaClientChatCompletion:
-    """Test chat completion functionality."""
-
-    @patch("requests.Session.request")
-    def test_chat_completion_basic(self, mock_request):
-        """Test basic chat completion request."""
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {
-            "model": "test-model",
-            "message": {"content": "Test response"},
-            "done": True,
-        }
-        mock_request.return_value = mock_response
-
-        client = OllamaClient(model="test-model")
-        responses = client.chat_completion(
-            messages=[{"role": "user", "content": "Hello"}]
-        )
-
-        assert len(responses) == 1
-        assert responses[0].message == "Test response"
-        assert responses[0].model == "test-model"
-
-    @patch("requests.Session.request")
-    def test_chat_completion_with_instance_model(self, mock_request):
-        """Test chat completion uses instance model if not provided."""
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {
-            "model": "instance-model",
-            "message": {"content": "Response"},
-            "done": True,
-        }
-        mock_request.return_value = mock_response
-
-        client = OllamaClient(model="instance-model")
-        responses = client.chat_completion(messages=[{"role": "user", "content": "Hi"}])
-
-        assert responses[0].model == "instance-model"
-
-    @patch("requests.Session.request")
-    def test_chat_completion_with_explicit_model(self, mock_request):
-        """Test explicit model overrides instance model."""
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {
-            "model": "explicit-model",
-            "message": {"content": "Response"},
-            "done": True,
-        }
-        mock_request.return_value = mock_response
-
-        client = OllamaClient(model="instance-model")
-        responses = client.chat_completion(
-            messages=[{"role": "user", "content": "Hi"}], model="explicit-model"
-        )
-
-        assert responses[0].model == "explicit-model"
-
-    @patch("requests.Session.request")
-    def test_chat_completion_no_model_raises(self, mock_request):
-        """Test chat completion raises ValueError without model."""
-        client = OllamaClient()  # No instance model
-
-        with pytest.raises(ValueError, match="Model name required"):
-            client.chat_completion(messages=[{"role": "user", "content": "Hello"}])
-
-    @patch("requests.Session.request")
-    def test_chat_completion_with_options(self, mock_request):
-        """Test chat completion with generation options."""
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {
-            "model": "test-model",
-            "message": {"content": "Response"},
-            "done": True,
-        }
-        mock_request.return_value = mock_response
-
-        client = OllamaClient(model="test-model")
-        responses = client.chat_completion(
-            messages=[{"role": "user", "content": "Hi"}],
-            options={"temperature": 0.7, "top_k": 40},
-        )
-
-        assert len(responses) == 1
-
-        # Verify options were sent
-        call_kwargs = mock_request.call_args.kwargs
-        json_data = call_kwargs["json"]
-        assert json_data["options"]["temperature"] == 0.7
-        assert json_data["options"]["top_k"] == 40
-
-    @patch("requests.Session.request")
-    def test_chat_completion_with_format(self, mock_request):
-        """Test chat completion with format option."""
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {
-            "model": "test-model",
-            "message": {"content": '{"key": "value"}'},
-            "done": True,
-        }
-        mock_request.return_value = mock_response
-
-        client = OllamaClient(model="test-model")
-        responses = client.chat_completion(
-            messages=[{"role": "user", "content": "Hi"}], format="json"
-        )
-
-        assert len(responses) == 1
-
-        # Verify format was sent
-        call_kwargs = mock_request.call_args.kwargs
-        json_data = call_kwargs["json"]
-        assert json_data["format"] == "json"
-
-
-class TestOllamaClientImageToText:
-    """Test image-to-text functionality."""
-
-    @patch("requests.Session.request")
-    @patch("pathlib.Path.exists", return_value=True)
-    def test_image_to_text_basic(self, mock_exists, mock_request):
-        """Test basic image-to-text request."""
-        with patch("PIL.Image.Image.verify"):
-            mock_response = Mock()
-            mock_response.status_code = 200
-            mock_response.json.return_value = {
-                "model": "qwen2-vl:7b",
-                "response": "Extracted text from image",
-            }
-            mock_request.return_value = mock_response
-
-            # Create test image file
-            with patch("builtins.open", create=True) as mock_open:
-                mock_file = Mock()
-                mock_file.read.return_value = (
-                    b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00"
-                )  # JPEG header
-                mock_open.return_value.__enter__ = Mock(return_value=mock_file)
-                mock_open.return_value.__exit__ = Mock(return_value=False)
-
-                client = OllamaClient(model="qwen2-vl:7b")
-                result = client.image_to_text(
-                    Path("/tmp/test.jpg"), prompt="Extract text"
-                )
-
-                assert result == "Extracted text from image"
-
-    @patch("requests.Session.request")
-    def test_image_to_text_image_not_found_raises(self, mock_request):
-        """Test image_to_text raises FileNotFoundError when image doesn't exist."""
-        client = OllamaClient(model="test-model")
-
-        with pytest.raises(FileNotFoundError, match="Image file not found"):
-            client.image_to_text(Path("/nonexistent/image.jpg"), prompt="Test")
-
-    @patch("requests.Session.request")
-    @patch("pathlib.Path.exists", return_value=True)
-    def test_image_to_text_invalid_image_raises(self, mock_exists, mock_request):
-        """Test image_to_text raises ValueError for invalid image."""
-        with patch("PIL.Image.open") as mock_img_open:
-            mock_img = Mock()
-            mock_img.verify.side_effect = Exception("Invalid JPEG")
-            mock_img_open.return_value = mock_img
-
-            client = OllamaClient(model="test-model")
-
-            with pytest.raises(ValueError, match="Invalid image file"):
-                client.image_to_text(Path("/tmp/invalid.jpg"), prompt="Test")
-
-    @patch("requests.Session.request")
-    def test_image_to_text_no_model_raises(self, mock_request):
-        """Test image_to_text raises ValueError without model."""
-        client = OllamaClient()
-
-        with pytest.raises(ValueError, match="Model name required"):
-            client.image_to_text(Path("/tmp/test.jpg"), prompt="Test")
-
-
-class TestOllamaClientEmbedding:
-    """Test embedding generation."""
-
-    @patch("requests.Session.request")
-    def test_embedding_basic(self, mock_request):
-        """Test basic embedding generation."""
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {
-            "model": "nomic-embed-text",
-            "embedding": [0.1, 0.2, 0.3, 0.4, 0.5],
-        }
-        mock_request.return_value = mock_response
-
-        client = OllamaClient(model="nomic-embed-text")
-        response = client.embedding(text="Test text")
-
-        assert isinstance(response, EmbeddingResponse)
-        assert response.model == "nomic-embed-text"
-        assert response.embedding == [0.1, 0.2, 0.3, 0.4, 0.5]
-
-    @patch("requests.Session.request")
-    def test_embedding_no_model_raises(self, mock_request):
-        """Test embedding raises ValueError without model."""
-        client = OllamaClient()
-
-        with pytest.raises(ValueError, match="Model name required"):
-            client.embedding(text="Test text")
-
-
-class TestOllamaClientListModels:
-    """Test list models functionality."""
-
-    @patch("requests.Session.request")
-    def test_list_models_basic(self, mock_request):
-        """Test listing available models."""
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {
-            "models": [
-                {"name": "qwen2-vl:7b", "modified_at": "2026-11-13T10:00:00Z", "size": 4096},
-                {"name": "llava:latest", "modified_at": "2026-11-12T10:00:00Z", "size": 2048},
-            ]
-        }
-        mock_request.return_value = mock_response
-
-        client = OllamaClient()
-        models = client.list_models()
-
-        assert len(models) == 2
-        assert models[0]["name"] == "qwen2-vl:7b"
-        assert models[1]["name"] == "llava:latest"
-
-    @patch("requests.Session.request")
-    def test_list_models_empty(self, mock_request):
-        """Test listing models when none available."""
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {"models": []}
-        mock_request.return_value = mock_response
-
-        client = OllamaClient()
-        models = client.list_models()
-
-        assert models == []
-
-
 class TestOllamaClientPullModel:
     """Test model pull/download functionality."""
 
     def test_client_has_no_pull_model(self):
         """Pulls only go through ModelServerManager.ensure_model(allow_pull=True)."""
         assert not hasattr(OllamaClient(), "pull_model")
-
-
-class TestOllamaClientCheckModel:
-    """Test check model functionality."""
-
-    @patch("requests.Session.request")
-    def test_check_model_found(self, mock_request):
-        """Test check_model returns True when model exists."""
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {
-            "models": [
-                {"name": "qwen2-vl:7b", "size": 4096},
-                {"name": "llava:latest", "size": 2048},
-            ]
-        }
-        mock_request.return_value = mock_response
-
-        client = OllamaClient()
-        exists = client.check_model("qwen2-vl:7b")
-
-        assert exists is True
-
-    @patch("requests.Session.request")
-    def test_check_model_not_found(self, mock_request):
-        """Test check_model returns False when model doesn't exist."""
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {
-            "models": [{"name": "qwen2-vl:7b", "size": 4096}]
-        }
-        mock_request.return_value = mock_response
-
-        client = OllamaClient()
-        exists = client.check_model("nonexistent-model")
-
-        assert exists is False
-
-    @patch("requests.Session.request")
-    def test_check_model_no_instance_model(self, mock_request):
-        """Test check_model returns False when no model specified."""
-        client = OllamaClient()  # No instance model
-        exists = client.check_model()
-
-        assert exists is False
-
-    @patch("requests.Session.request")
-    def test_check_model_error_returns_false(self, mock_request):
-        """Test check_model returns False on API error."""
-        mock_request.side_effect = Exception("API error")
-
-        client = OllamaClient()
-        exists = client.check_model("test-model")
-
-        assert exists is False
-
-
-class TestOllamaClientHealthCheck:
-    """Test health check functionality."""
-
-    @patch("requests.Session.get")
-    def test_health_check_success(self, mock_get):
-        """Test health_check returns True when server is healthy."""
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_get.return_value = mock_response
-
-        client = OllamaClient()
-        is_healthy = client.health_check()
-
-        assert is_healthy is True
-
-    @patch("requests.Session.get")
-    def test_health_check_failure(self, mock_get):
-        """Test health_check returns False when server is unhealthy."""
-        mock_get.side_effect = Exception("Connection refused")
-
-        client = OllamaClient()
-        is_healthy = client.health_check()
-
-        assert is_healthy is False
-
-    @patch("requests.Session.get")
-    def test_health_check_timeout(self, mock_get):
-        """Test health_check returns False on timeout."""
-        mock_get.side_effect = Exception("Request timed out")
-
-        client = OllamaClient()
-        is_healthy = client.health_check()
-
-        assert is_healthy is False
 
 
 class TestOllamaClientSessionManagement:
@@ -437,105 +103,24 @@ class TestOllamaClientSessionManagement:
 
 
 class TestOllamaClientErrors:
-    """Test error handling."""
+    """Error paths of the metadata request (``get_capabilities`` -> ``_make_request``)."""
 
     @patch("requests.Session.request")
-    def test_request_http_error_raises(self, mock_request):
-        """Test HTTP errors raise RequestException."""
-        from requests.exceptions import HTTPError
+    def test_http_500_keeps_ollama_message(self, mock_request):
+        response = Mock()
+        response.status_code = 500
+        response.json.return_value = {"error": "out of memory"}
+        mock_request.return_value = response
 
-        mock_response = Mock()
-        mock_response.status_code = 404
-        mock_response.raise_for_status.side_effect = HTTPError("Not Found")
-        mock_request.return_value = mock_response
-
-        client = OllamaClient(model="test-model")
-
-        with pytest.raises(HTTPError):
-            client.chat_completion(messages=[{"role": "user", "content": "Hi"}])
+        with pytest.raises(requests.HTTPError, match="HTTP 500: out of memory"):
+            OllamaClient().get_capabilities("test-model")
 
     @patch("requests.Session.request")
-    def test_request_timeout(self, mock_request):
-        """Test request timeout raises exception."""
-        from requests.exceptions import Timeout
+    def test_request_timeout_propagates(self, mock_request):
+        mock_request.side_effect = requests.Timeout("Request timed out")
 
-        mock_request.side_effect = Timeout("Request timed out")
-
-        client = OllamaClient(model="test-model")
-
-        with pytest.raises(Timeout):
-            client.list_models()
-
-
-class TestOllamaClientConvenienceFunction:
-    """Test get_ollama_client convenience function."""
-
-    def test_get_ollama_client_basic(self):
-        """Test get_ollama_client creates configured client."""
-        client = get_ollama_client()
-
-        assert isinstance(client, OllamaClient)
-        assert client.base_url == "http://localhost:11434"
-        assert client.timeout == 30
-
-    def test_get_ollama_client_with_params(self):
-        """Test get_ollama_client with custom parameters."""
-        client = get_ollama_client(
-            base_url="http://custom:9999", timeout=60, model="test-model"
-        )
-
-        assert client.base_url == "http://custom:9999"
-        assert client.timeout == 60
-        assert client.model == "test-model"
-
-
-class TestChatCompletionResponse:
-    """Test ChatCompletionResponse dataclass."""
-
-    def test_response_dataclass_fields(self):
-        """Test ChatCompletionResponse has correct fields."""
-        response = ChatCompletionResponse(
-            message="Test message",
-            model="test-model",
-            done=True,
-            prompt_eval_count=10,
-            prompt_eval_duration=100,
-            eval_count=5,
-            eval_duration=50,
-        )
-
-        assert response.message == "Test message"
-        assert response.model == "test-model"
-        assert response.done is True
-        assert response.prompt_eval_count == 10
-        assert response.prompt_eval_duration == 100
-        assert response.eval_count == 5
-        assert response.eval_duration == 50
-
-    def test_response_defaults(self):
-        """Test ChatCompletionResponse default values."""
-        response = ChatCompletionResponse(
-            message="Test", model="test-model"
-        )
-
-        assert response.done is True
-        assert response.prompt_eval_count == 0
-        assert response.prompt_eval_duration == 0
-        assert response.eval_count == 0
-        assert response.eval_duration == 0
-
-
-class TestEmbeddingResponse:
-    """Test EmbeddingResponse dataclass."""
-
-    def test_embedding_dataclass_fields(self):
-        """Test EmbeddingResponse has correct fields."""
-        response = EmbeddingResponse(
-            embedding=[0.1, 0.2, 0.3], model="nomic-embed-text"
-        )
-
-        assert response.embedding == [0.1, 0.2, 0.3]
-        assert response.model == "nomic-embed-text"
+        with pytest.raises(requests.Timeout):
+            OllamaClient().get_capabilities("test-model")
 
 
 # ---------------------------------------------------------------------------
@@ -644,8 +229,7 @@ class TestOllamaClientCapabilities:
         client = OllamaClient()
 
         assert client.get_capabilities("m") == {"completion", "vision", "thinking"}
-        assert client.supports_vision("m") is True
-        assert client.supports_thinking("m") is True
+        assert client.get_capabilities("m") == {"completion", "vision", "thinking"}  # cached
         assert mock_request.call_count == 1
         assert mock_request.call_args.kwargs["json"] == {"model": "m"}
         assert mock_request.call_args.kwargs["timeout"] == 30
@@ -708,7 +292,7 @@ class TestOllamaClientChatWithImages:
         assert len(user["images"]) == 2
         assert max(_decode(user["images"][0]).size) == 1280
 
-        assert result == VisionChatResult(
+        assert result == ChatResult(
             content='{"name": "Blood Oath"}',
             thinking="",
             model="qwen3.6:35b-a3b",
@@ -816,14 +400,320 @@ class TestOllamaClientChatWithImages:
 
 class TestOllamaClientMakeRequestErrors:
     @patch("requests.Session.request")
-    def test_http_error_message_preserved(self, mock_request):
+    def test_404_is_model_unavailable(self, mock_request):
         mock_request.return_value = _http(404, {"error": "model 'x' not found"})
-        with pytest.raises(requests.HTTPError, match="HTTP 404: model 'x' not found") as exc_info:
-            OllamaClient().list_models()
-        assert exc_info.value.response.status_code == 404
+        with pytest.raises(VisionModelUnavailableError, match="not installed") as exc_info:
+            OllamaClient().get_capabilities("x")
+        assert isinstance(exc_info.value.__cause__, requests.HTTPError)
+        assert exc_info.value.__cause__.response.status_code == 404
+
+    @patch("requests.Session.request")
+    def test_500_is_http_error_with_message(self, mock_request):
+        mock_request.return_value = _http(500, {"error": "model 'x' failed to load"})
+        with pytest.raises(requests.HTTPError, match="HTTP 500: model 'x' failed to load"):
+            OllamaClient().get_capabilities("x")
 
 
-def test_get_ollama_client_passes_vision_timeouts():
-    client = get_ollama_client(generate_timeout=42.0, connect_timeout=2.0)
+def test_client_vision_timeouts():
+    client = OllamaClient(generate_timeout=42.0, connect_timeout=2.0)
     assert client.generate_timeout == 42.0
     assert client.connect_timeout == 2.0
+
+
+# ---------------------------------------------------------------------------
+# Text: chat_text, think handling, error mapping, sessions
+# ---------------------------------------------------------------------------
+
+GPT_OSS_CAPS = _http(200, {"capabilities": ["completion", "tools", "thinking"]})
+TEXT_OK = {
+    "model": "gpt-oss:120b",
+    "message": {"role": "assistant", "content": '{"claims": []}', "thinking": "Checking the page..."},
+    "done_reason": "stop",
+    "prompt_eval_count": 4000,
+    "eval_count": 389,
+    "load_duration": 24_000_000_000,
+    "total_duration": 27_000_000_000,
+}
+
+
+def _chat_payload(mock_request) -> dict:
+    chat_calls = [c for c in mock_request.call_args_list if c.args[1].endswith("/api/chat")]
+    assert chat_calls, "no /api/chat request was sent"
+    return chat_calls[-1].kwargs["json"]
+
+
+class TestChatText:
+    @patch("requests.Session.request")
+    def test_payload_has_no_images_and_passes_options(self, mock_request):
+        mock_request.side_effect = _router(show=GPT_OSS_CAPS, chat=_http(200, TEXT_OK))
+        options = {"temperature": 0, "num_ctx": 16384, "num_predict": 6144}
+
+        result = OllamaClient().chat_text(
+            "Extract the claims",
+            model="gpt-oss:120b",
+            system="Quote verbatim",
+            format=SCHEMA,
+            think="high",
+            options=options,
+            keep_alive="10m",
+            read_timeout=900,
+        )
+
+        payload = _chat_payload(mock_request)
+        assert payload["model"] == "gpt-oss:120b"
+        assert payload["stream"] is False
+        assert payload["messages"] == [
+            {"role": "system", "content": "Quote verbatim"},
+            {"role": "user", "content": "Extract the claims"},
+        ]
+        assert all("images" not in m for m in payload["messages"])
+        assert payload["format"] == SCHEMA
+        assert payload["options"] == options
+        assert payload["keep_alive"] == "10m"
+        assert payload["think"] == "high"
+        assert mock_request.call_args.kwargs["timeout"] == (10.0, 900)
+        assert result == ChatResult(
+            content='{"claims": []}',
+            thinking="Checking the page...",
+            model="gpt-oss:120b",
+            done_reason="stop",
+            prompt_eval_count=4000,
+            eval_count=389,
+            load_duration_s=24.0,
+            total_duration_s=27.0,
+        )
+
+    @patch("requests.Session.request")
+    def test_defaults(self, mock_request):
+        mock_request.side_effect = _router(show=GPT_OSS_CAPS, chat=_http(200, TEXT_OK))
+        OllamaClient(model="gpt-oss:120b").chat_text("p")
+        payload = _chat_payload(mock_request)
+        assert payload["keep_alive"] == "5m"
+        assert "think" not in payload  # None leaves the model default
+        assert "format" not in payload
+        assert "options" not in payload
+        assert payload["messages"] == [{"role": "user", "content": "p"}]
+        assert mock_request.call_args.kwargs["timeout"] == (10.0, 600.0)
+
+    @patch("requests.Session.request")
+    def test_keep_alive_none_omitted(self, mock_request):
+        mock_request.side_effect = _router(show=GPT_OSS_CAPS, chat=_http(200, TEXT_OK))
+        OllamaClient(model="gpt-oss:120b").chat_text("p", keep_alive=None)
+        assert "keep_alive" not in _chat_payload(mock_request)
+
+    @patch("requests.Session.request")
+    def test_think_level_needs_thinking_capability(self, mock_request):
+        mock_request.side_effect = _router(
+            show=_http(200, {"capabilities": ["completion"]}), chat=_http(200, TEXT_OK)
+        )
+        OllamaClient(model="llama3.1").chat_text("p", think="high")
+        assert "think" not in _chat_payload(mock_request)
+
+    @pytest.mark.parametrize("think,expected", [(False, "low"), (True, "medium"), ("high", "high")])
+    @patch("requests.Session.request")
+    def test_gpt_oss_bool_maps_to_level(self, mock_request, think, expected):
+        mock_request.side_effect = _router(show=GPT_OSS_CAPS, chat=_http(200, TEXT_OK))
+        OllamaClient(model="gpt-oss:20b").chat_text("p", think=think)
+        assert _chat_payload(mock_request)["think"] == expected
+
+    @patch("requests.Session.request")
+    def test_other_thinking_model_gets_bool(self, mock_request):
+        mock_request.side_effect = _router(
+            show=_http(200, {"capabilities": ["completion", "thinking"]}), chat=_http(200, TEXT_OK)
+        )
+        OllamaClient(model="qwen3:32b").chat_text("p", think=False)
+        assert _chat_payload(mock_request)["think"] is False
+
+    def test_invalid_think_level_rejected(self):
+        with pytest.raises(ValueError, match="think must be"):
+            resolve_think("max", "gpt-oss:120b", {"thinking"})
+
+    @patch("requests.Session.request")
+    def test_model_without_completion_rejected(self, mock_request):
+        mock_request.side_effect = _router(show=_http(200, {"capabilities": ["embedding"]}))
+        with pytest.raises(TextModelUnavailableError, match="'completion'"):
+            OllamaClient().chat_text("p", model="nomic-embed-text")
+        assert all(not c.args[1].endswith("/api/chat") for c in mock_request.call_args_list)
+
+    @patch("requests.Session.request")
+    def test_missing_model_is_text_unavailable(self, mock_request):
+        mock_request.side_effect = _router(show=_http(404, {"error": "model 'gpt-oss:120b' not found"}))
+        with pytest.raises(TextModelUnavailableError, match="not installed"):
+            OllamaClient().chat_text("p", model="gpt-oss:120b")
+
+    @patch("requests.Session.request")
+    def test_capability_read_failure_is_advisory(self, mock_request):
+        mock_request.side_effect = _router(show=_http(500, {"error": "busy"}), chat=_http(200, TEXT_OK))
+        result = OllamaClient(model="gpt-oss:120b").chat_text("p", think="high")
+        assert result.content == '{"claims": []}'
+        assert "think" not in _chat_payload(mock_request)  # capability unknown
+
+    def test_requires_model(self):
+        with pytest.raises(ValueError, match="Model name required"):
+            OllamaClient().chat_text("p")
+
+    @patch("requests.Session.request")
+    def test_connection_error(self, mock_request):
+        mock_request.side_effect = _router(show=GPT_OSS_CAPS, chat=requests.ConnectionError("refused"))
+        with pytest.raises(OllamaConnectionError, match="Cannot reach Ollama"):
+            OllamaClient(model="gpt-oss:120b").chat_text("p")
+
+    @patch("requests.Session.request")
+    def test_non_json_200_body(self, mock_request):
+        mock_request.side_effect = _router(show=GPT_OSS_CAPS, chat=_http(200, None, text="<html>"))
+        with pytest.raises(TextAnalysisError, match="non-JSON"):
+            OllamaClient(model="gpt-oss:120b").chat_text("p")
+
+
+class TestChatErrorMapping:
+    """HTTP status / exception -> error class, for vision and text alike."""
+
+    @staticmethod
+    def _call(kind, tmp_path):
+        client = OllamaClient(model="m")
+        if kind == "vision":
+            return client.chat_with_images("p", [_jpeg(tmp_path / "x.jpg")])
+        return client.chat_text("p")
+
+    ERRORS = {
+        "vision": {
+            "transient": VisionTransientError,
+            "analysis": VisionAnalysisError,
+            "unavailable": VisionModelUnavailableError,
+            "timeout": VisionTimeoutError,
+        },
+        "text": {
+            "transient": TextTransientError,
+            "analysis": TextAnalysisError,
+            "unavailable": TextModelUnavailableError,
+            "timeout": TextTimeoutError,
+        },
+    }
+
+    @pytest.mark.parametrize("kind", ["vision", "text"])
+    @pytest.mark.parametrize("status", [500, 502, 503, 429, 408])
+    @patch("requests.Session.request")
+    def test_transient_statuses(self, mock_request, status, kind, tmp_path):
+        mock_request.side_effect = _router(chat=_http(status, {"error": "busy"}))
+        with pytest.raises(self.ERRORS[kind]["transient"], match=f"HTTP {status}"):
+            self._call(kind, tmp_path)
+
+    @pytest.mark.parametrize("kind", ["vision", "text"])
+    @patch("requests.Session.request")
+    def test_generic_request_exception_is_transient(self, mock_request, kind, tmp_path):
+        mock_request.side_effect = _router(chat=requests.exceptions.ChunkedEncodingError("cut"))
+        with pytest.raises(self.ERRORS[kind]["transient"], match="request failed"):
+            self._call(kind, tmp_path)
+
+    @pytest.mark.parametrize("kind", ["vision", "text"])
+    @patch("requests.Session.request")
+    def test_400_is_analysis_error_not_transient(self, mock_request, kind, tmp_path):
+        mock_request.side_effect = _router(chat=_http(400, {"error": "invalid format schema"}))
+        with pytest.raises(self.ERRORS[kind]["analysis"], match="HTTP 400") as exc_info:
+            self._call(kind, tmp_path)
+        assert not isinstance(exc_info.value, self.ERRORS[kind]["transient"])
+
+    @pytest.mark.parametrize("kind", ["vision", "text"])
+    @patch("requests.Session.request")
+    def test_404_is_unavailable(self, mock_request, kind, tmp_path):
+        mock_request.side_effect = _router(chat=_http(404, {"error": "model 'm' not found"}))
+        with pytest.raises(self.ERRORS[kind]["unavailable"], match="is not usable"):
+            self._call(kind, tmp_path)
+
+    @pytest.mark.parametrize("kind", ["vision", "text"])
+    @patch("requests.Session.request")
+    def test_read_timeout(self, mock_request, kind, tmp_path):
+        mock_request.side_effect = _router(chat=requests.ReadTimeout("slow"))
+        with pytest.raises(self.ERRORS[kind]["timeout"], match="did not respond within 600s"):
+            self._call(kind, tmp_path)
+
+    @pytest.mark.parametrize("kind", ["vision", "text"])
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {"model": "m", "message": "not a dict"},
+            {"model": "m", "message": {"content": "x"}, "eval_count": "many"},
+        ],
+    )
+    @patch("requests.Session.request")
+    def test_malformed_200_body_is_analysis_error(self, mock_request, body, kind, tmp_path):
+        mock_request.side_effect = _router(chat=_http(200, body))
+        with pytest.raises(self.ERRORS[kind]["analysis"], match="malformed"):
+            self._call(kind, tmp_path)
+
+    def test_exception_hierarchy(self):
+        assert issubclass(VisionTransientError, VisionAnalysisError)
+        for cls in (TextResponseError, TextTimeoutError, TextTransientError):
+            assert issubclass(cls, TextAnalysisError)
+        for cls in (TextAnalysisError, TextModelUnavailableError, TextResponseError,
+                    TextTimeoutError, TextTransientError):
+            assert cls not in FATAL_MODEL_ERRORS
+            assert not issubclass(cls, FATAL_MODEL_ERRORS)
+
+
+class TestThinkResolution:
+    @pytest.mark.parametrize(
+        "model,expected",
+        [
+            ("gpt-oss:120b", True),
+            ("gpt-oss:20b", True),
+            ("GPT-OSS", True),
+            ("registry.ollama.ai/library/gpt-oss:120b", True),
+            ("qwen3.6:35b-a3b", False),
+            ("my-gpt-oss", False),
+        ],
+    )
+    def test_gpt_oss_family(self, model, expected):
+        assert is_gpt_oss_model(model) is expected
+
+    def test_none_or_no_thinking_capability_omits(self):
+        assert resolve_think(None, "gpt-oss:120b", {"thinking"}) is None
+        assert resolve_think("high", "gpt-oss:120b", {"completion"}) is None
+        assert resolve_think(True, "qwen3:32b", None) is None
+        assert resolve_think(True, "qwen3:32b", set()) is None
+
+    def test_levels_and_bools(self):
+        caps = {"completion", "thinking"}
+        assert resolve_think("low", "qwen3:32b", caps) == "low"
+        assert resolve_think(True, "qwen3:32b", caps) is True
+        assert resolve_think(False, "gpt-oss:120b", caps) == "low"
+        assert resolve_think(True, "gpt-oss:120b", caps) == "medium"
+
+
+class TestSessionsPerThread:
+    def test_threads_get_distinct_sessions_and_close_closes_all(self):
+        import threading
+
+        client = OllamaClient()
+        main = client.session
+        assert client.session is main  # stable within a thread
+        seen = {}
+
+        def grab(key):
+            seen[key] = client.session
+
+        threads = [threading.Thread(target=grab, args=(i,)) for i in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        sessions = [main, seen[0], seen[1]]
+        assert len({id(s) for s in sessions}) == 3
+        with patch("requests.Session.close", autospec=True) as close:
+            client.close()
+        closed = {id(call.args[0]) for call in close.call_args_list}
+        assert closed == {id(s) for s in sessions}
+
+    def test_sessions_mount_pool_of_ten(self):
+        adapter = OllamaClient().session.get_adapter("http://localhost:11434")
+        assert adapter._pool_maxsize == 10
+
+    def test_injected_session_is_used_and_closed(self):
+        client = OllamaClient()
+        fake = Mock()
+        fake.request.return_value = _http(200, {"capabilities": ["vision"]})
+        client.session = fake
+        assert client.get_capabilities("m") == {"vision"}
+        client.close()
+        fake.close.assert_called_once()

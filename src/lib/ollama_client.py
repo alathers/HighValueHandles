@@ -1,27 +1,40 @@
 """Ollama REST API client wrapper.
 
-Provides a Pythonic interface to Ollama's local LLM server, including the
-multi-image vision call used for label extraction (``chat_with_images``).
+Provides a Pythonic interface to Ollama's local LLM server: the multi-image
+vision call used for label extraction (``chat_with_images``) and the
+text-only call used by the fact-check stage (``chat_text``). Both share one
+request path (``_post_chat``) and differ only in the capability they require
+and the exception family they raise (``Vision*`` or ``Text*``).
+
+The client is safe to share between threads: each thread gets its own
+``requests.Session``.
 """
 
 import base64
 import io
-import json
 import logging
+import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 import requests
 from PIL import Image as PILImage
 from PIL import ImageOps
+from requests.adapters import HTTPAdapter
 
 from lib.exceptions import (
+    AIModelError,
     OllamaConnectionError,
+    TextAnalysisError,
+    TextModelUnavailableError,
+    TextTimeoutError,
+    TextTransientError,
     VisionAnalysisError,
     VisionModelUnavailableError,
     VisionTimeoutError,
+    VisionTransientError,
 )
 
 try:  # Optional HEIC/HEIF support (iPhone photos); the scanner accepts .heic.
@@ -41,11 +54,20 @@ DEFAULT_CONNECT_TIMEOUT = 10.0
 DEFAULT_MAX_IMAGE_EDGE = 1280
 #: Ollama error texts meaning the model itself cannot be used on this server.
 _MODEL_UNUSABLE_MARKERS = ("not found", "no longer compatible", "does not support")
+#: HTTP statuses after which repeating the same request may succeed.
+_TRANSIENT_STATUSES = frozenset({408, 429})
+#: Think levels Ollama accepts as strings (gpt-oss accepts only these).
+THINK_LEVELS: tuple[str, ...] = ("low", "medium", "high")
+#: Connection pool size per session (matches the maximum ``--concurrency``).
+_POOL_MAXSIZE = 10
+
+#: Type of the ``think`` argument: a switch, a level, or None (model default).
+ThinkSetting = Union[bool, Literal["low", "medium", "high"], None]
 
 
 @dataclass
-class VisionChatResult:
-    """Result of one ``chat_with_images`` call.
+class ChatResult:
+    """Result of one ``chat_with_images`` or ``chat_text`` call.
 
     Attributes:
         content: The assistant message text (the model's answer).
@@ -66,6 +88,85 @@ class VisionChatResult:
     eval_count: int = 0
     load_duration_s: float = 0.0
     total_duration_s: float = 0.0
+
+
+def is_gpt_oss_model(model: str) -> bool:
+    """Whether ``model`` belongs to the gpt-oss family (accepts only think levels).
+
+    The registry host and namespace are ignored, so ``gpt-oss:120b`` and
+    ``registry.ollama.ai/library/gpt-oss:20b`` both match.
+    """
+    base = str(model or "").strip().lower().rsplit("/", 1)[-1]
+    return base.startswith("gpt-oss")
+
+
+def resolve_think(think: ThinkSetting, model: str, caps: Optional[set[str]]) -> Union[bool, str, None]:
+    """The ``think`` value to send for ``model``, or None to omit the field.
+
+    - None, or a model that does not report the ``thinking`` capability
+      (unknown capabilities included): omitted. Thinking models otherwise
+      spend the whole output budget reasoning.
+    - A level string (``'low'|'medium'|'high'``): sent as-is.
+    - A bool for a gpt-oss model, which ignores bools: False maps to
+      ``'low'`` (it cannot turn thinking off) and True to ``'medium'``.
+    - Any other bool: sent unchanged.
+
+    Args:
+        think: Requested setting.
+        model: Model name.
+        caps: Capabilities the server reported (None or empty if unknown).
+
+    Returns:
+        The payload value, or None to leave ``think`` out.
+
+    Raises:
+        ValueError: If ``think`` is a string that is not a known level.
+    """
+    if isinstance(think, str):
+        if think not in THINK_LEVELS:
+            raise ValueError(f"think must be a bool or one of {THINK_LEVELS}, got {think!r}")
+    elif think is not None and not isinstance(think, bool):
+        raise ValueError(f"think must be a bool or one of {THINK_LEVELS}, got {think!r}")
+    if think is None or not caps or "thinking" not in caps:
+        return None
+    if isinstance(think, str):
+        return think
+    if is_gpt_oss_model(model):
+        return "medium" if think else "low"
+    return bool(think)
+
+
+@dataclass(frozen=True)
+class _ErrorSet:
+    """Exception classes one kind of chat call raises (vision or text)."""
+
+    kind: str
+    unavailable: type[AIModelError]
+    analysis: type[AIModelError]
+    timeout: type[AIModelError]
+    transient: type[AIModelError]
+    capability: str
+    timeout_hint: str
+
+
+_VISION_ERRORS = _ErrorSet(
+    kind="Vision",
+    unavailable=VisionModelUnavailableError,
+    analysis=VisionAnalysisError,
+    timeout=VisionTimeoutError,
+    transient=VisionTransientError,
+    capability="vision",
+    timeout_hint="increase --request-timeout",
+)
+_TEXT_ERRORS = _ErrorSet(
+    kind="Text",
+    unavailable=TextModelUnavailableError,
+    analysis=TextAnalysisError,
+    timeout=TextTimeoutError,
+    transient=TextTransientError,
+    capability="completion",
+    timeout_hint="increase --text-timeout",
+)
 
 
 def prepare_image_b64(path: Path, max_edge: int = DEFAULT_MAX_IMAGE_EDGE, quality: int = 85) -> str:
@@ -106,40 +207,26 @@ def prepare_image_b64(path: Path, max_edge: int = DEFAULT_MAX_IMAGE_EDGE, qualit
     return base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
-@dataclass
-class ChatCompletionResponse:
-    """Response from Ollama chat completion."""
-
-    message: str
-    model: str
-    done: bool = True
-    prompt_eval_count: int = 0
-    prompt_eval_duration: int = 0
-    eval_count: int = 0
-    eval_duration: int = 0
-
-
-@dataclass
-class EmbeddingResponse:
-    """Response from Ollama embedding."""
-
-    embedding: List[float]
-    model: str
-
-
 class OllamaClient:
-    """Wrapper for Ollama REST API.
+    """Wrapper for the parts of the Ollama REST API the pipeline uses.
 
-    Provides methods for chat completion, image-to-text with vision models,
-    and embeddings. Designed for local LLM hosting via Ollama.
+    ``get_capabilities`` (``POST /api/show``), the multi-image vision call
+    ``chat_with_images`` and the text-only call ``chat_text`` (both
+    ``POST /api/chat``). Model management (pulls, listing, health, loading
+    and unloading) lives in :mod:`lib.model_server` /
+    :mod:`lib.model_availability`.
+
+    Each thread uses its own ``requests.Session`` (see :attr:`session`), so
+    one client can serve parallel OCR/vision workers; :meth:`close` closes
+    every session the client created.
 
     Attributes:
         base_url: Ollama server URL (default: http://localhost:11434)
         timeout: Request timeout in seconds for metadata endpoints (default: 30)
         model: Default model to use for requests
-        generate_timeout: Read timeout in seconds for vision calls (default: 600),
+        generate_timeout: Read timeout in seconds for chat calls (default: 600),
             long enough for a cold model load
-        connect_timeout: Connect timeout in seconds for vision calls (default: 10)
+        connect_timeout: Connect timeout in seconds for chat calls (default: 10)
     """
 
     def __init__(
@@ -156,16 +243,54 @@ class OllamaClient:
             base_url: Ollama server URL.
             timeout: Request timeout in seconds (metadata endpoints).
             model: Default model to use.
-            generate_timeout: Read timeout in seconds for ``chat_with_images``.
-            connect_timeout: Connect timeout in seconds for ``chat_with_images``.
+            generate_timeout: Read timeout in seconds for chat calls.
+            connect_timeout: Connect timeout in seconds for chat calls.
         """
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.model = model
         self.generate_timeout = generate_timeout
         self.connect_timeout = connect_timeout
-        self.session = requests.Session()
+        self._local = threading.local()
+        self._sessions: List[requests.Session] = []
+        self._sessions_lock = threading.Lock()
         self._capabilities: Dict[str, set[str]] = {}
+        self._capabilities_lock = threading.Lock()
+        _ = self.session  # the constructing thread's session exists from the start
+
+    # -- sessions ----------------------------------------------------------
+
+    @staticmethod
+    def _new_session() -> requests.Session:
+        session = requests.Session()
+        adapter = HTTPAdapter(pool_maxsize=_POOL_MAXSIZE)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        return session
+
+    def _track(self, session: Any) -> None:  # noqa: ANN401
+        with self._sessions_lock:
+            if not any(s is session for s in self._sessions):
+                self._sessions.append(session)
+
+    @property
+    def session(self) -> requests.Session:
+        """The calling thread's HTTP session (created on first use)."""
+        session = getattr(self._local, "session", None)
+        if session is None:
+            session = self._new_session()
+            self._local.session = session
+            self._track(session)
+        return session
+
+    @session.setter
+    def session(self, value: Any) -> None:  # noqa: ANN401
+        """Replace the calling thread's session (tests inject fakes this way)."""
+        self._local.session = value
+        if value is not None:
+            self._track(value)
+
+    # -- metadata ----------------------------------------------------------
 
     @staticmethod
     def _error_text(response: Any) -> str:  # noqa: ANN401
@@ -232,134 +357,6 @@ class OllamaClient:
         logger.debug("Ollama API response: %s %s - Status: %s", method, endpoint, response.status_code)
         return response.json()
 
-    def chat_completion(
-        self,
-        messages: List[Dict[str, str]],
-        model: Optional[str] = None,
-        stream: bool = False,
-        format: Optional[str] = None,
-        options: Optional[Dict[str, Any]] = None,
-    ) -> List[ChatCompletionResponse]:
-        """Generate chat completion.
-
-        Args:
-            messages: List of message dicts with 'role' and 'content' keys.
-            model: Model name (uses instance default if None).
-            stream: Whether to stream responses.
-            format: Response format ('json' for JSON output).
-            options: Generation options (temperature, top_k, etc.).
-
-        Returns:
-            List of ChatCompletionResponse objects (multiple if streaming).
-
-        Raises:
-            requests.RequestException: If request fails.
-            ValueError: If response format invalid.
-        """
-        model = model or self.model
-        if not model:
-            raise ValueError("Model name required (not set in instance or call)")
-
-        payload = {
-            "model": model,
-            "messages": messages,
-            "stream": stream,
-        }
-
-        if format:
-            payload["format"] = format
-        if options:
-            payload["options"] = options
-
-        response = self._make_request("/api/chat", json_data=payload)
-
-        if stream:
-            responses = []
-            for line in response.splitlines():
-                if line.strip():
-                    chunk = json.loads(line)
-                    if chunk.get("done", True) or chunk.get("message"):
-                        responses.append(
-                            ChatCompletionResponse(
-                                message=chunk.get("message", {}).get("content", ""),
-                                model=chunk.get("model", model),
-                                done=chunk.get("done", True),
-                                prompt_eval_count=chunk.get("prompt_eval_count", 0),
-                                prompt_eval_duration=chunk.get("prompt_eval_duration", 0),
-                                eval_count=chunk.get("eval_count", 0),
-                                eval_duration=chunk.get("eval_duration", 0),
-                            )
-                        )
-            return responses
-        else:
-            return [
-                ChatCompletionResponse(
-                    message=response.get("message", {}).get("content", ""),
-                    model=response.get("model", model),
-                    done=response.get("done", True),
-                    prompt_eval_count=response.get("prompt_eval_count", 0),
-                    prompt_eval_duration=response.get("prompt_eval_duration", 0),
-                    eval_count=response.get("eval_count", 0),
-                    eval_duration=response.get("eval_duration", 0),
-                )
-            ]
-
-    def image_to_text(
-        self,
-        image_path: Path,
-        prompt: str,
-        model: Optional[str] = None,
-        detail: str = "high",
-        format: Optional[str] = None,
-    ) -> str:
-        """Extract text from image using vision model (legacy single-image call).
-
-        Kept for compatibility; the bottle analyzer uses ``chat_with_images``,
-        which sends several downscaled images, a JSON schema and ``think``.
-
-        Args:
-            image_path: Path to image file.
-            prompt: Text prompt for the model.
-            model: Vision model name (uses instance default if None).
-            detail: Image detail level ('low', 'medium', 'high').
-            format: Response format ('json' for structured output; default none).
-
-        Returns:
-            Extracted text as string.
-
-        Raises:
-            requests.RequestException: If request fails.
-            ValueError: If image file invalid or response format invalid.
-            FileNotFoundError: If image file not found.
-        """
-        model = model or self.model
-        if not model:
-            raise ValueError("Model name required (not set in instance or call)")
-
-        if not image_path.exists():
-            raise FileNotFoundError(f"Image file not found: {image_path}")
-
-        # Load and validate image
-        try:
-            with PILImage.open(image_path) as img:
-                img.verify()
-        except Exception as e:
-            raise ValueError(f"Invalid image file: {e}")
-
-        # Prepare request
-        payload = {
-            "model": model,
-            "prompt": prompt,
-            "images": [self._encode_image(image_path)],
-            "stream": False,
-        }
-
-        if format:
-            payload["format"] = format
-
-        response = self._make_request("/api/generate", json_data=payload)
-        return response.get("response", "")
-
     def get_capabilities(self, model: str) -> set[str]:
         """Capabilities Ollama reports for an installed model (cached per model).
 
@@ -374,8 +371,10 @@ class OllamaClient:
             VisionModelUnavailableError: If the model is not installed (HTTP 404).
             requests.RequestException: If the request fails otherwise.
         """
-        if model in self._capabilities:
-            return self._capabilities[model]
+        with self._capabilities_lock:
+            cached = self._capabilities.get(model)
+        if cached is not None:
+            return cached
         try:
             body = self._make_request("/api/show", json_data={"model": model})
         except requests.HTTPError as e:
@@ -386,115 +385,87 @@ class OllamaClient:
             raise
         caps = body.get("capabilities") if isinstance(body, dict) else None
         result = {str(c).lower() for c in caps} if isinstance(caps, list) else set()
-        self._capabilities[model] = result
+        with self._capabilities_lock:
+            self._capabilities[model] = result
         return result
 
-    def supports_vision(self, model: str) -> bool:
-        """Whether the model accepts images.
+    def _required_capabilities(self, model: str, errors: _ErrorSet) -> Optional[set[str]]:
+        """Read ``model``'s capabilities and require ``errors.capability``.
 
-        Args:
-            model: Installed model name.
-
-        Returns:
-            True if Ollama reports the ``vision`` capability.
-        """
-        return "vision" in self.get_capabilities(model)
-
-    def supports_thinking(self, model: str) -> bool:
-        """Whether the model accepts the ``think`` switch.
-
-        Args:
-            model: Installed model name.
+        A failed capability read is advisory (the chat call decides), except
+        that a missing model or an unreachable server raises right away.
 
         Returns:
-            True if Ollama reports the ``thinking`` capability.
-        """
-        return "thinking" in self.get_capabilities(model)
-
-    def chat_with_images(
-        self,
-        prompt: str,
-        image_paths: Sequence[Path],
-        model: Optional[str] = None,
-        *,
-        system: Optional[str] = None,
-        format: Optional[Union[str, Dict[str, Any]]] = None,
-        think: Optional[bool] = False,
-        options: Optional[Dict[str, Any]] = None,
-        keep_alive: Optional[Union[str, int]] = "30m",
-        max_image_edge: int = DEFAULT_MAX_IMAGE_EDGE,
-        read_timeout: Optional[float] = None,
-    ) -> VisionChatResult:
-        """Ask a vision model about one or more images via ``POST /api/chat``.
-
-        All images go into one user message, each orientation-corrected,
-        downscaled to ``max_image_edge`` and JPEG-encoded. ``think`` is only sent
-        when the model reports the ``thinking`` capability: thinking models
-        otherwise spend the whole output budget reasoning and return no content.
-
-        Args:
-            prompt: User message text.
-            image_paths: Images to attach (at least one).
-            model: Model name (uses instance default if None).
-            system: Optional system message.
-            format: ``'json'`` or a JSON-schema dict constraining the output.
-            think: Thinking switch; None leaves the model default.
-            options: Generation options (temperature, num_ctx, num_predict, ...).
-            keep_alive: How long Ollama keeps the model loaded afterwards.
-            max_image_edge: Long-edge limit in pixels (0 keeps full size).
-            read_timeout: Read timeout in seconds (default: ``generate_timeout``).
-
-        Returns:
-            VisionChatResult with the answer and token/timing statistics.
+            The capabilities, or None if they could not be read.
 
         Raises:
-            ValueError: If no model is set, no image is given or an image is invalid.
-            FileNotFoundError: If an image file does not exist.
-            VisionModelUnavailableError: If the model is missing, incompatible
-                with this Ollama, or cannot take images.
+            errors.unavailable: If the model is missing or lacks the capability.
             OllamaConnectionError: If Ollama cannot be reached.
-            VisionTimeoutError: If no response arrives within the read timeout.
-            VisionAnalysisError: For any other HTTP or protocol error.
         """
-        model = model or self.model
-        if not model:
-            raise ValueError("Model name required (not set in instance or call)")
-        paths = [Path(p) for p in image_paths]
-        if not paths:
-            raise ValueError("At least one image is required")
-
         caps: Optional[set[str]] = None
         try:
             caps = self.get_capabilities(model)
-        except VisionModelUnavailableError:
-            raise
+        except VisionModelUnavailableError as e:
+            if errors.unavailable is VisionModelUnavailableError:
+                raise
+            raise errors.unavailable(str(e)) from e
         except requests.ConnectionError as e:
             raise OllamaConnectionError(f"Cannot reach Ollama at {self.base_url}: {e}") from e
         except Exception as e:  # capabilities are advisory; the chat call decides
             logger.debug("Could not read capabilities of %s: %s", model, e)
-        if caps and "vision" not in caps:
-            raise VisionModelUnavailableError(
-                f"Model '{model}' does not support image input (capabilities: {sorted(caps)})"
+        if caps and errors.capability not in caps:
+            what = "image input" if errors.capability == "vision" else f"'{errors.capability}'"
+            raise errors.unavailable(
+                f"Model '{model}' does not support {what} (capabilities: {sorted(caps)})"
             )
+        return caps
 
-        images = [prepare_image_b64(p, max_image_edge) for p in paths]
-        messages: List[Dict[str, Any]] = []
-        if system:
-            messages.append({"role": "system", "content": system})
-        messages.append({"role": "user", "content": prompt, "images": images})
+    # -- chat --------------------------------------------------------------
 
+    @staticmethod
+    def _build_payload(
+        model: str,
+        messages: List[Dict[str, Any]],
+        caps: Optional[set[str]],
+        *,
+        format: Optional[Union[str, Dict[str, Any]]],
+        think: ThinkSetting,
+        options: Optional[Dict[str, Any]],
+        keep_alive: Optional[Union[str, int]],
+    ) -> Dict[str, Any]:
         payload: Dict[str, Any] = {"model": model, "stream": False, "messages": messages}
-        if think is not None and caps and "thinking" in caps:
-            payload["think"] = bool(think)
+        think_value = resolve_think(think, model, caps)
+        if think_value is not None:
+            payload["think"] = think_value
         if format is not None:
             payload["format"] = format
         if options:
             payload["options"] = dict(options)
         if keep_alive is not None:
             payload["keep_alive"] = keep_alive
+        return payload
 
-        read = read_timeout if read_timeout is not None else self.generate_timeout
-        logger.debug("Ollama API request: POST /api/chat (%s, %d image(s))", model, len(images))
+    def _post_chat(
+        self, payload: Dict[str, Any], model: str, read: float, *, errors: _ErrorSet
+    ) -> ChatResult:
+        """Send one ``POST /api/chat`` and map every failure to ``errors``.
+
+        - connect failure or connect timeout: :class:`OllamaConnectionError`;
+        - read timeout: ``errors.timeout``;
+        - HTTP 404 or an "unusable model" message: ``errors.unavailable``;
+        - HTTP 5xx, 408, 429 or another request failure: ``errors.transient``;
+        - any other HTTP error, an ``error`` in the body or a non-JSON body:
+          ``errors.analysis``.
+
+        Args:
+            payload: Request body.
+            model: Model name (for messages).
+            read: Read timeout in seconds.
+            errors: Exception family to raise.
+
+        Returns:
+            The parsed answer and its statistics.
+        """
         try:
             response = self.session.request(
                 "POST",
@@ -505,14 +476,14 @@ class OllamaClient:
         except requests.ConnectTimeout as e:
             raise OllamaConnectionError(f"Cannot reach Ollama at {self.base_url}: {e}") from e
         except requests.Timeout as e:
-            raise VisionTimeoutError(
-                f"Vision model '{model}' did not respond within {read:.0f}s "
-                "(model load + generation); increase --request-timeout"
+            raise errors.timeout(
+                f"{errors.kind} model '{model}' did not respond within {read:.0f}s "
+                f"(model load + generation); {errors.timeout_hint}"
             ) from e
         except requests.ConnectionError as e:
             raise OllamaConnectionError(f"Cannot reach Ollama at {self.base_url}: {e}") from e
         except requests.RequestException as e:
-            raise VisionAnalysisError(f"Ollama /api/chat request failed for {model}: {e}") from e
+            raise errors.transient(f"Ollama /api/chat request failed for {model}: {e}") from e
 
         status = response.status_code if isinstance(response.status_code, int) else 0
         try:
@@ -523,133 +494,175 @@ class OllamaClient:
         if status >= 400 or error:
             err_text = str(error)[:500] if error else self._error_text(response)
             if status == 404 or any(m in err_text.lower() for m in _MODEL_UNUSABLE_MARKERS):
-                raise VisionModelUnavailableError(
-                    f"Vision model '{model}' is not usable on {self.base_url}: {err_text}"
+                raise errors.unavailable(
+                    f"{errors.kind} model '{model}' is not usable on {self.base_url}: {err_text}"
                 )
-            raise VisionAnalysisError(f"Ollama /api/chat failed (HTTP {status}) for {model}: {err_text}")
+            message = f"Ollama /api/chat failed (HTTP {status}) for {model}: {err_text}"
+            if status >= 500 or status in _TRANSIENT_STATUSES:
+                raise errors.transient(message)
+            raise errors.analysis(message)
         if not isinstance(body, dict):
-            raise VisionAnalysisError(f"Ollama /api/chat returned a non-JSON body for {model}")
+            raise errors.analysis(f"Ollama /api/chat returned a non-JSON body for {model}")
 
-        message = body.get("message") or {}
-        return VisionChatResult(
-            content=str(message.get("content") or ""),
-            thinking=str(message.get("thinking") or ""),
-            model=str(body.get("model") or model),
-            done_reason=body.get("done_reason"),
-            prompt_eval_count=int(body.get("prompt_eval_count") or 0),
-            eval_count=int(body.get("eval_count") or 0),
-            load_duration_s=(body.get("load_duration") or 0) / 1e9,
-            total_duration_s=(body.get("total_duration") or 0) / 1e9,
-        )
+        message_body = body.get("message") or {}
+        if not isinstance(message_body, dict):
+            raise errors.analysis(
+                f"Ollama /api/chat returned a malformed 'message' for {model}: "
+                f"{type(message_body).__name__}"
+            )
+        try:
+            return ChatResult(
+                content=str(message_body.get("content") or ""),
+                thinking=str(message_body.get("thinking") or ""),
+                model=str(body.get("model") or model),
+                done_reason=body.get("done_reason"),
+                prompt_eval_count=int(body.get("prompt_eval_count") or 0),
+                eval_count=int(body.get("eval_count") or 0),
+                load_duration_s=float(body.get("load_duration") or 0) / 1e9,
+                total_duration_s=float(body.get("total_duration") or 0) / 1e9,
+            )
+        except (TypeError, ValueError) as e:
+            raise errors.analysis(
+                f"Ollama /api/chat returned malformed statistics for {model}: {e}"
+            ) from e
 
-    def embedding(
+    def chat_with_images(
         self,
-        text: str,
+        prompt: str,
+        image_paths: Sequence[Path],
         model: Optional[str] = None,
-    ) -> EmbeddingResponse:
-        """Generate text embedding.
+        *,
+        system: Optional[str] = None,
+        format: Optional[Union[str, Dict[str, Any]]] = None,
+        think: ThinkSetting = False,
+        options: Optional[Dict[str, Any]] = None,
+        keep_alive: Optional[Union[str, int]] = "30m",
+        max_image_edge: int = DEFAULT_MAX_IMAGE_EDGE,
+        read_timeout: Optional[float] = None,
+    ) -> ChatResult:
+        """Ask a vision model about one or more images via ``POST /api/chat``.
+
+        All images go into one user message, each orientation-corrected,
+        downscaled to ``max_image_edge`` and JPEG-encoded. ``think`` is
+        handled by :func:`resolve_think`: it is only sent when the model
+        reports the ``thinking`` capability.
 
         Args:
-            text: Input text.
-            model: Embedding model name (uses instance default if None).
+            prompt: User message text.
+            image_paths: Images to attach (at least one).
+            model: Model name (uses instance default if None).
+            system: Optional system message.
+            format: ``'json'`` or a JSON-schema dict constraining the output.
+            think: Thinking switch or level; None leaves the model default.
+            options: Generation options (temperature, num_ctx, num_predict, ...).
+            keep_alive: How long Ollama keeps the model loaded afterwards.
+            max_image_edge: Long-edge limit in pixels (0 keeps full size).
+            read_timeout: Read timeout in seconds (default: ``generate_timeout``).
 
         Returns:
-            EmbeddingResponse with embedding vector and model name.
+            ChatResult with the answer and token/timing statistics.
 
         Raises:
-            requests.RequestException: If request fails.
+            ValueError: If no model is set, no image is given, an image is
+                invalid or ``think`` is not a known level.
+            FileNotFoundError: If an image file does not exist.
+            VisionModelUnavailableError: If the model is missing, incompatible
+                with this Ollama, or cannot take images.
+            OllamaConnectionError: If Ollama cannot be reached.
+            VisionTimeoutError: If no response arrives within the read timeout.
+            VisionTransientError: For HTTP 5xx/408/429 and other request failures.
+            VisionAnalysisError: For any other HTTP or protocol error.
+        """
+        model = model or self.model
+        if not model:
+            raise ValueError("Model name required (not set in instance or call)")
+        paths = [Path(p) for p in image_paths]
+        if not paths:
+            raise ValueError("At least one image is required")
+
+        caps = self._required_capabilities(model, _VISION_ERRORS)
+        images = [prepare_image_b64(p, max_image_edge) for p in paths]
+        messages: List[Dict[str, Any]] = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt, "images": images})
+        payload = self._build_payload(
+            model, messages, caps, format=format, think=think, options=options, keep_alive=keep_alive
+        )
+
+        read = read_timeout if read_timeout is not None else self.generate_timeout
+        logger.debug("Ollama API request: POST /api/chat (%s, %d image(s))", model, len(images))
+        return self._post_chat(payload, model, read, errors=_VISION_ERRORS)
+
+    def chat_text(
+        self,
+        prompt: str,
+        model: Optional[str] = None,
+        *,
+        system: Optional[str] = None,
+        format: Optional[Union[str, Dict[str, Any]]] = None,
+        think: ThinkSetting = None,
+        options: Optional[Dict[str, Any]] = None,
+        keep_alive: Optional[Union[str, int]] = "5m",
+        read_timeout: Optional[float] = None,
+    ) -> ChatResult:
+        """Ask a text model a question via ``POST /api/chat`` (no images).
+
+        Used by the fact-check stage (e.g. gpt-oss with a JSON schema in
+        ``format`` and a think level). The model must report the
+        ``completion`` capability; a failed capability read is advisory.
+
+        Args:
+            prompt: User message text.
+            model: Model name (uses instance default if None).
+            system: Optional system message.
+            format: ``'json'`` or a JSON-schema dict constraining the output.
+            think: Thinking switch or level (``'low'|'medium'|'high'``); see
+                :func:`resolve_think`. None leaves the model default.
+            options: Generation options (temperature, num_ctx, num_predict, ...).
+            keep_alive: How long Ollama keeps the model loaded afterwards.
+            read_timeout: Read timeout in seconds (default: ``generate_timeout``).
+
+        Returns:
+            ChatResult with the answer, the separate reasoning text and
+            token/timing statistics.
+
+        Raises:
+            ValueError: If no model is set or ``think`` is not a known level.
+            TextModelUnavailableError: If the model is missing, incompatible
+                with this Ollama, or lacks the ``completion`` capability.
+            OllamaConnectionError: If Ollama cannot be reached.
+            TextTimeoutError: If no response arrives within the read timeout.
+            TextTransientError: For HTTP 5xx/408/429 and other request failures.
+            TextAnalysisError: For any other HTTP error or a non-JSON body.
         """
         model = model or self.model
         if not model:
             raise ValueError("Model name required (not set in instance or call)")
 
-        payload = {
-            "model": model,
-            "prompt": text,
-        }
-
-        response = self._make_request("/api/embeddings", json_data=payload)
-        return EmbeddingResponse(
-            embedding=response.get("embedding", []),
-            model=response.get("model", model),
+        caps = self._required_capabilities(model, _TEXT_ERRORS)
+        messages: List[Dict[str, Any]] = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+        payload = self._build_payload(
+            model, messages, caps, format=format, think=think, options=options, keep_alive=keep_alive
         )
 
-    def _encode_image(self, image_path: Path) -> str:
-        """Encode image as base64 string.
-
-        Args:
-            image_path: Path to image file.
-
-        Returns:
-            Base64 encoded image string.
-
-        Raises:
-            ValueError: If image encoding fails.
-        """
-        try:
-            with open(image_path, "rb") as f:
-                return base64.b64encode(f.read()).decode("utf-8")
-        except Exception as e:
-            raise ValueError(f"Failed to encode image: {e}")
-
-    def list_models(self) -> List[Dict[str, Any]]:
-        """List available models.
-
-        Returns:
-            List of model info dicts with 'name', 'modified_at', 'size', etc.
-
-        Raises:
-            requests.RequestException: If request fails.
-        """
-        response = self._make_request("/api/tags", method="GET")
-        return response.get("models", [])
-
-    def check_model(self, model: Optional[str] = None) -> bool:
-        """Check if model is available locally.
-
-        Args:
-            model: Model name to check (uses instance default if None).
-
-        Returns:
-            True if model available, False otherwise.
-        """
-        model = model or self.model
-        if not model:
-            return False
-
-        try:
-            models = self.list_models()
-            model_names = [m.get("name", "") for m in models]
-            return model in model_names
-        except Exception:
-            return False
-
-    def is_model_available(self, model: Optional[str] = None) -> bool:
-        """Check if model is available locally (alias for check_model).
-
-        Args:
-            model: Model name to check (uses instance default if None).
-
-        Returns:
-            True if model available, False otherwise.
-        """
-        return self.check_model(model)
-
-    def health_check(self) -> bool:
-        """Check if Ollama server is running and accessible.
-
-        Returns:
-            True if server is healthy, False otherwise.
-        """
-        try:
-            response = self.session.get(f"{self.base_url}/api/tags", timeout=5)
-            return response.status_code == 200
-        except Exception:
-            return False
+        read = read_timeout if read_timeout is not None else self.generate_timeout
+        logger.debug("Ollama API request: POST /api/chat (%s, text only)", model)
+        return self._post_chat(payload, model, read, errors=_TEXT_ERRORS)
 
     def close(self):
-        """Close HTTP session."""
-        self.session.close()
+        """Close every HTTP session this client created (all threads)."""
+        with self._sessions_lock:
+            sessions, self._sessions = self._sessions, []
+        for session in sessions:
+            try:
+                session.close()
+            except Exception as e:  # closing must never raise
+                logger.debug("Error closing HTTP session: %s", e)
+        self._local = threading.local()
 
     def __enter__(self):
         """Context manager entry."""
@@ -658,33 +671,3 @@ class OllamaClient:
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Context manager exit."""
         self.close()
-
-
-# Convenience function for quick usage
-
-def get_ollama_client(
-    base_url: str = "http://localhost:11434",
-    timeout: int = 30,
-    model: Optional[str] = None,
-    generate_timeout: float = DEFAULT_GENERATE_TIMEOUT,
-    connect_timeout: float = DEFAULT_CONNECT_TIMEOUT,
-) -> OllamaClient:
-    """Create Ollama client instance.
-
-    Args:
-        base_url: Ollama server URL.
-        timeout: Request timeout in seconds (metadata endpoints).
-        model: Default model to use.
-        generate_timeout: Read timeout in seconds for vision calls.
-        connect_timeout: Connect timeout in seconds for vision calls.
-
-    Returns:
-        Configured OllamaClient instance.
-    """
-    return OllamaClient(
-        base_url=base_url,
-        timeout=timeout,
-        model=model,
-        generate_timeout=generate_timeout,
-        connect_timeout=connect_timeout,
-    )

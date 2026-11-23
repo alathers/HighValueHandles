@@ -1,54 +1,58 @@
 """Model selector for the bourbon image processor pipeline.
 
-Assigns the appropriate AI/ML model to each processing stage, manages
-fallback chains, tracks usage, and provides runtime model resolution.
+Maps each pipeline stage that calls an Ollama model to exactly one model and
+records every call for the run's usage summary. There is no fallback: a
+silent switch to another model would hide which model produced a fact, so a
+stage either uses its configured model or fails.
 
-Pipeline stages and their recommended models (from research.md):
+Stages:
 
-    Stage                          | Primary Model          | Fallback
-    --------------------------------|------------------------|------------------
-    1. OCR / Text Extraction        | Tesseract-OCR          | qwen2-vl:7b
-    2. Vision Model Analysis        | DEFAULT_VISION_MODEL   | qwen2-vl:7b
-    3. Image Grouping (Similarity)  | ORB (OpenCV)           | filename heuristics
-    4. Quantity Detection            | Hash-based             | Visual analysis
-    5. Metadata Generation (Text)   | gpt-oss:120b           | qwen3-vl:32b
-    6. Web Research (Vendor Cache)  | DuckDuckGo API         | Skip (non-blocking)
-    7. Error Classification          | Rule-based             | N/A
+    Stage                 | Default model          | Role
+    ----------------------|------------------------|------------------------------------
+    VISION_ANALYSIS       | DEFAULT_VISION_MODEL   | reads label fields from the photos
+    METADATA_GENERATION   | gpt-oss:120b           | text-only fact extraction from OCR
+                          |                        | and web evidence, verified copy
 
-Only the vision-analysis primary model is called by the pipeline
-(:data:`IMPLEMENTED_MODEL_STAGES`); there is no automatic fallback, so the
-fallback entries and the other stages' models are descriptive only and are
-reported as "not used" by :meth:`ModelSelector.print_stage_report`.
+:func:`active_stages` says which stages a run calls (the text stage only
+when the fact check is enabled); pre-flight requires (and may pull) only
+their models, each checked for the capability in :data:`STAGE_CAPABILITY`.
+
+Steps that never call a model (OCR with Tesseract, capture-time grouping,
+quantity from duplicate photos, error classification, preview rendering) are
+not stages here.
 
 Usage::
 
     from lib.model_selector import ModelSelector, ModelStage
 
-    selector = ModelSelector.from_config(config)
-
-    # Get the primary model for a stage
+    selector = ModelSelector.from_config(args)        # args.model -> vision
     model_name = selector.get_model(ModelStage.VISION_ANALYSIS)
-
-    # Execute with automatic fallback
-    result = selector.execute_with_fallback(
-        stage=ModelStage.VISION_ANALYSIS,
-        fn=vision_fn,
-        image_path=image_path,
-        prompt=prompt,
-    )
-
+    selector.record_usage(ModelStage.VISION_ANALYSIS, model_name, duration=12.3)
 """
 
 import logging
+import threading
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
-from lib.config import DEFAULT_VISION_MODEL
+from lib.constants import DEFAULT_TEXT_MODEL, DEFAULT_VISION_MODEL
+from lib.model_availability import normalize_model_name
 
 logger = logging.getLogger(__name__)
+
+__all__ = [
+    "DEFAULT_TEXT_MODEL",
+    "DEFAULT_VISION_MODEL",
+    "STAGE_CAPABILITY",
+    "ModelSelector",
+    "ModelSpec",
+    "ModelStage",
+    "ModelUsage",
+    "UsageLog",
+    "active_stages",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -56,35 +60,13 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 class ModelStage(Enum):
-    """Pipeline stages that require model selection.
-
-    Each stage maps to a recommended primary model and one or more
-    fallback models, configured via the ModelSelector.
-    """
-
-    OCR_EXTRACTION = auto()
-    """Stage 1: Text extraction from images (Tesseract OCR)."""
+    """Pipeline stages that call an Ollama model."""
 
     VISION_ANALYSIS = auto()
-    """Stage 2: Vision model metadata extraction from bottle images."""
-
-    IMAGE_GROUPING = auto()
-    """Stage 3: Visual similarity for image grouping (ORB/OpenCV)."""
-
-    QUANTITY_DETECTION = auto()
-    """Stage 4: Quantity detection via hash-based or visual analysis."""
+    """Vision model reads label fields from a bottle's photos."""
 
     METADATA_GENERATION = auto()
-    """Stage 5: Text-to-text metadata refinement (GPT-OSS)."""
-
-    WEB_RESEARCH = auto()
-    """Stage 6: Web search for vendor images and reference links."""
-
-    ERROR_CLASSIFICATION = auto()
-    """Stage 7: Error type classification for retry logic."""
-
-    PREVIEW_GENERATION = auto()
-    """Stage 8: Markdown preview report generation (text model)."""
+    """Text model: fact extraction from OCR/web evidence and verified description."""
 
 
 # ---------------------------------------------------------------------------
@@ -93,34 +75,17 @@ class ModelStage(Enum):
 
 @dataclass
 class ModelSpec:
-    """Specification for a single model in a fallback chain.
+    """The model assigned to one stage.
 
     Attributes:
-        name: Model identifier (e.g., "qwen3-vl:32b").
+        name: Ollama model tag (e.g. "qwen3.6:35b-a3b").
         stage: Pipeline stage this model serves.
-        role: "primary" or "fallback".
-        priority: Lower numbers = tried first within same role.
-        max_tokens: Maximum output tokens (0 = unlimited).
-        temperature: Generation temperature (0.0-2.0).
         description: Human-readable description of what this model does.
     """
 
     name: str
     stage: ModelStage
-    role: str = "primary"
-    priority: int = 0
-    max_tokens: int = 0
-    temperature: float = 0.1
     description: str = ""
-
-    def __post_init__(self):
-        """Validate model spec."""
-        if self.role not in ("primary", "fallback"):
-            raise ValueError(f"role must be 'primary' or 'fallback', got {self.role!r}")
-        if not 0.0 <= self.temperature <= 2.0:
-            raise ValueError(f"temperature must be 0.0-2.0, got {self.temperature}")
-        if self.max_tokens < 0:
-            raise ValueError(f"max_tokens must be >= 0, got {self.max_tokens}")
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +104,7 @@ class ModelUsage:
         input_tokens: Tokens consumed (0 if unknown).
         output_tokens: Tokens produced (0 if unknown).
         error: Error message if failed.
-        fallback_used: Whether a fallback model was used instead of primary.
+        think: Think level sent with the call (None if not sent).
     """
 
     stage: ModelStage
@@ -149,23 +114,27 @@ class ModelUsage:
     input_tokens: int = 0
     output_tokens: int = 0
     error: Optional[str] = None
-    fallback_used: bool = False
+    think: Optional[str] = None
 
 
 @dataclass
 class UsageLog:
-    """Accumulates usage records for reporting.
+    """Accumulates usage records for reporting. Thread-safe.
+
+    Parallel workers may record at the same time; appends and every summary
+    run under one lock and summaries read a snapshot.
 
     Attributes:
         records: List of ModelUsage records.
     """
 
     records: list[ModelUsage] = field(default_factory=list)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def record(self, stage: ModelStage, model: str, success: bool = True,
                duration: float = 0.0, input_tokens: int = 0,
                output_tokens: int = 0, error: Optional[str] = None,
-               fallback_used: bool = False) -> None:
+               think: Optional[str] = None) -> None:
         """Record a single model invocation.
 
         Args:
@@ -176,9 +145,9 @@ class UsageLog:
             input_tokens: Input token count.
             output_tokens: Output token count.
             error: Error message if failed.
-            fallback_used: Whether a fallback model was used.
+            think: Think level sent with the call, if any.
         """
-        self.records.append(ModelUsage(
+        usage = ModelUsage(
             stage=stage,
             model=model,
             success=success,
@@ -186,62 +155,57 @@ class UsageLog:
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             error=error,
-            fallback_used=fallback_used,
-        ))
+            think=think,
+        )
+        with self._lock:
+            self.records.append(usage)
+
+    def snapshot(self) -> list[ModelUsage]:
+        """A copy of the records, taken under the lock."""
+        with self._lock:
+            return list(self.records)
 
     @property
     def total_calls(self) -> int:
         """Total number of model invocations."""
-        return len(self.records)
+        return len(self.snapshot())
 
     @property
     def successful_calls(self) -> int:
         """Number of successful model invocations."""
-        return sum(1 for r in self.records if r.success)
-
-    @property
-    def fallback_calls(self) -> int:
-        """Number of times a fallback model was used."""
-        return sum(1 for r in self.records if r.fallback_used)
+        return sum(1 for r in self.snapshot() if r.success)
 
     @property
     def total_duration(self) -> float:
         """Total time spent in model calls."""
-        return sum(r.duration_seconds for r in self.records)
+        return sum(r.duration_seconds for r in self.snapshot())
 
     def summary_by_stage(self) -> dict[str, dict[str, int]]:
         """Get usage summary grouped by stage.
 
         Returns:
-            Dictionary mapping stage names to {total, success, fallback}.
+            Dictionary mapping stage names to {total, success}.
         """
         summary: dict[str, dict[str, int]] = {}
-        for r in self.records:
-            stage_name = r.stage.name
-            if stage_name not in summary:
-                summary[stage_name] = {"total": 0, "success": 0, "fallback": 0}
-            summary[stage_name]["total"] += 1
+        for r in self.snapshot():
+            stats = summary.setdefault(r.stage.name, {"total": 0, "success": 0})
+            stats["total"] += 1
             if r.success:
-                summary[stage_name]["success"] += 1
-            if r.fallback_used:
-                summary[stage_name]["fallback"] += 1
+                stats["success"] += 1
         return summary
 
     def summary_by_model(self) -> dict[str, dict[str, int]]:
         """Get usage summary grouped by model name.
 
         Returns:
-            Dictionary mapping model names to {total, success, fallback}.
+            Dictionary mapping model names to {total, success}.
         """
         summary: dict[str, dict[str, int]] = {}
-        for r in self.records:
-            if r.model not in summary:
-                summary[r.model] = {"total": 0, "success": 0, "fallback": 0}
-            summary[r.model]["total"] += 1
+        for r in self.snapshot():
+            stats = summary.setdefault(r.model, {"total": 0, "success": 0})
+            stats["total"] += 1
             if r.success:
-                summary[r.model]["success"] += 1
-            if r.fallback_used:
-                summary[r.model]["fallback"] += 1
+                stats["success"] += 1
         return summary
 
     def to_dict(self) -> dict[str, Any]:
@@ -250,13 +214,21 @@ class UsageLog:
         Returns:
             Dictionary with summary statistics and per-record details.
         """
+        records = self.snapshot()
+        by_stage: dict[str, dict[str, int]] = {}
+        by_model: dict[str, dict[str, int]] = {}
+        for r in records:
+            for key, summary in ((r.stage.name, by_stage), (r.model, by_model)):
+                stats = summary.setdefault(key, {"total": 0, "success": 0})
+                stats["total"] += 1
+                if r.success:
+                    stats["success"] += 1
         return {
-            "total_calls": self.total_calls,
-            "successful_calls": self.successful_calls,
-            "fallback_calls": self.fallback_calls,
-            "total_duration_seconds": round(self.total_duration, 2),
-            "by_stage": self.summary_by_stage(),
-            "by_model": self.summary_by_model(),
+            "total_calls": len(records),
+            "successful_calls": sum(1 for r in records if r.success),
+            "total_duration_seconds": round(sum(r.duration_seconds for r in records), 2),
+            "by_stage": by_stage,
+            "by_model": by_model,
             "records": [
                 {
                     "stage": r.stage.name,
@@ -266,132 +238,60 @@ class UsageLog:
                     "input_tokens": r.input_tokens,
                     "output_tokens": r.output_tokens,
                     "error": r.error,
-                    "fallback_used": r.fallback_used,
+                    "think": r.think,
                 }
-                for r in self.records
+                for r in records
             ],
         }
 
 
 # ---------------------------------------------------------------------------
-# Default model specifications (from research.md)
+# Default model specifications
 # ---------------------------------------------------------------------------
 
-_DEFAULT_MODELS: dict[ModelStage, list[ModelSpec]] = {
-    ModelStage.OCR_EXTRACTION: [
-        ModelSpec(
-            name="tesseract",
-            stage=ModelStage.OCR_EXTRACTION,
-            role="primary",
-            priority=0,
-            description="Tesseract OCR system engine for text extraction",
+_DEFAULT_MODELS: dict[ModelStage, ModelSpec] = {
+    ModelStage.VISION_ANALYSIS: ModelSpec(
+        name=DEFAULT_VISION_MODEL,
+        stage=ModelStage.VISION_ANALYSIS,
+        description="Ollama vision model for label metadata extraction",
+    ),
+    ModelStage.METADATA_GENERATION: ModelSpec(
+        name=DEFAULT_TEXT_MODEL,
+        stage=ModelStage.METADATA_GENERATION,
+        description=(
+            "Text model: fact extraction from OCR/web evidence and verified description "
+            "(text-only)"
         ),
-        ModelSpec(
-            name="qwen2-vl:7b",
-            stage=ModelStage.OCR_EXTRACTION,
-            role="fallback",
-            priority=1,
-            description="Qwen2-VL 7B vision model as OCR fallback",
-        ),
-    ],
-    ModelStage.VISION_ANALYSIS: [
-        ModelSpec(
-            name=DEFAULT_VISION_MODEL,
-            stage=ModelStage.VISION_ANALYSIS,
-            role="primary",
-            priority=0,
-            description="Ollama vision model for label metadata extraction",
-        ),
-        ModelSpec(
-            name="qwen2-vl:7b",
-            stage=ModelStage.VISION_ANALYSIS,
-            role="fallback",
-            priority=1,
-            description="Qwen2-VL 7B fallback for vision analysis",
-        ),
-    ],
-    ModelStage.IMAGE_GROUPING: [
-        ModelSpec(
-            name="orb-opencv",
-            stage=ModelStage.IMAGE_GROUPING,
-            role="primary",
-            priority=0,
-            description="OpenCV ORB feature matching for image similarity",
-        ),
-        ModelSpec(
-            name="filename-heuristic",
-            stage=ModelStage.IMAGE_GROUPING,
-            role="fallback",
-            priority=1,
-            description="Filename pattern matching as last-resort grouping",
-        ),
-    ],
-    ModelStage.QUANTITY_DETECTION: [
-        ModelSpec(
-            name="md5-hash",
-            stage=ModelStage.QUANTITY_DETECTION,
-            role="primary",
-            priority=0,
-            description="MD5 hash-based duplicate detection for quantity",
-        ),
-        ModelSpec(
-            name="visual-analysis",
-            stage=ModelStage.QUANTITY_DETECTION,
-            role="fallback",
-            priority=1,
-            description="Visual analysis heuristic for implicit multiple bottles",
-        ),
-    ],
-    ModelStage.METADATA_GENERATION: [
-        ModelSpec(
-            name="gpt-oss:120b",
-            stage=ModelStage.METADATA_GENERATION,
-            role="primary",
-            priority=0,
-            description="GPT-OSS 120B for structured metadata generation",
-        ),
-        ModelSpec(
-            name="qwen3-vl:32b",
-            stage=ModelStage.METADATA_GENERATION,
-            role="fallback",
-            priority=1,
-            description="Qwen3-VL 32B fallback for text-to-text metadata",
-        ),
-    ],
-    ModelStage.WEB_RESEARCH: [
-        ModelSpec(
-            name="duckduckgo-api",
-            stage=ModelStage.WEB_RESEARCH,
-            role="primary",
-            priority=0,
-            description="DuckDuckGo web search for vendor image lookup",
-        ),
-    ],
-    ModelStage.ERROR_CLASSIFICATION: [
-        ModelSpec(
-            name="rule-based",
-            stage=ModelStage.ERROR_CLASSIFICATION,
-            role="primary",
-            priority=0,
-            description="Rule-based error classification for retry logic",
-        ),
-    ],
-    ModelStage.PREVIEW_GENERATION: [
-        ModelSpec(
-            name="template-markdown",
-            stage=ModelStage.PREVIEW_GENERATION,
-            role="primary",
-            priority=0,
-            description="Template-based markdown generation (no model needed)",
-        ),
-    ],
+    ),
 }
 
 
-#: Stages whose models the pipeline actually calls. Pre-flight requires (and
-#: may pull) only these stages' primary models; add a stage here only once
-#: code really invokes its model.
-IMPLEMENTED_MODEL_STAGES: frozenset[ModelStage] = frozenset({ModelStage.VISION_ANALYSIS})
+#: Capability each stage's model must report (``/api/show`` capabilities).
+STAGE_CAPABILITY: dict[ModelStage, str] = {
+    ModelStage.VISION_ANALYSIS: "vision",
+    ModelStage.METADATA_GENERATION: "completion",
+}
+
+#: When one model serves several stages, the capability that implies the
+#: others is checked (a vision model also completes text).
+_CAPABILITY_STRICTNESS: dict[str, int] = {"completion": 0, "vision": 1}
+
+
+def active_stages(text_enabled: bool) -> frozenset[ModelStage]:
+    """Stages whose models a run calls.
+
+    Pre-flight requires (and may pull) only these stages' models.
+
+    Args:
+        text_enabled: Whether the text (fact-check) stage runs.
+
+    Returns:
+        ``{VISION_ANALYSIS}``, plus ``METADATA_GENERATION`` when
+        ``text_enabled``.
+    """
+    if text_enabled:
+        return frozenset({ModelStage.VISION_ANALYSIS, ModelStage.METADATA_GENERATION})
+    return frozenset({ModelStage.VISION_ANALYSIS})
 
 
 # ---------------------------------------------------------------------------
@@ -399,52 +299,41 @@ IMPLEMENTED_MODEL_STAGES: frozenset[ModelStage] = frozenset({ModelStage.VISION_A
 # ---------------------------------------------------------------------------
 
 class ModelSelector:
-    """Selects and tracks models for each pipeline stage.
-
-    Manages a registry of model specifications (primary + fallback chains),
-    resolves models at runtime, and tracks usage for reporting.
+    """Selects the model for each pipeline stage and tracks usage.
 
     Attributes:
-        models: Mapping of stage to list of ModelSpec (primary first).
-        usage: UsageLog for tracking all model invocations.
-        default_model: Fallback model name when stage-specific models unavailable.
+        models: Mapping of stage to its ModelSpec.
+        usage: UsageLog for tracking all model invocations (None if disabled).
     """
 
     def __init__(
         self,
-        models: dict[ModelStage, list[ModelSpec]] | None = None,
-        default_model: str = DEFAULT_VISION_MODEL,
-        allow_fallback: bool = True,
+        models: dict[ModelStage, ModelSpec] | None = None,
         log_usage: bool = True,
     ):
         """Initialize model selector.
 
         Args:
-            models: Custom model specifications. If None, uses defaults from research.md.
-            default_model: Fallback model when stage-specific models unavailable.
-            allow_fallback: Whether to attempt fallback models on failure.
+            models: Stage-to-model mapping. If None, uses the defaults.
             log_usage: Whether to track usage statistics.
         """
         if models is None:
-            models = {stage: list(specs) for stage, specs in _DEFAULT_MODELS.items()}
-        self.models: dict[ModelStage, list[ModelSpec]] = models
-        self.default_model = default_model
-        self.allow_fallback = allow_fallback
+            models = dict(_DEFAULT_MODELS)
+        self.models: dict[ModelStage, ModelSpec] = models
         self.usage = UsageLog() if log_usage else None
 
     @classmethod
     def from_config(cls, config: Any) -> "ModelSelector":  # noqa: ANN401
-        """Create a ModelSelector from a Config object.
+        """Create a ModelSelector from a config/args object.
 
-        ``config.model`` (the CLI ``--model``) becomes the primary model of
-        the vision-analysis stage and the selector's default model. A
-        per-stage ``config.<stage>_model`` attribute (e.g.
-        ``vision_analysis_model``) overrides that stage's primary model only;
-        fallback chains are kept. Only non-empty strings count, so unset or
+        ``config.model`` (the CLI ``--model``) becomes the vision-analysis
+        model. A per-stage ``config.<stage>_model`` attribute (e.g.
+        ``metadata_generation_model``) overrides that stage's model and wins
+        over ``config.model``. Only non-empty strings count, so unset or
         mocked attributes leave the defaults in place.
 
         Args:
-            config: Config object with 'model' and optional per-stage overrides.
+            config: Object with 'model' and optional per-stage overrides.
 
         Returns:
             Configured ModelSelector instance.
@@ -455,102 +344,85 @@ class ModelSelector:
             return value.strip() if isinstance(value, str) and value.strip() else None
 
         global_model = _str_attr("model")
-        default_model = global_model or DEFAULT_VISION_MODEL
-
-        custom_models: dict[ModelStage, list[ModelSpec]] = {}
-        for stage, specs in _DEFAULT_MODELS.items():
+        models: dict[ModelStage, ModelSpec] = {}
+        for stage, spec in _DEFAULT_MODELS.items():
             override = _str_attr(f"{stage.name.lower()}_model")
             if override is None and stage is ModelStage.VISION_ANALYSIS:
                 override = global_model
-            custom_models[stage] = [
-                ModelSpec(
-                    name=override if (override and spec.role == "primary") else spec.name,
-                    stage=stage,
-                    role=spec.role,
-                    priority=spec.priority,
-                    max_tokens=spec.max_tokens,
-                    temperature=spec.temperature,
-                    # A replaced model must not keep the old model's wording.
-                    description=(
-                        f"{override} ({stage.name.lower().replace('_', ' ')} override)"
-                        if (override and spec.role == "primary" and override != spec.name)
-                        else spec.description
-                    ),
-                )
-                for spec in specs
-            ]
-
-        return cls(
-            models=custom_models,
-            default_model=default_model,
-        )
+            if override and override != spec.name:
+                # A replaced model must not keep the old model's wording.
+                description = f"{override} ({stage.name.lower().replace('_', ' ')} override)"
+                models[stage] = ModelSpec(name=override, stage=stage, description=description)
+            else:
+                models[stage] = spec
+        return cls(models=models)
 
     def get_model(self, stage: ModelStage) -> str:
-        """Get the primary model name for a stage.
+        """Get the model name for a stage.
 
         Args:
             stage: Pipeline stage.
 
         Returns:
-            Model name string (e.g., "qwen3-vl:32b").
+            Model name string (e.g., "qwen3.6:35b-a3b").
 
         Raises:
-            KeyError: If stage has no registered models.
+            KeyError: If the stage has no registered model (never substitutes
+                another stage's model).
         """
-        specs = self.models.get(stage)
-        if not specs:
-            return self.default_model
-        return specs[0].name
+        spec = self.models.get(stage)
+        if spec is None:
+            raise KeyError(f"No model registered for stage {stage.name}")
+        return spec.name
 
-    def required_models(
-        self, stages: Iterable[ModelStage] = IMPLEMENTED_MODEL_STAGES
-    ) -> list[str]:
-        """Models that must be installed before the pipeline runs.
+    def required_model_specs(self, stages: Iterable[ModelStage]) -> list[tuple[str, str]]:
+        """Models (with the capability each must have) for the given stages.
 
-        Only the primary model of each given stage counts; fallbacks are
-        never required (or pulled). Names are deduplicated, keeping the
-        order of ``ModelStage``.
+        Names are deduplicated by :func:`normalize_model_name`, keeping the
+        order of ``ModelStage`` and the first spelling. When one model
+        serves several stages, the stricter capability is kept (``'vision'``
+        over ``'completion'``).
 
         Args:
-            stages: Stages to include (default: the implemented ones).
+            stages: Stages to include, e.g. ``active_stages(text_enabled)``.
 
         Returns:
-            Primary model names, e.g. ``['qwen3.6:35b-a3b']``.
+            ``(name, capability)`` pairs, e.g.
+            ``[('qwen3.6:35b-a3b', 'vision'), ('gpt-oss:120b', 'completion')]``.
         """
         wanted = set(stages)
-        names: list[str] = []
+        specs: list[tuple[str, str]] = []
+        index: dict[str, int] = {}
         for stage in ModelStage:
-            if stage in wanted:
-                name = self.get_model(stage)
-                if name not in names:
-                    names.append(name)
-        return names
+            if stage not in wanted:
+                continue
+            name = self.get_model(stage)
+            capability = STAGE_CAPABILITY[stage]
+            key = normalize_model_name(name)
+            if key not in index:
+                index[key] = len(specs)
+                specs.append((name, capability))
+                continue
+            kept_name, kept_cap = specs[index[key]]
+            if _CAPABILITY_STRICTNESS.get(capability, 0) > _CAPABILITY_STRICTNESS.get(kept_cap, 0):
+                specs[index[key]] = (kept_name, capability)
+        return specs
 
-    def get_fallback_chain(self, stage: ModelStage) -> list[str]:
-        """Get all models for a stage in priority order (primary + fallbacks).
+    def required_models(self, stages: Optional[Iterable[ModelStage]] = None) -> list[str]:
+        """Names of the models that must be installed before the pipeline runs.
 
-        Args:
-            stage: Pipeline stage.
-
-        Returns:
-            List of model names, primary first.
-        """
-        specs = self.models.get(stage, [])
-        return [spec.name for spec in specs]
-
-    def get_stage_description(self, stage: ModelStage) -> str:
-        """Get human-readable description of a stage's primary model.
+        Same order and deduplication as :meth:`required_model_specs`.
 
         Args:
-            stage: Pipeline stage.
+            stages: Stages to include (default: ``active_stages(False)``,
+                the vision stage only).
 
         Returns:
-            Description string.
+            Model names, e.g. ``['qwen3.6:35b-a3b']``.
         """
-        specs = self.models.get(stage, [])
-        if specs:
-            return specs[0].description
-        return f"Default model for {stage.name}"
+        if stages is None:
+            stages = active_stages(False)
+        return [name for name, _ in self.required_model_specs(stages)]
 
     def record_usage(
         self,
@@ -561,9 +433,9 @@ class ModelSelector:
         input_tokens: int = 0,
         output_tokens: int = 0,
         error: Optional[str] = None,
-        fallback_used: bool = False,
+        think: Optional[str] = None,
     ) -> None:
-        """Record a model invocation for usage tracking.
+        """Record a model invocation for usage tracking (thread-safe).
 
         Args:
             stage: Pipeline stage.
@@ -573,7 +445,7 @@ class ModelSelector:
             input_tokens: Input token count.
             output_tokens: Output token count.
             error: Error message if failed.
-            fallback_used: Whether a fallback model was used.
+            think: Think level sent with the call, if any.
         """
         if self.usage is not None:
             self.usage.record(
@@ -584,82 +456,37 @@ class ModelSelector:
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 error=error,
-                fallback_used=fallback_used,
+                think=think,
             )
 
     def get_usage_summary(self) -> dict[str, Any]:
         """Get a dictionary summary of all recorded usage.
 
         Returns:
-            Dictionary with total_calls, successful_calls, fallback_calls,
-            total_duration, by_stage, by_model, and per-record details.
+            Dictionary with total_calls, successful_calls, total_duration,
+            by_stage, by_model, and per-record details.
         """
         if self.usage is None:
             return {"error": "Usage logging not enabled"}
         return self.usage.to_dict()
 
-    def is_model_available(self, model_name: str) -> bool:
-        """Check if a model is in the registered specifications.
+    def print_stage_report(self, active: Optional[Iterable[ModelStage]] = None) -> None:
+        """Log one line per stage: its model and whether this run calls it.
 
         Args:
-            model_name: Model name to check.
-
-        Returns:
-            True if the model is registered in any stage's chain.
+            active: Stages this run calls (default: ``active_stages(False)``).
         """
-        for specs in self.models.values():
-            if any(spec.name == model_name for spec in specs):
-                return True
-        return model_name == self.default_model
-
-    def print_stage_report(self) -> None:
-        """Log the model configuration of every stage.
-
-        Only stages in :data:`IMPLEMENTED_MODEL_STAGES` call a model; the
-        others are marked "not used". Fallbacks are listed as unused because
-        the pipeline never switches models automatically.
-        """
+        active_set = set(active_stages(False) if active is None else active)
         logger.info("=" * 70)
         logger.info("MODEL SELECTOR STAGE REPORT")
         logger.info("=" * 70)
-        for stage, specs in self.models.items():
-            primary = specs[0].name if specs else "N/A"
-            used = stage in IMPLEMENTED_MODEL_STAGES
-            fallbacks = ", ".join(spec.name for spec in specs[1:])
+        for stage in ModelStage:
+            spec = self.models.get(stage)
+            status = "active this run" if stage in active_set else "inactive"
             logger.info(
-                "  %s%s\n    Primary: %s\n    Fallbacks: %s\n    %s",
+                "  %s: %s (%s)",
                 stage.name,
-                "" if used else " (not used by the pipeline)",
-                primary,
-                f"{fallbacks} (not used: no automatic fallback)" if fallbacks else "(none)",
-                specs[0].description if specs else "No models registered",
+                spec.name if spec is not None else "no model registered",
+                status,
             )
-        logger.info("-" * 70)
-        logger.info("Vision model: %s", self.get_model(ModelStage.VISION_ANALYSIS))
         logger.info("=" * 70)
-
-
-# ---------------------------------------------------------------------------
-# Convenience
-# ---------------------------------------------------------------------------
-
-def create_default_selector() -> ModelSelector:
-    """Create a ModelSelector with default specifications from research.md.
-
-    Returns:
-        Configured ModelSelector with all stage defaults.
-    """
-    return ModelSelector()
-
-
-def get_stage_models(stage: ModelStage) -> list[str]:
-    """Get all model names for a stage from defaults.
-
-    Args:
-        stage: Pipeline stage.
-
-    Returns:
-        List of model names (primary + fallbacks).
-    """
-    specs = _DEFAULT_MODELS.get(stage, [])
-    return [spec.name for spec in specs]

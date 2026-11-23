@@ -10,6 +10,7 @@ Tests cover:
     systemd service store
   - Disk checks, safety margin, the mid-pull disk guard, formatting and
     local/remote URL classification
+  - Advisory memory check (total_memory_bytes, memory_verdict)
 """
 
 import json
@@ -40,11 +41,13 @@ from lib.model_availability import (
     is_local_url,
     make_disk_guard,
     manifest_blob_sizes,
+    memory_verdict,
     normalize_model_name,
     ollama_models_dir,
     parse_model_ref,
     required_margin_bytes,
     sum_manifest_sizes,
+    total_memory_bytes,
 )
 
 FIXTURES = Path(__file__).resolve().parent.parent / "fixtures" / "manifests"
@@ -522,3 +525,68 @@ class TestFormattingAndHosts:
     def test_own_hostname_is_local(self, monkeypatch):
         monkeypatch.setattr("lib.model_availability.socket.gethostname", lambda: "My-Laptop")
         assert is_local_url("http://my-laptop:11434") is True
+
+
+# ---------------------------------------------------------------------------
+# Memory (advisory)
+# ---------------------------------------------------------------------------
+
+
+class TestMemory:
+    @staticmethod
+    def _sysconf(values):
+        def sysconf(name):
+            value = values[name]
+            if isinstance(value, BaseException):
+                raise value
+            return value
+
+        return sysconf
+
+    def test_total_memory_bytes(self, monkeypatch):
+        monkeypatch.setattr(
+            ma.os, "sysconf", self._sysconf({"SC_PAGE_SIZE": 16384, "SC_PHYS_PAGES": 8_388_608})
+        )
+        assert total_memory_bytes() == 16384 * 8_388_608  # 128 GiB
+
+    @pytest.mark.parametrize(
+        "values",
+        [
+            {"SC_PAGE_SIZE": ValueError("unknown name"), "SC_PHYS_PAGES": 1},
+            {"SC_PAGE_SIZE": 4096, "SC_PHYS_PAGES": OSError("not supported")},
+            {"SC_PAGE_SIZE": 4096, "SC_PHYS_PAGES": -1},
+            {"SC_PAGE_SIZE": 0, "SC_PHYS_PAGES": 100},
+        ],
+    )
+    def test_total_memory_bytes_error_is_none(self, monkeypatch, values):
+        monkeypatch.setattr(ma.os, "sysconf", self._sysconf(values))
+        assert total_memory_bytes() is None
+
+    def test_total_memory_bytes_without_sysconf(self, monkeypatch):
+        monkeypatch.delattr(ma.os, "sysconf")
+        assert total_memory_bytes() is None
+
+    def test_total_memory_bytes_real_machine(self):
+        total = total_memory_bytes()
+        assert total is None or total > 0
+
+    @pytest.mark.parametrize(
+        "model,total,verdict",
+        [
+            (65 * GB, 128 * GiB, "ok"),
+            (75 * GB, 100 * GB, "ok"),        # exactly 75 %: not above
+            (76 * GB, 100 * GB, "warn"),
+            (100 * GB, 100 * GB, "warn"),     # equal to memory: not larger
+            (101 * GB, 100 * GB, "error"),
+            (65 * GB, 32 * GiB, "error"),
+        ],
+    )
+    def test_memory_verdict_thresholds(self, model, total, verdict):
+        result, message = memory_verdict(model, total)
+        assert result == verdict
+        assert format_gb(model) in message
+
+    def test_memory_verdict_unknown_total(self):
+        result, message = memory_verdict(65 * GB, None)
+        assert result == "unknown"
+        assert "could not be measured" in message
