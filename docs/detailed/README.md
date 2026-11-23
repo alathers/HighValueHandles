@@ -29,6 +29,30 @@ The Bourbon Image Processor is a local CLI tool that extracts bourbon bottle met
 
 The system uses Ollama for vision AI and Tesseract for OCR, running entirely on your machine (no cloud services required).
 
+### Per-Stage Model Selection
+
+The model selector assigns the right model to each pipeline stage:
+
+| Stage | Primary Model | Fallback |
+|-------|--------------|----------|
+| OCR / Text Extraction | Tesseract-OCR | qwen2-vl:7b |
+| Vision Model Analysis | qwen3-vl:32b | qwen2-vl:7b |
+| Image Grouping (Similarity) | ORB (OpenCV) | Filename heuristics |
+| Quantity Detection | Hash-based | Visual analysis |
+| Metadata Generation | gpt-oss:120b | qwen3-vl:32b |
+| Web Research | DuckDuckGo API | Skip (non-blocking) |
+| Error Classification | Rule-based | N/A |
+| Preview Generation | Template Markdown | N/A |
+
+### Model Serving Backends
+
+- **MPLTX** (preferred): Native process management with configurable port, GPU layers, context size
+- **Ollama** (backward compatible): Auto-starts Ollama if not running
+
+### Usage Tracking
+
+At the end of processing, a summary is printed showing total calls, successful calls, fallback count, and duration — broken down by stage and model name.
+
 ---
 
 ## Installation
@@ -197,8 +221,19 @@ process [OPTIONS]
 
 **Model Options:**
 ```
--m, --model STR                Ollama vision model (default: qwen2-vl:7b)
+-m, --model STR                Global default model (sets primary for all AI stages) (default: qwen2-vl:7b)
 -u, --ollama-url STR           Ollama service URL (default: http://localhost:11434)
+--server-backend STR           Model serving backend: "mpltx" or "ollama" (default: mpltx)
+--mpltx-home PATH              MPLTX data directory (default: ~/.mpltx)
+--mpltx-port INT               MPLTX HTTP API port (default: 11435)
+--mpltx-gpu-layers INT         MPLTX GPU offload layers, -1=all (default: -1)
+--mpltx-context-size INT       MPLTX context window size (default: 4096)
+```
+
+**Per-Stage Model Overrides (environment variables):**
+```
+BOURBON_VISION_ANALYSIS_MODEL=qwen2-vl:7b   # Override vision analysis stage
+BOURBON_METADATA_GENERATION_MODEL=gpt-oss:120b  # Override metadata generation
 ```
 
 **Behavior Options:**
@@ -930,10 +965,15 @@ process                                    # Process current dir
 process -f /path/to/photos                 # Process specific folder
 process -o /custom/output                  # Custom output dir
 
-# Model selection
-process -m qwen3-vl:32b                    # Best balance
-process -m gpt-oss:120b                    # Most accurate
-process -m qwen2-vl:7b                     # Fastest
+# Model selection (per-stage by default)
+process -m qwen3-vl:32b                    # Best balance (global)
+process -m gpt-oss:120b                    # Most accurate (global)
+process -m qwen2-vl:7b                     # Fastest (global)
+# Per-stage: BOURBON_VISION_ANALYSIS_MODEL=qwen2-vl:7b process
+
+# Model serving
+process --server-backend ollama            # Use Ollama backend
+process --server-backend mpltx --mpltx-port 11435  # Configure MPLTX
 
 # Batch control
 process -b all                             # No batching
@@ -943,9 +983,9 @@ process --lookahead 5                      # Aggressive grouping
 # Interactive & review
 process -i                                 # Interactive mode
 process --dry-run                          # Test grouping
+process --debug                            # Verbose + model selector report
 
 # Troubleshooting
-process --debug                            # Verbose logging
 retry --report processed/bottle/error.json  # Retry failed
 feedback -b 1 -i                           # Correct previous batch
 

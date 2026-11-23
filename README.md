@@ -4,11 +4,41 @@ AI-powered tool to analyze bourbon bottle images, extract metadata, and generate
 
 ## Features
 
-- Image analysis with Qwen3-VL multimodal model
-- Metadata extraction with GPT-OSS text model
+- **Per-stage model selection** — Different models for OCR, vision analysis, metadata generation, etc.
+- **Automatic fallback chains** — When the preferred model is unavailable, tries the next in chain automatically
+- **Usage tracking & reporting** — See which models were used, how many fallbacks, total processing time per stage
+- **MPLTX model serving** — Native process management (start, stop, pull, load/unload, resource monitoring)
+- **Metadata extraction** with GPT-OSS text model
 - Generates markdown files with bottle information (name, distillery, MSRP, release notes, tasting notes)
 - Batch processing of image folders
 - Local-only processing (no cloud API calls)
+
+## Model Selector
+
+The model selector assigns the right model to each pipeline stage, manages fallback chains, and tracks usage.
+
+| Stage | Primary Model | Fallback |
+|-------|--------------|----------|
+| OCR / Text Extraction | Tesseract-OCR | qwen2-vl:7b |
+| Vision Model Analysis | qwen3-vl:32b | qwen2-vl:7b |
+| Image Grouping (Similarity) | ORB (OpenCV) | Filename heuristics |
+| Quantity Detection | Hash-based | Visual analysis |
+| Metadata Generation | gpt-oss:120b | qwen3-vl:32b |
+| Web Research | DuckDuckGo API | Skip (non-blocking) |
+| Error Classification | Rule-based | N/A |
+| Preview Generation | Template Markdown | N/A |
+
+### Model Serving Backends
+
+- **MPLTX** (preferred): Native process management with configurable port, GPU layers, context size, and keep-alive
+- **Ollama** (backward compatible): Auto-starts Ollama if not running
+
+### Usage Reporting
+
+At the end of processing, a summary is printed showing:
+- Total/successful/fallback model calls
+- Total processing duration
+- Breakdown by stage and by model name
 
 ## Documentation
 
@@ -106,6 +136,45 @@ python scraper.py --image-folder ./bourbon_photos
 python scraper.py --image-folder ./photos --model qwen2-vl:7b
 ```
 
+### Per-Stage Model Selection
+
+By default, each pipeline stage uses its recommended model (see table above). Override the global default:
+
+```bash
+python scraper.py --model llama3.2
+```
+
+This sets `llama3.2` as the primary model for all AI stages. Per-stage overrides via environment variables:
+
+```bash
+# Override vision analysis stage specifically
+BOURBON_VISION_ANALYSIS_MODEL=qwen2-vl:7b python scraper.py
+```
+
+### Model Serving Backend
+
+Choose between MPLTX (preferred) and Ollama:
+
+```bash
+# Use Ollama backend (backward compatible)
+python scraper.py --server-backend ollama
+
+# Configure MPLTX settings
+python scraper.py --server-backend mpltx \
+  --mpltx-home ~/.mpltx \
+  --mpltx-port 11435 \
+  --mpltx-gpu-layers 32 \
+  --mpltx-context-size 4096
+```
+
+### Debug Mode — Model Selector Report
+
+```bash
+python scraper.py --debug
+```
+
+In debug mode, the model selector prints a stage report showing primary models, fallback chains, and descriptions for each stage.
+
 ### Help
 
 ```bash
@@ -119,13 +188,26 @@ python scraper.py --help
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `--image-folder` | `.` | Folder containing bottle images |
-| `--model` | `qwen3-vl:32b` | Ollama model for image analysis |
+| `--model` | `qwen3-vl:32b` | Global default model (sets primary for all AI stages) |
+| `--server-backend` | `mpltx` | Model serving backend: `mpltx` or `ollama` |
+| `--mpltx-home` | `~/.mpltx` | MPLTX data directory |
+| `--mpltx-port` | `11435` | MPLTX HTTP API port |
+| `--mpltx-gpu-layers` | `-1` | MPLTX GPU offload layers (`-1` = all) |
+| `--mpltx-context-size` | `4096` | MPLTX context window size |
 
 ### Environment Variables
 
 The script auto-configures Ollama internally:
 - `OLLAMA_MAX_LOADED_MODELS=3` - Keep 3 models in memory
 - `OLLAMA_KEEP_ALIVE=-1` - Keep models loaded indefinitely
+
+Model server settings:
+- `BOURBON_SERVER_BACKEND` - Override backend: `mpltx` or `ollama`
+- `BOURBON_MPLTX_HOME` - Override MPLTX data directory
+- `BOURBON_MPLTX_PORT` - Override MPLTX port
+- `BOURBON_MPLTX_GPU_LAYERS` - Override GPU offload layers
+- `BOURBON_MPLTX_CONTEXT_SIZE` - Override context window size
+- `BOURBON_<STAGE>_MODEL` - Per-stage model override (e.g., `BOURBON_VISION_ANALYSIS_MODEL`)
 
 Adjust models in `scraper.py` if needed.
 
@@ -169,6 +251,24 @@ curl http://localhost:11434/api/tags
 Pull the required model:
 ```bash
 ollama pull qwen3-vl:32b
+```
+
+### Wrong model for a stage
+
+The model selector uses the best model for each stage by default. See the [Model Selector](#model-selector) table above. To override:
+
+```bash
+# Global override
+python scraper.py --model qwen2-vl:7b
+
+# Per-stage override
+BOURBON_VISION_ANALYSIS_MODEL=qwen2-vl:7b python scraper.py
+```
+
+### Using Ollama backend instead of MPLTX
+
+```bash
+python scraper.py --server-backend ollama --ollama-url http://localhost:11434
 ```
 
 ### Out of memory errors

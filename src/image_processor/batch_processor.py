@@ -10,12 +10,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from typing import TYPE_CHECKING
+
 import cv2
 import numpy as np
 
 from image_processor.bottle_analyzer import BottleAnalyzer
 from models.bottle import Correction, ExtractedMetadata
 from models.image import Image
+
+if TYPE_CHECKING:
+    from lib.model_selector import ModelSelector
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +62,7 @@ class BatchProcessor:
         lookahead: int = 3,
         bottle_analyzer: Optional[BottleAnalyzer] = None,
         similarity_threshold: float = 0.7,
+        model_selector: Optional["ModelSelector"] = None,
     ):
         """Initialize batch processor.
 
@@ -65,6 +71,7 @@ class BatchProcessor:
             lookahead: Number of images to peek ahead for multi-angle grouping.
             bottle_analyzer: Optional BottleAnalyzer instance.
             similarity_threshold: Minimum similarity score for grouping (0.0-1.0).
+            model_selector: Optional ModelSelector for per-stage model resolution.
         """
         if batch_size == "all":
             self.batch_size = batch_size
@@ -73,6 +80,7 @@ class BatchProcessor:
         self.lookahead = lookahead
         self.bottle_analyzer = bottle_analyzer or BottleAnalyzer()
         self.similarity_threshold = similarity_threshold
+        self.model_selector = model_selector
 
         logger.debug(
             "Initialized BatchProcessor: batch_size=%s, lookahead=%d, similarity_threshold=%.2f",
@@ -282,13 +290,17 @@ class BatchProcessor:
 
         Args:
             batch: List of image groups to process.
-            vision_model: Vision model name for Ollama.
+            vision_model: Vision model name for Ollama (overridden by model_selector).
 
         Returns:
             BatchResult with processed bottles and metadata.
         """
         batch_id = id(batch)
         logger.info("Processing batch with %d image groups", len(batch))
+
+        # Pass model_selector to bottle_analyzer if available (T164)
+        if self.model_selector is not None:
+            self.bottle_analyzer.model_selector = self.model_selector
 
         result = BatchResult(batch_id=batch_id)
 

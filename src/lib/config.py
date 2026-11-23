@@ -41,6 +41,13 @@ class Config:
     # Ollama connection
     ollama_url: str = "http://localhost:11434"
 
+    # Model server settings
+    server_backend: str = "mpltx"  # "mpltx" or "ollama"
+    mpltx_home: str = "~/.mpltx"
+    mpltx_port: int = 11435
+    mpltx_gpu_layers: int = -1  # -1 = all layers on GPU
+    mpltx_context_size: int = 4096
+
     # Output settings
     output_dir: str = "processed/"
     allow_retry: bool = True
@@ -244,6 +251,22 @@ class Config:
             self.get_url("ollama_url")
         except ValueError as e:
             errors.append(str(e))
+
+        # Validate server_backend
+        if self.server_backend not in ("mpltx", "ollama"):
+            errors.append(f"server_backend must be 'mpltx' or 'ollama', got '{self.server_backend}'")
+
+        # Validate mpltx_port
+        if not (1024 <= self.mpltx_port <= 65535):
+            errors.append(f"mpltx_port must be 1024-65535, got {self.mpltx_port}")
+
+        # Validate mpltx_gpu_layers
+        if self.mpltx_gpu_layers < -1:
+            errors.append(f"mpltx_gpu_layers must be >= -1, got {self.mpltx_gpu_layers}")
+
+        # Validate mpltx_context_size
+        if self.mpltx_context_size < 256:
+            errors.append(f"mpltx_context_size must be >= 256, got {self.mpltx_context_size}")
 
         if errors:
             raise ValueError("Configuration validation failed:\n" + "\n".join(f"  - {e}" for e in errors))

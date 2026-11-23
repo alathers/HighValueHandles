@@ -100,6 +100,37 @@ def parse_args(argv: list | None = None) -> argparse.Namespace:
         default="http://localhost:11434",
         help="Ollama service URL (default: http://localhost:11434)",
     )
+    process_parser.add_argument(
+        "--server-backend",
+        type=str,
+        choices=["mpltx", "ollama"],
+        default="mpltx",
+        help="Model serving backend (default: mpltx)",
+    )
+    process_parser.add_argument(
+        "--mpltx-home",
+        type=Path,
+        default=None,
+        help="MPLTX data directory (default: ~/.mpltx)",
+    )
+    process_parser.add_argument(
+        "--mpltx-port",
+        type=int,
+        default=None,
+        help="MPLTX HTTP API port (default: 11435)",
+    )
+    process_parser.add_argument(
+        "--mpltx-gpu-layers",
+        type=int,
+        default=None,
+        help="MPLTX GPU offload layers, -1=all (default: -1)",
+    )
+    process_parser.add_argument(
+        "--mpltx-context-size",
+        type=int,
+        default=None,
+        help="MPLTX context window size (default: 4096)",
+    )
 
     # Behavior options
     process_parser.add_argument(
@@ -270,31 +301,48 @@ def pre_flight_checks(args: argparse.Namespace) -> int:
 
     logger.info("Found %s images in %s", len(image_files), args.image_folder)
 
-    # Check Ollama service reachable
+    # Check Ollama/MPLTX service reachable and required models available
     try:
-        ollama_client = OllamaClient(base_url=args.ollama_url)
-        if not ollama_client.health_check():
-            logger.error("Ollama service not reachable at %s", args.ollama_url)
-            return 2
-        logger.info("Ollama service is reachable")
-    except Exception:
-        logger.exception("Failed to connect to Ollama")
-        return 2
+        from lib.model_selector import ModelSelector, ModelStage
+        from lib.model_server import ModelServerManager
 
-    # Check model available
-    try:
-        ollama_client = OllamaClient(base_url=args.ollama_url)
-        if not ollama_client.is_model_available(args.model):
-            logger.error("Model '%s' is not available in Ollama", args.model)
-            logger.info("Available models:")
-            models = ollama_client.list_models()
-            if models:
-                for model in models:
-                    logger.info("  - %s", model)
-            return 2
-        logger.info("Model '%s' is available", args.model)
+        # Build kwargs for ModelServerManager from CLI args
+        server_kwargs: dict = {
+            "backend": getattr(args, "server_backend", "mpltx"),
+        }
+        if getattr(args, "mpltx_home", None) is not None:
+            server_kwargs["mpltx_home"] = str(args.mpltx_home)
+        if getattr(args, "mpltx_port", None) is not None:
+            server_kwargs["mpltx_port"] = args.mpltx_port
+        if getattr(args, "mpltx_gpu_layers", None) is not None:
+            server_kwargs["mpltx_gpu_layers"] = args.mpltx_gpu_layers
+        if getattr(args, "mpltx_context_size", None) is not None:
+            server_kwargs["mpltx_context_size"] = args.mpltx_context_size
+
+        # Create and initialize the server manager
+        server_manager = ModelServerManager(**server_kwargs)
+
+        # Ensure the server is running
+        server_manager.ensure_running()
+        logger.info("Model server is reachable at %s", server_manager.state.base_url)
+
+        # Ensure required models are available
+        required_models = ["qwen3-vl:32b", "qwen2-vl:7b", "gpt-oss:120b"]
+        server_manager.ensure_models(required_models)
+
+        # Create model selector and print stage report in debug mode
+        selector = ModelSelector.from_config(
+            type("Config", (), {"model": args.model})()
+        )
+        if args.debug:
+            selector.print_stage_report()
+
+        # Store server_manager for later use in process_command
+        args._server_manager = server_manager
+        args._model_selector = selector
+
     except Exception:
-        logger.exception("Failed to check model availability")
+        logger.exception("Failed to initialize model server")
         return 2
 
     # Check Tesseract OCR installed
@@ -337,10 +385,29 @@ def process_command(args: argparse.Namespace) -> int:
     if exit_code != 0:
         return exit_code
 
-    # Initialize components
-    ollama_client = OllamaClient(base_url=args.ollama_url)
+    # Initialize components using model selector and server from pre-flight
     image_organizer = ImageOrganizer()
-    bottle_analyzer = BottleAnalyzer(ollama_client=ollama_client, image_organizer=image_organizer)
+
+    # Get model selector and server manager from pre-flight (or create defaults)
+    model_selector = getattr(args, "_model_selector", None)
+    server_manager = getattr(args, "_server_manager", None)
+
+    # Build bottle_analyzer: use model_selector if available, else fall back to OllamaClient
+    if model_selector is not None and server_manager is not None:
+        ollama_client = server_manager.get_client()
+        bottle_analyzer = BottleAnalyzer(
+            ollama_client=ollama_client,
+            image_organizer=image_organizer,
+        )
+    else:
+        # Fallback: direct OllamaClient (backward compatible)
+        from lib.ollama_client import OllamaClient
+        ollama_client = OllamaClient(base_url=args.ollama_url)
+        bottle_analyzer = BottleAnalyzer(
+            ollama_client=ollama_client,
+            image_organizer=image_organizer,
+        )
+
     batch_processor = BatchProcessor(
         batch_size=args.batch_size,
         lookahead=args.lookahead,
@@ -507,6 +574,41 @@ def process_command(args: argparse.Namespace) -> int:
         logger.error("All bottles failed to process")
         return 4
     logger.warning("Some bottles failed (%s/%s)", failed_count, len(image_groups))
+
+    # Print usage summary (T158)
+    selector = getattr(args, "_model_selector", None)
+    server_manager = getattr(args, "_server_manager", None)
+    if selector is not None and hasattr(selector, "get_usage_summary"):
+        summary = selector.get_usage_summary()
+        if summary.get("total_calls", 0) > 0:
+            logger.info("=" * 60)
+            logger.info("Model Usage Summary")
+            logger.info("=" * 60)
+            logger.info("  Total calls:      %s", summary.get("total_calls", 0))
+            logger.info("  Successful calls: %s", summary.get("successful_calls", 0))
+            logger.info("  Fallback calls:   %s", summary.get("fallback_calls", 0))
+            logger.info("  Total duration:   %.2fs", summary.get("total_duration_seconds", 0))
+            by_stage = summary.get("by_stage", {})
+            if by_stage:
+                logger.info("  By stage:")
+                for stage_name, stats in by_stage.items():
+                    logger.info("    %s: %s calls, %s success, %s fallback",
+                                stage_name, stats.get("total", 0),
+                                stats.get("success", 0), stats.get("fallback", 0))
+            by_model = summary.get("by_model", {})
+            if by_model:
+                logger.info("  By model:")
+                for model_name, stats in by_model.items():
+                    logger.info("    %s: %s calls, %s success",
+                                model_name, stats.get("total", 0), stats.get("success", 0))
+
+    # Close server manager (T159)
+    if server_manager is not None:
+        try:
+            server_manager.close()
+        except Exception:
+            pass
+
     return 1
 
 
@@ -733,7 +835,18 @@ def retry_command(args: argparse.Namespace) -> int:
         return 1
 
     # Initialize components for re-processing
-    ollama_client = OllamaClient(base_url="http://localhost:11434")
+    try:
+        from lib.model_selector import ModelSelector, ModelStage
+        from lib.model_server import ModelServerManager
+
+        server_kwargs: dict = {"backend": "mpltx"}
+        server_manager = ModelServerManager(**server_kwargs)
+        server_manager.ensure_running()
+        ollama_client = server_manager.get_client()
+    except Exception:
+        from lib.ollama_client import OllamaClient
+        ollama_client = OllamaClient(base_url="http://localhost:11434")
+
     image_organizer = ImageOrganizer()
     bottle_analyzer = BottleAnalyzer(ollama_client=ollama_client, image_organizer=image_organizer)
 

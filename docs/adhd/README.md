@@ -26,6 +26,23 @@ ollama pull qwen3-vl:32b  # Recommended: fast & accurate
 ./install.sh
 ```
 
+## Model Selector
+
+The system uses different models for different pipeline stages:
+
+| Stage | Primary Model | Fallback |
+|-------|--------------|----------|
+| OCR / Text Extraction | Tesseract-OCR | qwen2-vl:7b |
+| Vision Model Analysis | qwen3-vl:32b | qwen2-vl:7b |
+| Metadata Generation | gpt-oss:120b | qwen3-vl:32b |
+
+Override the global default:
+
+```bash
+# Use a faster model for all AI stages
+process --model qwen2-vl:7b
+```
+
 ## Key Commands
 
 **Process one bottle** (current folder images → processed/ folder):

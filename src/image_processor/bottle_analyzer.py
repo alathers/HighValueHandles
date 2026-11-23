@@ -5,7 +5,9 @@ and creates Bottle model instances with extracted metadata.
 """
 
 import logging
+import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from image_processor.image_organizer import ImageOrganizer
 from image_processor.text_extractor import TextExtractor
@@ -14,6 +16,9 @@ from lib.error_handling import RetryManager
 from lib.ollama_client import OllamaClient
 from models.bottle import ExtractedMetadata
 from models.image import Image
+
+if TYPE_CHECKING:
+    from lib.model_selector import ModelSelector, ModelStage
 
 # Maximum number of angle photos expected for a single bottle
 MAX_ANGLES_PER_BOTTLE = 4
@@ -31,6 +36,7 @@ class BottleAnalyzer:
         text_extractor: TextExtractor for OCR and metadata extraction.
         ollama_client: Ollama client for vision model calls.
         retry_manager: RetryManager for automatic retries.
+        model_selector: Optional ModelSelector for per-stage model resolution.
     """
 
     def __init__(
@@ -39,6 +45,7 @@ class BottleAnalyzer:
         ollama_client: OllamaClient | None = None,
         retry_manager: RetryManager | None = None,
         image_organizer: ImageOrganizer | None = None,
+        model_selector: "ModelSelector | None" = None,
     ):
         """Initialize bottle analyzer.
 
@@ -47,11 +54,13 @@ class BottleAnalyzer:
             ollama_client: Optional OllamaClient instance.
             retry_manager: Optional RetryManager instance.
             image_organizer: Optional ImageOrganizer instance.
+            model_selector: Optional ModelSelector for per-stage model resolution.
         """
         self.text_extractor = text_extractor or TextExtractor(retry_manager=retry_manager)
         self.ollama_client = ollama_client or OllamaClient()
         self.retry_manager = retry_manager or RetryManager()
         self.image_organizer = image_organizer or ImageOrganizer()
+        self.model_selector = model_selector
 
     def process_single_bottle(
         self,
@@ -62,7 +71,7 @@ class BottleAnalyzer:
 
         Args:
             images: List of Image objects for this bottle.
-            vision_model: Vision model name for Ollama.
+            vision_model: Vision model name for Ollama (overridden by model_selector).
 
         Returns:
             Tuple of (bottle_dict, metadata) where:
@@ -70,6 +79,15 @@ class BottleAnalyzer:
                 - metadata: ExtractedMetadata with full OCR text and confidence scores
         """
         logger.info("Processing bottle with %d image(s)", len(images))
+
+        # Resolve model from selector if available (T161)
+        if self.model_selector is not None:
+            try:
+                from lib.model_selector import ModelStage
+
+                vision_model = self.model_selector.get_model(ModelStage.VISION_ANALYSIS)
+            except Exception:
+                pass  # Fall back to passed-in vision_model
 
         # Use first non-bill image for metadata extraction
         primary_image = None
@@ -83,7 +101,7 @@ class BottleAnalyzer:
 
         # Extract OCR text from all images
         logger.debug("Extracting OCR text from %d image(s)", len(images))
-        ocr_texts = []
+        ocr_texts: list[str] = []
         for img in images:
             try:
                 text = self.text_extractor.extract_with_retry(
@@ -101,22 +119,56 @@ class BottleAnalyzer:
         logger.debug("Combined OCR text length: %d characters", len(combined_ocr))
 
         # Analyze with vision model for metadata
-        if primary_image:
-            logger.info("Analyzing with vision model: %s", vision_model)
-            metadata = self.analyze_with_vision_model(
-                Path(primary_image.path),
-                combined_ocr,
-                vision_model,
+        start_time = time.time()
+        success = False
+        error_msg: str | None = None
+        try:
+            if primary_image:
+                logger.info("Analyzing with vision model: %s", vision_model)
+                metadata = self.analyze_with_vision_model(
+                    Path(primary_image.path),
+                    combined_ocr,
+                    vision_model,
+                )
+                success = True
+            else:
+                # No images provided - still call vision model (allows patching in tests)
+                # Vision model implementation should handle empty case gracefully
+                logger.warning("No primary image found, attempting vision model anyway")
+                metadata = self.analyze_with_vision_model(
+                    Path(""),
+                    combined_ocr,
+                    vision_model,
+                )
+                success = True
+        except Exception:
+            logger.exception("Vision model analysis failed")
+            error_msg = "Vision model analysis failed"
+            metadata = ExtractedMetadata(
+                full_text=combined_ocr,
+                selected_text=combined_ocr,
+                source_images=[str(primary_image.path)] if primary_image else [],
             )
-        else:
-            # No images provided - still call vision model (allows patching in tests)
-            # Vision model implementation should handle empty case gracefully
-            logger.warning("No primary image found, attempting vision model anyway")
-            metadata = self.analyze_with_vision_model(
-                Path(""),
-                combined_ocr,
-                vision_model,
-            )
+
+        # Record usage tracking (T162)
+        if self.model_selector is not None and hasattr(self.model_selector, "record_usage"):
+            try:
+                from lib.model_selector import ModelStage
+
+                duration = time.time() - start_time
+                fallback_used = (
+                    self.model_selector.get_model(ModelStage.VISION_ANALYSIS) != vision_model
+                )
+                self.model_selector.record_usage(
+                    stage=ModelStage.VISION_ANALYSIS,
+                    model=vision_model,
+                    success=success,
+                    duration=duration,
+                    fallback_used=fallback_used,
+                    error=error_msg,
+                )
+            except Exception:
+                pass  # Usage tracking failure should not break processing
 
         # Build bottle dict from metadata
         bottle_dict = self._build_bottle_dict(metadata, images)
