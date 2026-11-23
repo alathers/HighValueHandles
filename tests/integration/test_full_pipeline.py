@@ -4,6 +4,7 @@ Tests verify the complete workflow from image input to processed bottle metadata
 Uses pytest.mark.integration to mark these tests as requiring external services.
 """
 
+import json
 import tempfile
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -14,8 +15,20 @@ import pytest
 from image_processor.bottle_analyzer import BottleAnalyzer
 from image_processor.batch_processor import BatchProcessor
 from image_processor.image_organizer import ImageOrganizer
+from lib.exceptions import VisionAnalysisError
+from lib.ollama_client import VisionChatResult
 from models.bottle import Bottle, ExtractedMetadata
 from models.image import Image
+
+
+def _vision_reply(**fields) -> VisionChatResult:
+    """A schema-shaped JSON vision reply (unset keys are null)."""
+    keys = ("name", "distillery", "specific_release", "msrp", "proof", "abv", "age",
+            "batch_number", "tasting_notes")
+    body = {k: None for k in keys}
+    body.update({"confidence": "high", "same_bottle": True})
+    body.update(fields)
+    return VisionChatResult(content=json.dumps(body), done_reason="stop")
 
 
 # Marker for integration tests that require Ollama
@@ -47,13 +60,13 @@ class TestFullPipelineEndToEnd:
         )
 
         # Mock vision model response
-        with patch.object(analyzer.ollama_client, 'image_to_text') as mock_vision:
-            mock_vision.return_value = (
-                "name: Test Bourbon\n"
-                "distillery: Test Distillery\n"
-                "msrp: 50.00\n"
-                "proof: 90 Proof\n"
-                "age: 12 Years\n"
+        with patch.object(analyzer.ollama_client, 'chat_with_images') as mock_vision:
+            mock_vision.return_value = _vision_reply(
+                name="Test Bourbon",
+                distillery="Test Distillery",
+                msrp=50.00,
+                proof=90,
+                age="12 Years",
             )
 
             # Execute
@@ -65,7 +78,9 @@ class TestFullPipelineEndToEnd:
             assert bottle_dict["msrp"] == "50.00"
             assert bottle_dict["proof"] == "90 Proof"
             assert bottle_dict["age"] == "12 Years"
+            assert bottle_dict["confidence"] == "HIGH"
             assert isinstance(metadata, ExtractedMetadata)
+            assert mock_vision.call_args.kwargs["image_paths"] == [img_path]
 
     @has_ollama
     def test_multi_angle_bottle_processing(self, tmp_path):
@@ -91,9 +106,11 @@ class TestFullPipelineEndToEnd:
         ]
 
         # Mock vision and OCR
-        with patch.object(analyzer.ollama_client, 'image_to_text') as mock_vision, \
+        with patch.object(analyzer.ollama_client, 'chat_with_images') as mock_vision, \
              patch.object(analyzer.text_extractor, 'extract_with_retry') as mock_ocr:
-            mock_vision.return_value = "name: Multi Angle Bourbon\ndistillery: Test Distillery\nmsrp: 75.00"
+            mock_vision.return_value = _vision_reply(
+                name="Multi Angle Bourbon", distillery="Test Distillery", msrp=75.00
+            )
             mock_ocr.side_effect = [
                 "Front label text",
                 "Back label text",
@@ -108,6 +125,10 @@ class TestFullPipelineEndToEnd:
             assert len(bottle_dict["images"]) == 3
             # Verify OCR was called for all images
             assert mock_ocr.call_count == 3
+            # All three photos went to ONE vision call, primary first
+            mock_vision.assert_called_once()
+            assert mock_vision.call_args.kwargs["image_paths"] == [img1_path, img2_path, img3_path]
+            assert metadata.full_text == "Front label text\nBack label text\nClose label text"
 
     def test_bottle_model_from_extraction_result(self, tmp_path):
         """Test creating Bottle model from extraction results without Ollama.
@@ -204,18 +225,15 @@ class TestPipelineErrorHandling:
         test_image = Image(path=str(img_path), category="BOTTLE", is_primary=True)
 
         # Mock vision model to raise exception
-        with patch.object(analyzer.ollama_client, 'image_to_text') as mock_vision:
-            mock_vision.side_effect = Exception("Vision model unavailable")
+        with patch.object(analyzer.ollama_client, 'chat_with_images') as mock_vision:
+            mock_vision.side_effect = Exception("Vision model exploded")
 
-            # Execute - should handle gracefully
             with patch.object(analyzer.text_extractor, 'extract_with_retry') as mock_ocr:
-                mock_ocr.return_value = "Test Bourbon Result"  # Fallback OCR text
+                mock_ocr.return_value = "Test Bourbon Result"
 
-                bottle_dict, metadata = analyzer.process_single_bottle([test_image])
-
-                # Should still return a result with fallback values
-                assert bottle_dict is not None
-                assert bottle_dict["name"] != "Unknown"  # Fallback OCR should provide name
+                # A vision failure is a failure, never an OCR-only "Unknown Bottle"
+                with pytest.raises(VisionAnalysisError, match="Vision model exploded"):
+                    analyzer.process_single_bottle([test_image])
 
     def test_invalid_image_handling(self, tmp_path):
         """Test handling of non-image files in input."""

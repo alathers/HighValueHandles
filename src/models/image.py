@@ -63,6 +63,12 @@ class Image:
         is_primary: Whether this is the primary image for the bottle.
         is_duplicate: Whether this image is a duplicate of another.
         duplicate_of_id: ID/path of the original image this duplicates.
+        capture_time: Capture time in seconds (EXIF, as UTC epoch seconds),
+            or None if unknown. Set by grouping.
+        capture_time_source: Where capture_time came from ('exif_original',
+            'exif_digitized', 'exif_datetime', 'mtime' or 'none').
+        near_duplicate_of: Path of an almost identical photo taken just
+            before this one (a burst retake), or None.
     """
 
     path: Path
@@ -74,6 +80,9 @@ class Image:
     is_primary: bool = False
     is_duplicate: bool = False
     duplicate_of_id: Optional[str] = None
+    capture_time: Optional[float] = None
+    capture_time_source: str = "none"
+    near_duplicate_of: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization.
@@ -91,6 +100,9 @@ class Image:
             "is_primary": self.is_primary,
             "is_duplicate": self.is_duplicate,
             "duplicate_of_id": self.duplicate_of_id,
+            "capture_time": self.capture_time,
+            "capture_time_source": self.capture_time_source,
+            "near_duplicate_of": self.near_duplicate_of,
         }
 
     @classmethod
@@ -113,6 +125,9 @@ class Image:
             is_primary=data.get("is_primary", False),
             is_duplicate=data.get("is_duplicate", False),
             duplicate_of_id=data.get("duplicate_of_id"),
+            capture_time=data.get("capture_time"),
+            capture_time_source=data.get("capture_time_source", "none"),
+            near_duplicate_of=data.get("near_duplicate_of"),
         )
 
     def to_json(self, indent: int = 2) -> str:
@@ -151,3 +166,10 @@ class Image:
         if not isinstance(other, Image):
             return False
         return self.path == other.path
+
+
+def group_bottle_id(group: "list[Image]") -> str:
+    """Bottle ID of an image group: its assigned ``bottle_ref``, else the first photo's stem."""
+    if not group:
+        return "unknown"
+    return group[0].bottle_ref or Path(group[0].path).stem

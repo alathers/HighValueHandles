@@ -5,6 +5,7 @@ specs/001-bourbon-image-processor/contracts/cli-interface.md.
 """
 
 import json
+import os
 import shlex
 import shutil
 import subprocess
@@ -20,17 +21,55 @@ from cli.commands import process_command, retry_command, feedback_command
 from lib.exceptions import OllamaConnectionError
 
 
+@pytest.fixture(autouse=True)
+def _run_in_tmp_cwd(tmp_path, monkeypatch):
+    """Run every test (and the CLI subprocesses it starts) from ``tmp_path``.
+
+    Many tests invoke ``process`` without ``-f``/``-o``; the defaults ``.``
+    and ``processed`` are relative to the working directory, so without this
+    the suite would scan the repo and write ``processed/.bourbon_output``
+    into it.
+    """
+    monkeypatch.chdir(tmp_path)
+
+
+#: A closed local port: CLI subprocesses that get as far as probing the model
+#: server see "connection refused" instead of the developer's real Ollama
+#: (the in-process hermetic guard does not reach child processes).
+CLOSED_OLLAMA_URL = "http://127.0.0.1:9"
+NO_SERVER = ["--ollama-url", CLOSED_OLLAMA_URL]
+
+
+def expected_dry_run_exit() -> int:
+    """Exit code of a dry run over a folder with images and no model server.
+
+    1 without Tesseract (checked first), 2 if Ollama could not be started by
+    a real run (no executable), else 0 ("would be started").
+    """
+    if shutil.which("tesseract") is None:
+        return 1
+    if shutil.which(os.environ.get("OLLAMA_BIN", "ollama")) is None:
+        return 2
+    return 0
+
+
+def assert_clean(result: subprocess.CompletedProcess, code: int) -> None:
+    """The CLI exited with ``code`` and did not crash."""
+    output = result.stdout + result.stderr
+    assert "Traceback" not in output, output
+    assert result.returncode == code, output
+
+
 def get_python_executable() -> str:
     """Get the appropriate Python executable path for subprocess calls.
 
-    Tries to find python3 or python, falling back to sys.executable.
+    Uses the interpreter running the test suite, so subprocesses see the same
+    environment (venv, installed package) regardless of what ``python3`` is
+    first on PATH.
 
     Returns:
         Path to Python executable.
     """
-    for candidate in ["python3", "python"]:
-        if result := shutil.which(candidate):
-            return result
     return sys.executable
 
 
@@ -93,12 +132,12 @@ class TestCLIProcessCommand:
         # Valid integers
         for size in ["1", "5", "10"]:
             result = subprocess.run(
-                [get_python_executable(), "-m", "cli.commands", "process", "--batch-size", size, "--dry-run"],
+                [get_python_executable(), "-m", "cli.commands", "process", "--batch-size", size, "--dry-run",
+                 *NO_SERVER],
                 capture_output=True,
                 text=True,
             )
-            # Dry-run should succeed even without real images
-            # Exit code should not be invalid argument error (1), but possibly 3 (no images) or 0 (dry-run success)
+            assert_clean(result, 3)  # valid argument; the empty tmp_path has no images
 
         # Invalid integer (negative)
         result = subprocess.run(
@@ -110,11 +149,12 @@ class TestCLIProcessCommand:
 
         # Valid 'all'
         result = subprocess.run(
-            [get_python_executable(), "-m", "cli.commands", "process", "--batch-size", "all", "--dry-run"],
+            [get_python_executable(), "-m", "cli.commands", "process", "--batch-size", "all", "--dry-run",
+             *NO_SERVER],
             capture_output=True,
             text=True,
         )
-        # May fail on no images but should not fail on invalid argument
+        assert_clean(result, 3)
 
     def test_process_image_folder_validation(self):
         """Test --image-folder validation: must exist, be directory, be readable.
@@ -157,18 +197,22 @@ class TestCLIProcessCommand:
         assert result.returncode != 0
 
     def test_process_lookahead_validation(self):
-        """Test --lookahead validation: integer 0-10.
+        """Test --lookahead validation: integer 0-10 (deprecated and ignored, still range-checked).
 
         Contract: See Validation Rules > Option Validation (line 397).
         """
         # Valid range
         for value in ["0", "5", "10"]:
             result = subprocess.run(
-                [get_python_executable(), "-m", "cli.commands", "process", "--lookahead", value, "--dry-run"],
+                [get_python_executable(), "-m", "cli.commands", "process", "--lookahead", value, "--dry-run",
+                 *NO_SERVER],
                 capture_output=True,
                 text=True,
             )
-            # Should not exit with argument error
+            assert_clean(result, 3)
+
+        # Deprecated: accepted, ignored, and says so
+        assert "--lookahead is deprecated and ignored" in result.stdout + result.stderr
 
         # Invalid: negative
         result = subprocess.run(
@@ -194,11 +238,12 @@ class TestCLIProcessCommand:
         # Valid range
         for value in ["1", "5", "10"]:
             result = subprocess.run(
-                [get_python_executable(), "-m", "cli.commands", "process", "--concurrency", value, "--dry-run"],
+                [get_python_executable(), "-m", "cli.commands", "process", "--concurrency", value, "--dry-run",
+                 *NO_SERVER],
                 capture_output=True,
                 text=True,
             )
-            # Should not exit with argument error
+            assert_clean(result, 3)
 
         # Invalid: 0
         result = subprocess.run(
@@ -226,14 +271,21 @@ class TestCLIProcessCommand:
             test_file = Path(tmpdir) / "IMG_0001.jpg"
             test_file.write_bytes(b"\xff\xd8\xff\xe0\x00\x10JFIF")  # JPEG header
 
+            out = Path(tmpdir) / "out"
             result = subprocess.run(
-                [get_python_executable(), "-m", "cli.commands", "process", "--image-folder", tmpdir, "--dry-run"],
+                [
+                    get_python_executable(), "-m", "cli.commands", "process", "--image-folder", tmpdir,
+                    "-o", str(out), "--dry-run", *NO_SERVER,
+                ],
                 capture_output=True,
                 text=True,
             )
 
-            # Dry-run should execute without errors and show processing info
-            # Should actually create minimal files for discovery
+            assert_clean(result, expected_dry_run_exit())
+            assert not out.exists()  # a dry run writes nothing
+            if result.returncode == 0:
+                assert "Dry-run mode" in result.stdout
+                assert "IMG_0001" in result.stdout
 
     def test_process_debug_flag(self):
         """Test --debug enables verbose logging.
@@ -246,36 +298,51 @@ class TestCLIProcessCommand:
             test_file = Path(tmpdir) / "IMG_0001.jpg"
             test_file.write_bytes(b"\xff\xd8\xff\xe0\x00\x10JFIF")  # JPEG header
 
+            # --dry-run and a closed server port keep this a pure flag test.
             result = subprocess.run(
-                [get_python_executable(), "-m", "cli.commands", "process", "--image-folder", tmpdir, "--debug"],
+                [
+                    get_python_executable(), "-m", "cli.commands", "process",
+                    "--image-folder", tmpdir, "--debug", "--dry-run", *NO_SERVER,
+                ],
                 capture_output=True,
                 text=True,
             )
-            # Debug flag should not cause invalid argument error
+            assert_clean(result, expected_dry_run_exit())
+            assert " - DEBUG - " in result.stdout
+            assert "TiffImagePlugin" not in result.stdout  # PIL debug noise is silenced
 
     def test_process_interactive_flag(self):
         """Test --interactive enables interactive CLI prompts.
 
         Contract: See Options table (line 34).
         """
+        # The autouse fixture runs this in an empty tmp_path: no images, exit 3
+        # before any server contact or interactive prompt.
         result = subprocess.run(
-            [get_python_executable(), "-m", "cli.commands", "process", "--interactive"],
+            [
+                get_python_executable(), "-m", "cli.commands", "process", "--interactive",
+                "--dry-run", *NO_SERVER,
+            ],
             capture_output=True,
             text=True,
         )
-        # Should not exit with argument error
+        assert_clean(result, 3)
 
     def test_process_include_vendor_images_flag(self):
         """Test --include-vendor-images enables vendor image caching.
 
         Contract: See Options table (line 35).
         """
+        # Runs in an empty tmp_path (autouse fixture): no images, exit 3.
         result = subprocess.run(
-            [get_python_executable(), "-m", "cli.commands", "process", "--include-vendor-images"],
+            [
+                get_python_executable(), "-m", "cli.commands", "process",
+                "--include-vendor-images", "--dry-run", *NO_SERVER,
+            ],
             capture_output=True,
             text=True,
         )
-        # Should not exit with argument error
+        assert_clean(result, 3)
 
 
 class TestRetryFromReportCommand:
@@ -365,39 +432,40 @@ class TestEnvironmentVariables:
 
     def test_env_var_bourbon_image_model(self):
         """Test BORBON_IMAGE_MODEL environment variable."""
-        env = {"BORBON_IMAGE_MODEL": "qwen2-vl:7b"}
+        env = {**os.environ, "BORBON_IMAGE_MODEL": "qwen2-vl:7b"}
         result = subprocess.run(
-            [get_python_executable(), "-m", "cli.commands", "process", "--dry-run"],
+            [get_python_executable(), "-m", "cli.commands", "process", "--dry-run", *NO_SERVER],
             capture_output=True,
             text=True,
             env=env,
         )
-        # Should not exit with argument error
+        assert_clean(result, 3)
 
     def test_env_var_olllama_url(self):
         """Test OLLLAMA_URL environment variable."""
-        env = {"OLLLAMA_URL": "http://localhost:11435"}
+        env = {**os.environ, "OLLLAMA_URL": "http://localhost:11435"}
         result = subprocess.run(
-            [get_python_executable(), "-m", "cli.commands", "process", "--dry-run"],
+            [get_python_executable(), "-m", "cli.commands", "process", "--dry-run", *NO_SERVER],
             capture_output=True,
             text=True,
             env=env,
         )
-        # Should not exit with argument error
+        assert_clean(result, 3)
 
     def test_env_var_always_uppercase(self):
         """Verify CLI arguments override environment variables.
 
         Contract: See Precedence Order (line 275-279).
         """
-        env = {"BORBON_IMAGE_MODEL": "qwen2-vl:7b"}
+        env = {**os.environ, "BORBON_IMAGE_MODEL": "qwen2-vl:7b"}
         result = subprocess.run(
-            [get_python_executable(), "-m", "cli.commands", "process", "--model", "qwen3-vl:32b", "--dry-run"],
+            [get_python_executable(), "-m", "cli.commands", "process", "--model", "qwen3-vl:32b", "--dry-run",
+             *NO_SERVER],
             capture_output=True,
             text=True,
             env=env,
         )
-        # CLI arg should override env var
+        assert_clean(result, 3)
 
 
 class TestExitCodes:
@@ -428,7 +496,7 @@ class TestExitCodes:
                 capture_output=True,
                 text=True,
             )
-            # Should fail with Ollama-related error code (possibly 2 or 1 depending on implementation)
+            assert_clean(result, 2)  # rejected before any connection attempt
 
     def test_exit_code_3_no_valid_images(self):
         """Test exit code 3 when no valid images found.
@@ -438,11 +506,11 @@ class TestExitCodes:
         with tempfile.TemporaryDirectory() as tmpdir:
             # Empty directory
             result = subprocess.run(
-                [get_python_executable(), "-m", "cli.commands", "process", "--image-folder", tmpdir],
+                [get_python_executable(), "-m", "cli.commands", "process", "--image-folder", tmpdir, *NO_SERVER],
                 capture_output=True,
                 text=True,
             )
-            # Should exit with code 3 (no valid images found)
+            assert_clean(result, 3)
 
 
 class TestOutputMessages:
@@ -482,11 +550,11 @@ class TestPreFlightChecks:
         """
         with tempfile.TemporaryDirectory() as tmpdir:
             result = subprocess.run(
-                [get_python_executable(), "-m", "cli.commands", "process", "--image-folder", tmpdir],
+                [get_python_executable(), "-m", "cli.commands", "process", "--image-folder", tmpdir, *NO_SERVER],
                 capture_output=True,
                 text=True,
             )
-            # Should fail before attempting to connect to Ollama
+            assert_clean(result, 3)  # before any model server contact
 
     def test_preflight_ollama_reachable(self):
         """Test pre-flight check verifies Ollama is reachable.
@@ -511,7 +579,7 @@ class TestPreFlightChecks:
                 capture_output=True,
                 text=True,
             )
-            # Should fail on Ollama connection check before processing
+            assert_clean(result, 2)
 
 
 class TestNonFatalErrorsContinue:
@@ -594,3 +662,78 @@ model = "qwen3-vl:32b"
                 config = tomli.load(f)
                 assert "processing" in config
                 assert "ollama" in config
+
+
+class TestEntryPoint:
+    """main(): default subcommand, help on no arguments, signal handling."""
+
+    def test_no_arguments_prints_help_and_returns_1(self, capsys):
+        from cli.commands import main
+
+        assert main([]) == 1
+        assert "usage:" in capsys.readouterr().out
+
+    def test_options_without_subcommand_mean_process(self):
+        from cli.commands import parse_args
+
+        args = parse_args(["-f", "photos", "--dry-run"])
+        assert args.command == "process"
+        assert str(args.image_folder) == "photos"
+        assert parse_args(["--debug", "retry", "--report", "r.json"]).command == "retry"
+
+    def test_top_level_help_still_works(self, capsys):
+        from cli.commands import parse_args
+
+        with pytest.raises(SystemExit) as excinfo:
+            parse_args(["--help"])
+        assert excinfo.value.code == 0
+        assert "process" in capsys.readouterr().out
+
+    def test_main_turns_sigterm_and_sighup_into_exit(self, monkeypatch):
+        """SIGHUP (terminal closed, SSH dropped) must run cleanup like SIGTERM does."""
+        import signal
+
+        from cli import commands
+
+        installed = {}
+        monkeypatch.setattr(commands.signal, "signal", lambda sig, handler: installed.__setitem__(sig, handler))
+        monkeypatch.setattr(commands, "process_command", lambda args: 0)
+        assert commands.main(["process", "--dry-run"]) == 0
+        assert signal.SIGTERM in installed
+        if hasattr(signal, "SIGQUIT"):
+            assert signal.SIGQUIT in installed
+        if hasattr(signal, "SIGHUP"):
+            assert signal.SIGHUP in installed
+            with pytest.raises(SystemExit) as excinfo:
+                installed[signal.SIGHUP](signal.SIGHUP, None)
+            assert excinfo.value.code == 128 + signal.SIGHUP
+
+    def test_debug_logging_silences_pil(self):
+        import logging
+
+        from cli.commands import setup_logging
+
+        setup_logging(debug=True)
+        assert logging.getLogger("PIL").getEffectiveLevel() >= logging.INFO
+
+
+class TestPipelineEdgeCases:
+    """_run_pipeline after pre-flight passed."""
+
+    def test_scan_finding_no_images_exits_3_without_using_the_model(self, tmp_path):
+        import argparse
+        from unittest.mock import MagicMock
+
+        from cli.commands import _run_pipeline
+
+        folder = tmp_path / "photos"
+        (folder / "old").mkdir(parents=True)
+        (folder / "old" / ".bourbon_output").touch()
+        (folder / "old" / "a.jpg").write_bytes(b"x")
+        args = argparse.Namespace(
+            image_folder=folder, output_dir=tmp_path / "out", dry_run=False, batch_size="5",
+            lookahead=3, interactive=False, model=None,
+        )
+        manager = MagicMock()
+        assert _run_pipeline(args, manager, MagicMock()) == 3
+        manager.get_client.assert_not_called()

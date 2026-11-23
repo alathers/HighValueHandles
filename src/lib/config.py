@@ -15,6 +15,11 @@ try:
 except ImportError:
     import tomli as tomllib  # Fallback for Python < 3.11
 
+#: Vision model used when neither ``-m/--model`` nor ``$BOURBON_MODEL`` names
+#: one. The single source of truth for the default; it must be a
+#: vision-capable Ollama tag.
+DEFAULT_VISION_MODEL = "qwen3.6:35b-a3b"
+
 
 @dataclass
 class Config:
@@ -30,11 +35,11 @@ class Config:
     # Image processing settings
     image_folder: str = "."
     batch_size: str = "5"
-    lookahead: int = 3
+    lookahead: int = 3  # deprecated and ignored; kept so old config files still load
     concurrency: int = 3
 
     # AI/model settings
-    model: str = "qwen3-vl:32b"
+    model: str = DEFAULT_VISION_MODEL
     interactive: bool = False
     include_vendor_images: bool = False
 
@@ -42,11 +47,7 @@ class Config:
     ollama_url: str = "http://localhost:11434"
 
     # Model server settings
-    server_backend: str = "mpltx"  # "mpltx" or "ollama"
-    mpltx_home: str = "~/.mpltx"
-    mpltx_port: int = 11435
-    mpltx_gpu_layers: int = -1  # -1 = all layers on GPU
-    mpltx_context_size: int = 4096
+    server_backend: str = "ollama"  # the only supported backend
 
     # Output settings
     output_dir: str = "processed/"
@@ -62,8 +63,13 @@ class Config:
         """Load configuration from file and environment variables."""
         self._load_from_file()
         self._load_from_env()
-        self._apply_cli_args()
+        self._apply_cli_args()  # also normalizes values
         self._setup_logging()
+
+    def _normalize(self):
+        """Canonicalize values whose spelling does not matter (backend name case)."""
+        if isinstance(self.server_backend, str):
+            object.__setattr__(self, "server_backend", self.server_backend.strip().lower())
 
     def _load_from_file(self):
         """Load configuration from .specify_config.toml if exists."""
@@ -110,6 +116,7 @@ class Config:
         for key, value in self._cli_args.items():
             if hasattr(self, key):
                 object.__setattr__(self, key, value)
+        self._normalize()
 
     def _setup_logging(self):
         """Configure logging based on debug flag."""
@@ -252,21 +259,9 @@ class Config:
         except ValueError as e:
             errors.append(str(e))
 
-        # Validate server_backend
-        if self.server_backend not in ("mpltx", "ollama"):
-            errors.append(f"server_backend must be 'mpltx' or 'ollama', got '{self.server_backend}'")
-
-        # Validate mpltx_port
-        if not (1024 <= self.mpltx_port <= 65535):
-            errors.append(f"mpltx_port must be 1024-65535, got {self.mpltx_port}")
-
-        # Validate mpltx_gpu_layers
-        if self.mpltx_gpu_layers < -1:
-            errors.append(f"mpltx_gpu_layers must be >= -1, got {self.mpltx_gpu_layers}")
-
-        # Validate mpltx_context_size
-        if self.mpltx_context_size < 256:
-            errors.append(f"mpltx_context_size must be >= 256, got {self.mpltx_context_size}")
+        # Validate server_backend (Ollama is the only supported backend)
+        if self.server_backend != "ollama":
+            errors.append(f"server_backend must be 'ollama', got '{self.server_backend}'")
 
         if errors:
             raise ValueError("Configuration validation failed:\n" + "\n".join(f"  - {e}" for e in errors))

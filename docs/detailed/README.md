@@ -22,7 +22,7 @@ The Bourbon Image Processor is a local CLI tool that extracts bourbon bottle met
 
 - **Batch processing** with configurable preview checkpoints
 - **Interactive feedback** for correcting extractions
-- **Multi-angle photo grouping** via visual similarity detection
+- **Multi-angle photo grouping** by EXIF capture time
 - **Automatic retry** with error reports
 - **Optional vendor reference caching**
 - **Publish-ready markdown** output
@@ -31,23 +31,24 @@ The system uses Ollama for vision AI and Tesseract for OCR, running entirely on 
 
 ### Per-Stage Model Selection
 
-The model selector assigns the right model to each pipeline stage:
+Only the vision-analysis stage calls a model: the `-m/--model` vision model
+(default `qwen3.6:35b-a3b`). There is no automatic fallback model, and no text
+model (such as gpt-oss) is used.
 
-| Stage | Primary Model | Fallback |
-|-------|--------------|----------|
-| OCR / Text Extraction | Tesseract-OCR | qwen2-vl:7b |
-| Vision Model Analysis | qwen3-vl:32b | qwen2-vl:7b |
-| Image Grouping (Similarity) | ORB (OpenCV) | Filename heuristics |
-| Quantity Detection | Hash-based | Visual analysis |
-| Metadata Generation | gpt-oss:120b | qwen3-vl:32b |
-| Web Research | DuckDuckGo API | Skip (non-blocking) |
-| Error Classification | Rule-based | N/A |
-| Preview Generation | Template Markdown | N/A |
+| Stage | Primary | Notes |
+|-------|---------|-------|
+| OCR / Text Extraction | Tesseract-OCR | Hint text for the vision model |
+| Vision Model Analysis | `-m` (default `qwen3.6:35b-a3b`) | The only model called |
+| Image Grouping | EXIF capture time + vision same-bottle check | `--group-gap-seconds`, `--group-max-size`, `--split-budget-ratio` |
+| Quantity Detection | Hash-based | |
+| Metadata Generation | (not used) | Not implemented |
+| Web Research | (not used) | |
+| Error Classification | Rule-based | |
+| Preview Generation | Template Markdown | |
 
 ### Model Serving Backends
 
-- **MPLTX** (preferred): Native process management with configurable port, GPU layers, context size
-- **Ollama** (backward compatible): Auto-starts Ollama if not running
+- **Ollama** (the only backend, macOS and Linux): a running Ollama is reused and never stopped; otherwise `ollama serve` is started for the run and stopped afterwards
 
 ### Usage Tracking
 
@@ -79,12 +80,11 @@ brew install ollama
 # 2. Start Ollama service
 ollama serve
 
-# 3. Pull recommended vision model
-ollama pull qwen3-vl:32b
+# 3. Pull the default vision model (or let the tool do it: re-run with --pull)
+ollama pull qwen3.6:35b-a3b
 
-# Or pull alternative models:
-# ollama pull gpt-oss:120b  # Slower, more accurate
-# ollama pull qwen2-vl:7b   # Faster, less accurate
+# Any other vision-capable model works with -m, e.g.:
+# ollama pull gemma4:26b            # smaller
 
 # 4. Install Tesseract OCR
 brew install tesseract
@@ -113,8 +113,8 @@ curl -fsSL https://ollama.ai/install.sh | sh
 # 2. Start Ollama service
 systemctl start ollama  # or: ollama serve
 
-# 3. Pull vision model
-ollama pull qwen3-vl:32b
+# 3. Pull the default vision model (or re-run the tool with --pull)
+ollama pull qwen3.6:35b-a3b
 
 # 4. Install Tesseract OCR
 sudo apt update
@@ -132,7 +132,7 @@ process --help
 
 ```bash
 # Check Ollama models
-ollama list  # Should show qwen3-vl:32b
+ollama list  # Should show qwen3.6:35b-a3b (or the model you pass with -m)
 
 # Check Ollama health
 curl http://localhost:11434/api/tags  # Should return model list
@@ -153,10 +153,9 @@ process --help
 The processor uses sensible defaults:
 
 - **Batch size**: 5 bottles
-- **Lookahead**: 3 images for multi-angle grouping
-- **Similarity threshold**: 0.7 (70% visual similarity)
+- **Grouping**: photos at most 12 s apart (EXIF capture time), at most 3 per bottle
 - **Ollama URL**: `http://localhost:11434`
-- **Model**: `qwen2-vl:7b` (default), recommended: `qwen3-vl:32b`
+- **Model**: `$BOURBON_MODEL`, else `qwen3.6:35b-a3b`
 - **Output directory**: `processed/`
 - **Retry limit**: 3 attempts per bottle
 - **Max file size**: 5MB (pre-commit check)
@@ -166,14 +165,11 @@ The processor uses sensible defaults:
 Optional environment overrides:
 
 ```bash
-# Set Ollama URL (default: http://localhost:11434)
-export OLLAMA_BASE_URL=http://localhost:11434
+# Default vision model when -m is not given
+export BOURBON_MODEL=qwen3.6:35b-a3b
 
-# Set maximum concurrent operations
-export MAX_CONCURRENCY=3
-
-# Set model override
-export DEFAULT_MODEL=qwen3-vl:32b
+# Ollama model store (default ~/.ollama/models)
+export OLLAMA_MODELS=/path/to/models
 ```
 
 ### File-Based Configuration
@@ -182,9 +178,9 @@ No configuration file required; all settings via CLI arguments. If you frequentl
 
 ```bash
 # Add to ~/.bashrc or ~/.zshrc
-alias bourbon-process='process --model qwen3-vl:32b --batch-size 5'
-alias bourbon-all='process --model qwen3-vl:32b --batch-size all'
-alias bourbon-interactive='process --model qwen3-vl:32b --interactive'
+alias bourbon-batch='bourbon-process process --batch-size 5'
+alias bourbon-all='bourbon-process process --batch-size all'
+alias bourbon-interactive='bourbon-process process --interactive'
 ```
 
 ---
@@ -215,25 +211,24 @@ process [OPTIONS]
 **Processing Options:**
 ```
 -b, --batch-size STR|NUM        Bottles per batch: number or "all" (default: 5)
---lookahead INT                Images to peek ahead for multi-angle photos (default: 3)
---concurrency INT              Max concurrent operations (default: 3)
+--group-gap-seconds SECS       Most seconds between photos of one bottle (default: 12)
+--group-max-size N             Most photos per bottle, 0 = no limit (default: 3)
+--split-budget-ratio RATIO     Extra analyses per group for splitting groups the model
+                               reports as mixed; at least 4 per run, 0 = off (default: 0.35).
+                               An analysis is one vision request (retried once if unusable) + OCR
+--lookahead INT                Deprecated and ignored (warns); accepted (0-10) for old scripts
+--concurrency INT              Accepted; processing is currently sequential (default: 3)
 ```
 
 **Model Options:**
 ```
--m, --model STR                Global default model (sets primary for all AI stages) (default: qwen2-vl:7b)
+-m, --model STR                Vision model (Ollama tag) (default: $BOURBON_MODEL, else qwen3.6:35b-a3b)
 -u, --ollama-url STR           Ollama service URL (default: http://localhost:11434)
---server-backend STR           Model serving backend: "mpltx" or "ollama" (default: mpltx)
---mpltx-home PATH              MPLTX data directory (default: ~/.mpltx)
---mpltx-port INT               MPLTX HTTP API port (default: 11435)
---mpltx-gpu-layers INT         MPLTX GPU offload layers, -1=all (default: -1)
---mpltx-context-size INT       MPLTX context window size (default: 4096)
-```
-
-**Per-Stage Model Overrides (environment variables):**
-```
-BOURBON_VISION_ANALYSIS_MODEL=qwen2-vl:7b   # Override vision analysis stage
-BOURBON_METADATA_GENERATION_MODEL=gpt-oss:120b  # Override metadata generation
+--server-backend STR           Model serving backend; only "ollama" (default: ollama)
+--server-start-timeout SECS    Wait for an `ollama serve` started by the run (default: 30)
+--request-timeout SECS         Per-request model timeout (default: 600)
+--keep-server                  Leave an `ollama serve` started by the run running
+--no-server-autostart          Never start `ollama serve`; fail if Ollama is not running
 ```
 
 **Behavior Options:**
@@ -353,6 +348,7 @@ process --dry-run
 ```
 
 Shows which images would be grouped as bottles, but doesn't process them.
+Nothing is written to disk and no model is started, pulled or loaded.
 
 ---
 
@@ -448,7 +444,7 @@ The `.txt` file contains concatenated OCR text from all bottle images.
 The processor divides your images into batches for manageable review:
 
 1. **Scan**: Reads all images from input folder
-2. **Group**: Groups related images by bottle (visual + temporal similarity)
+2. **Group**: Groups photos by bottle using EXIF capture time (see below)
 3. **Slice**: Divides bottle groups into batches (default: 5)
 4. **Lookahead**: Peek at next N images for multi-angle photos of current batch
 5. **Process**: Extract metadata for each bottle in batch
@@ -456,29 +452,47 @@ The processor divides your images into batches for manageable review:
 7. **Feedback**: (Optional) Interactive correction opportunity
 8. **Repeat**: Continue with next batch
 
-### Lookahead Feature
+### Grouping by Capture Time
 
-The lookahead mechanism ensures multi-angle photos stay together:
+Photos taken by one camera at most `--group-gap-seconds` apart (default 12)
+are one bottle; runs longer than `--group-max-size` (default 3) are split at
+their largest time gap. File names are never compared (consecutive numbers
+are usually different bottles). Photos without EXIF time are single-photo
+bottles unless named like `IMG_1_front` / `IMG_1_back`.
 
-```
-Batch 1 (5 bottles)
-  ├─ Bottle A (front.jpg)
-  ├─ Bottle B (front.jpg)
-  ├─ Bottle C (front.jpg)
-  └─ Bottle D (front.jpg)
+### Same-Bottle Check (replaces lookahead)
 
-Lookahead: Checks next 3 images
-  Found: Bottle A (side.jpg) → moves into Batch 1
-  Found: Bottle C (back.jpg) → moves into Batch 1
-  Found: Bottle E (front.jpg) → stays for Batch 2
+Grouping finishes before batching, so a bottle never spans two batches and
+the old lookahead step is gone (`--lookahead` is still accepted, ignored, and
+logs a deprecation warning).
 
-Result: Batch 1 now has 7 bottle groups with multi-angle sets
-```
+When the vision model says a multi-photo group shows different products, the
+group is split at its largest capture-time gap and each half is read again.
+The split is kept only if the halves disagree on a field both show (name,
+release, batch, proof within 0.5, age); a field missing on one half is a
+wildcard, and so is a number in the name seen on one half only ("1792 Full
+Proof" vs "1792 Full Proof 125"). Otherwise the group stays one bottle with a
+review note and `same_bottle` cleared to `null`. Known limits: sibling bottles
+of one product with no visible difference may be merged, and a name that is a
+subset of the other ("Stagg" vs "Stagg Jr") matches unless another field read
+on both halves differs. Parts the model still calls mixed are split again,
+down to single photos; if such a part turns out to be one bottle that agrees
+with the other half, the whole group stays one bottle. Each kept part is
+saved as its own bottle folder with only its photos.
 
-Configure lookahead:
+Bottles whose photos are at most 60 s apart and whose labels agree get a
+"Possibly the same bottle as <id>" review note (never merged). When at least
+25% of those notes involve a group of exactly `--group-max-size` photos, the
+run suggests `--group-max-size N+1`.
+
+Extra analyses are capped for the whole run, shared by all batches. The cap
+counts analyses, not model requests (a retry after an unusable answer and the
+OCR pass are not counted):
+
 ```bash
-process --lookahead 5   # Peek at next 5 images
-process --lookahead 0   # Disable lookahead
+process --split-budget-ratio 0.35   # default: up to ceil(0.35 x groups) extra analyses (min 4)
+process --split-budget-ratio 1      # check more mixed groups
+process --split-budget-ratio 0      # turn the check off
 ```
 
 ### Preview Reports
@@ -648,8 +662,8 @@ process --ollama-url http://localhost:11435
 # Check installed models
 ollama list
 
-# Pull missing model
-ollama pull qwen3-vl:32b
+# Pull the missing vision model (or re-run with --pull)
+ollama pull qwen3.6:35b-a3b
 
 # Verify model loaded
 curl http://localhost:11434/api/show
@@ -658,14 +672,11 @@ curl http://localhost:11434/api/show
 **Problem:** Slow processing / timeouts
 
 ```bash
-# Use smaller model (faster but less accurate)
-process --model qwen2-vl:7b
+# Use a smaller vision model (faster but less accurate)
+process --model gemma4:26b
 
-# Reduce concurrency
-process --concurrency 1
-
-# Use smaller batch size
-process --batch-size 2
+# Allow more time per request (a cold model load can take minutes)
+process --request-timeout 1200
 ```
 
 ### Tesseract OCR Issues
@@ -713,8 +724,8 @@ process --batch-size 3
 # Reduce concurrency
 process --concurrency 1
 
-# Use smaller model
-process --model qwen2-vl:7b
+# Use a smaller vision model
+process --model gemma4:26b
 
 # Check system memory
 free -h  # Linux
@@ -745,7 +756,8 @@ process --output-dir /tmp/bourbon_output
 # Check supported formats
 ls -la /path/to/images
 
-# Supported: .jpeg .jpg .png .tiff .heic
+# Supported: .bmp .heic .jpeg .jpg .png .tiff .webp
+# Earlier outputs (folders with a .bourbon_output marker) and hidden folders are skipped
 
 # Convert to supported format (ImageMagick)
 convert photo.tiff photo.jpg
@@ -754,14 +766,17 @@ convert photo.tiff photo.jpg
 **Problem:** Images not grouped correctly
 
 ```bash
-# Use smaller lookahead (aggressive grouping)
-process --lookahead 1
+# See the groups without processing
+process --dry-run
 
-# Disable lookahead (no grouping)
-process --lookahead 0
+# Photos of one bottle taken further apart than 12 s
+process --group-gap-seconds 20
 
-# Manual review: Organize photos into folders per bottle before processing
-./organize_photos.sh  # Custom script to sort by timestamp/group
+# Four or more angles per bottle
+process --group-max-size 5
+
+# Photos without EXIF capture time are single-photo bottles; name them
+# IMG_1_front.jpg / IMG_1_back.jpg to pair them
 ```
 
 ### Extraction Accuracy
@@ -769,11 +784,8 @@ process --lookahead 0
 **Problem:** Wrong bottle name or distillery
 
 ```bash
-# Use more accurate model
-process --model gpt-oss:120b  # Slower but smarter
-
-# Or try qwen3-vl:32b (sweet spot)
-process --model qwen3-vl:32b
+# Try another vision-capable model
+process --model gemma4:26b
 
 # Manual editing: Use interactive mode for correction
 process --interactive
@@ -834,14 +846,17 @@ This enables:
 
 Available vision models (via Ollama):
 
-| Model | Accuracy | Speed | Recommended For |
-|-------|----------|-------|-----------------|
-| `qwen3-vl:32b` | High | Medium | Standard use (sweet spot) |
-| `gpt-oss:120b` | Very High | Slow | Difficult bottles, low-quality photos |
-| `qwen2-vl:7b` | Medium | Fast | Large collections, speed priority |
-| `llava:7b` | Low | Very Fast | Preview/testing only |
+Any vision-capable Ollama model can be passed with `-m`; text-only models
+(such as `gpt-oss`) are rejected by pre-flight.
 
-Recommendation: Start with `qwen3-vl:32b`, switch to `gpt-oss:120b` only if accuracy issues persist.
+| Model | Notes |
+|-------|-------|
+| `qwen3.6:35b-a3b` | Default; tested end to end |
+| `qwen3.8:27b` | Alternative (~18 GB) |
+| `gemma4:26b` | Smallest of these (~16 GB) |
+
+The old `llama3.2-vision` builds are listed by Ollama but fail on current
+Ollama versions ("no longer compatible"); the run stops with exit code 2.
 
 ### Vendor Image Caching
 
@@ -944,16 +959,10 @@ process --dry-run
 
 ## Performance Benchmarks
 
-Typical processing times (qwen3-vl:32b model):
-
-| Collection Size | Bottles | Images | Time (M1 Mac) | Time (i7 Linux) |
-|----------------|---------|--------|---------------|-----------------|
-| Small | 1 | 4 | 45 sec | 60 sec |
-| Small | 5 | 20 | 3 min | 4 min |
-| Medium | 10 | 40 | 7 min | 10 min |
-| Large | 50 | 200 | 35 min | 50 min |
-
-Multiplied by ~1.5x for gpt-oss:120b model, divided by ~0.6x for qwen2-vl:7b model.
+Each bottle is one vision call with up to 4 photos (downscaled to 1280 px).
+With `qwen3.6:35b-a3b` a warm call took a few seconds to under a minute per
+bottle in testing; the first call also pays the model load (minutes on a cold
+start). Times depend heavily on the model and hardware.
 
 ---
 
@@ -965,20 +974,19 @@ process                                    # Process current dir
 process -f /path/to/photos                 # Process specific folder
 process -o /custom/output                  # Custom output dir
 
-# Model selection (per-stage by default)
-process -m qwen3-vl:32b                    # Best balance (global)
-process -m gpt-oss:120b                    # Most accurate (global)
-process -m qwen2-vl:7b                     # Fastest (global)
-# Per-stage: BOURBON_VISION_ANALYSIS_MODEL=qwen2-vl:7b process
+# Vision model (the only model used)
+process -m qwen3.6:35b-a3b                 # Default
+process -m gemma4:26b                      # Smaller
+process --pull                             # Download the model if missing (disk-checked)
 
 # Model serving
-process --server-backend ollama            # Use Ollama backend
-process --server-backend mpltx --mpltx-port 11435  # Configure MPLTX
+process -u http://gpu-box:11434            # Use Ollama on another host
+process --no-server-autostart              # Require an already-running Ollama
 
 # Batch control
 process -b all                             # No batching
 process -b 10                              # 10-bottle batches
-process --lookahead 5                      # Aggressive grouping
+process --split-budget-ratio 0             # No same-bottle split check
 
 # Interactive & review
 process -i                                 # Interactive mode

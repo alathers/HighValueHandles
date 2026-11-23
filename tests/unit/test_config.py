@@ -9,11 +9,16 @@ from pathlib import Path
 
 import pytest
 
-from lib.config import Config, get_config
+from lib.config import DEFAULT_VISION_MODEL, Config, get_config
 
 
 class TestConfigInitialization:
     """Test Config class initialization and defaults."""
+
+    def test_default_vision_model_constant(self):
+        """The default vision model is an installed, vision-capable Ollama tag."""
+        assert DEFAULT_VISION_MODEL == "qwen3.6:35b-a3b"
+        assert Config().model == DEFAULT_VISION_MODEL
 
     def test_config_default_values(self):
         """Test Config has correct default values."""
@@ -23,7 +28,7 @@ class TestConfigInitialization:
         assert config.batch_size == "5"
         assert config.lookahead == 3
         assert config.concurrency == 3
-        assert config.model == "qwen3-vl:32b"
+        assert config.model == DEFAULT_VISION_MODEL
         assert config.interactive is False
         assert config.include_vendor_images is False
         assert config.ollama_url == "http://localhost:11434"
@@ -84,7 +89,7 @@ debug = true
             os.chdir(tmpdir)
             try:
                 config = Config()
-                assert config.model == "qwen3-vl:32b"  # Default
+                assert config.model == DEFAULT_VISION_MODEL  # Default
             finally:
                 os.chdir(old_cwd)
 
@@ -230,7 +235,7 @@ class TestConfigHelperMethods:
     def test_get_str(self):
         """Test get_str method."""
         config = Config()
-        assert config.get_str("model") == "qwen3-vl:32b"
+        assert config.get_str("model") == DEFAULT_VISION_MODEL
         assert config.get_str("image_folder") == "."
 
     def test_get_str_int_to_string(self):
@@ -406,6 +411,26 @@ class TestConfigValidation:
         assert "batch_size must be >= 1" in error_msg
         assert "lookahead must be between 0 and 10" in error_msg
         assert "concurrency must be between 1 and 10" in error_msg
+
+    def test_server_backend_defaults(self, monkeypatch):
+        """Ollama is the default (and only) backend."""
+        monkeypatch.delenv("BOURBON_SERVER_BACKEND", raising=False)
+        config = Config()
+        assert config.server_backend == "ollama"
+        config.validate()  # does not raise
+
+    def test_server_backend_case_normalized(self):
+        """Backend names are case-insensitive and normalized to lower case."""
+        config = Config()
+        config.set_cli_arg("server_backend", " OLLAMA ")
+        assert config.server_backend == "ollama"
+        config.validate()  # does not raise
+
+    def test_validate_unknown_backend_fails(self):
+        config = Config()
+        config.server_backend = "bogus"
+        with pytest.raises(ValueError, match="server_backend must be 'ollama', got 'bogus'"):
+            config.validate()
 
 
 class TestGetConfigConvenience:

@@ -46,6 +46,61 @@ class OllamaConnectionError(AIModelError):
     pass
 
 
+class ModelServerError(AIModelError, RuntimeError):
+    """Model server could not be started, reached or verified.
+
+    Also a ``RuntimeError`` so callers that predate this class (and catch
+    ``RuntimeError``) keep working.
+    """
+
+    pass
+
+
+class VisionAnalysisError(AIModelError):
+    """Vision analysis of one bottle failed (HTTP error, bad or empty response, timeout).
+
+    Per-bottle: the batch records the bottle as failed and moves on.
+    """
+
+    pass
+
+
+class VisionResponseError(VisionAnalysisError):
+    """The vision model answered, but the output was unusable.
+
+    Raised for empty, length-truncated or unparseable content, or a reply
+    with no identifying field (name, distillery and release all missing).
+    """
+
+    pass
+
+
+class VisionTimeoutError(VisionAnalysisError):
+    """The vision model did not respond within the read timeout."""
+
+    pass
+
+
+class VisionModelUnavailableError(AIModelError):
+    """The vision model cannot be used at all on this server.
+
+    Raised when the model is not installed, is incompatible with the running
+    server version, or lacks the ``vision`` capability. Fatal for the run:
+    every bottle would fail the same way.
+    """
+
+    pass
+
+
+#: Errors after which no further bottle can succeed; batches re-raise these
+#: and the CLI aborts the run instead of recording one failure per bottle.
+FATAL_MODEL_ERRORS: tuple[type[AIModelError], ...] = (
+    VisionModelUnavailableError,
+    OllamaConnectionError,
+    ModelServerError,
+)
+
+
 class ConfigurationError(BourbonException):
     """Error in configuration loading or validation."""
 

@@ -3,18 +3,64 @@
 Tests metadata extraction, image grouping, and bottle analysis functionality.
 """
 
+import json
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 import pytest
 
-from image_processor.bottle_analyzer import BottleAnalyzer
+from image_processor.bottle_analyzer import MIXED_GROUP_WARNING, BottleAnalyzer
 from image_processor.text_extractor import TextExtractor
+from image_processor.vision_prompt import (
+    VISION_MAX_IMAGE_EDGE,
+    VISION_OPTIONS,
+    VISION_RESPONSE_SCHEMA,
+    VISION_SYSTEM_PROMPT,
+)
+from lib.config import DEFAULT_VISION_MODEL
 from lib.duplicates import DuplicateDetector
 from lib.error_handling import RetryManager
-from lib.ollama_client import OllamaClient
+from lib.exceptions import (
+    AIModelError,
+    ModelServerError,
+    OllamaConnectionError,
+    VisionAnalysisError,
+    VisionModelUnavailableError,
+    VisionResponseError,
+    VisionTimeoutError,
+)
+from lib.model_selector import ModelStage
+from lib.ollama_client import OllamaClient, VisionChatResult
 from models.bottle import ExtractedMetadata
-from models.image import Image
+from models.image import Image, ImageCategory
+
+
+def _reply(content=None, done_reason="stop", **fields) -> VisionChatResult:
+    """A vision reply: raw ``content``, or a schema-shaped JSON object from ``fields``."""
+    if content is None:
+        body = {
+            k: None
+            for k in ("name", "distillery", "specific_release", "msrp", "proof", "abv", "age",
+                      "batch_number", "tasting_notes")
+        }
+        body.update({"confidence": "high", "same_bottle": True})
+        body.update(fields)
+        content = json.dumps(body)
+    return VisionChatResult(content=content, done_reason=done_reason, prompt_eval_count=10, eval_count=5)
+
+
+def _vision_analyzer(**kwargs) -> tuple[BottleAnalyzer, Mock]:
+    """Analyzer with a spec'd OllamaClient mock and a no-op OCR mock."""
+    client = Mock(spec=OllamaClient)
+    extractor = Mock(spec=TextExtractor)
+    extractor.extract_with_retry.return_value = ""
+    analyzer = BottleAnalyzer(
+        text_extractor=kwargs.pop("text_extractor", extractor),
+        ollama_client=client,
+        image_organizer=Mock(),
+        **kwargs,
+    )
+    return analyzer, client
 
 
 class TestBottleAnalyzerInitialization:
@@ -499,20 +545,18 @@ class TestBottleAnalyzerAnalyzeWithVisionModel:
     """Test analyze_with_vision_model method."""
 
     def test_analyze_with_vision_model_success(self):
-        """Test successful vision model analysis."""
-        mock_ollama_client = Mock(spec=OllamaClient)
-        mock_ollama_client.image_to_text.return_value = (
-            "name: Blanton's\n"
-            "distillery: Buffalo Trace\n"
-            "msrp: $59.99\n"
-            "proof: 93 Proof\n"
-            "age: No Age Statement"
+        """A schema JSON reply is normalised to ExtractedMetadata's string fields."""
+        analyzer, client = _vision_analyzer()
+        client.chat_with_images.return_value = _reply(
+            name="Blanton's",
+            distillery="Buffalo Trace",
+            msrp=59.99,
+            proof=93,
+            age="No Age Statement",
         )
 
-        analyzer = BottleAnalyzer(ollama_client=mock_ollama_client)
-
         metadata = analyzer.analyze_with_vision_model(
-            image_path=Path("/test.jpg"), ocr_text="OCR text", model="test-model"
+            [Path("/test.jpg")], ["OCR text"], model="test-model"
         )
 
         assert metadata.name == "Blanton's"
@@ -521,110 +565,356 @@ class TestBottleAnalyzerAnalyzeWithVisionModel:
         assert metadata.proof == "93 Proof"
         assert metadata.age == "No Age Statement"
         assert metadata.full_text == "OCR text"
-
-    def test_analyze_with_vision_model_fallback_on_error(self):
-        """Test falls back to OCR-only on vision model error."""
-        mock_ollama_client = Mock(spec=OllamaClient)
-        mock_ollama_client.image_to_text.side_effect = Exception("API error")
-
-        analyzer = BottleAnalyzer(ollama_client=mock_ollama_client)
-
-        metadata = analyzer.analyze_with_vision_model(
-            image_path=Path("/test.jpg"), ocr_text="Fallback OCR text"
-        )
-
-        # Should return OCR-only metadata
-        assert metadata.full_text == "Fallback OCR text"
-        assert metadata.selected_text == "Fallback OCR text"
         assert metadata.source_images == ["/test.jpg"]
+        assert metadata.vision_model == "test-model"
+        assert metadata.vision_confidence == "high"
+        assert metadata.warnings == []
 
-    def test_analyze_with_vision_model_custom_model(self):
-        """Test custom vision model is used."""
-        mock_ollama_client = Mock(spec=OllamaClient)
-        mock_ollama_client.image_to_text.return_value = "name: Test Model"
-
-        analyzer = BottleAnalyzer(ollama_client=mock_ollama_client)
+    def test_analyze_with_vision_model_sends_standard_request(self):
+        """Schema, system prompt, think=False, fixed options and downscaling are always sent."""
+        analyzer, client = _vision_analyzer()
+        client.chat_with_images.return_value = _reply(name="X")
 
         analyzer.analyze_with_vision_model(
-            image_path=Path("/test.jpg"), ocr_text="OCR", model="qwen3-vl:32b"
+            [Path("/a.jpg"), Path("/b.jpg")], ["front text", ""], model="m"
         )
 
-        # Verify custom model was used
-        mock_ollama_client.image_to_text.assert_called_once()
-        call_kwargs = mock_ollama_client.image_to_text.call_args.kwargs
-        assert call_kwargs["model"] == "qwen3-vl:32b"
+        kwargs = client.chat_with_images.call_args.kwargs
+        assert kwargs["image_paths"] == [Path("/a.jpg"), Path("/b.jpg")]
+        assert kwargs["model"] == "m"
+        assert kwargs["system"] == VISION_SYSTEM_PROMPT
+        assert kwargs["format"] == VISION_RESPONSE_SCHEMA
+        assert kwargs["think"] is False
+        assert kwargs["options"] == VISION_OPTIONS
+        assert kwargs["max_image_edge"] == VISION_MAX_IMAGE_EDGE
+        assert '<ocr photo="1">\nfront text\n</ocr>' in kwargs["prompt"]
+        assert '<ocr photo="2">' not in kwargs["prompt"]
+        assert "2 attached photos" in kwargs["prompt"]
+
+    def test_analyze_with_vision_model_legacy_lines(self):
+        """Old 'key: value' replies still parse (backends without schema support)."""
+        analyzer, client = _vision_analyzer()
+        client.chat_with_images.return_value = _reply(
+            content=(
+                "name: Blanton's\n"
+                "distillery: Buffalo Trace\n"
+                "msrp: $59.99\n"
+                "proof: 93 Proof\n"
+                "age: No Age Statement"
+            )
+        )
+
+        metadata = analyzer.analyze_with_vision_model(Path("/test.jpg"), "OCR text", model="m")
+
+        assert metadata.name == "Blanton's"
+        assert metadata.msrp == "59.99"
+        assert metadata.proof == "93 Proof"
+        assert metadata.full_text == "OCR text"
+
+    def test_analyze_with_vision_model_raises_on_client_error(self):
+        """Non-fatal client errors become VisionAnalysisError (never an OCR-only result)."""
+        analyzer, client = _vision_analyzer()
+        client.chat_with_images.side_effect = AIModelError("boom")
+
+        with pytest.raises(VisionAnalysisError, match="boom") as exc_info:
+            analyzer.analyze_with_vision_model([Path("/test.jpg")], ["Fallback OCR text"], model="m")
+
+        assert "test.jpg" in str(exc_info.value)
+        assert "'m'" in str(exc_info.value)
+
+    def test_analyze_with_vision_model_wraps_invalid_image(self):
+        """An unreadable photo fails that bottle with a VisionAnalysisError."""
+        analyzer, client = _vision_analyzer()
+        client.chat_with_images.side_effect = ValueError("Invalid image file /x.jpg: truncated")
+
+        with pytest.raises(VisionAnalysisError, match="Invalid image file"):
+            analyzer.analyze_with_vision_model([Path("/x.jpg")], "", model="m")
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            VisionModelUnavailableError("model 'm' not found"),
+            OllamaConnectionError("Cannot reach Ollama"),
+            ModelServerError("not running"),
+        ],
+    )
+    def test_fatal_errors_propagate_unchanged(self, error):
+        analyzer, client = _vision_analyzer()
+        client.chat_with_images.side_effect = error
+
+        with pytest.raises(type(error)) as exc_info:
+            analyzer.analyze_with_vision_model([Path("/a.jpg")], "", model="m")
+
+        assert exc_info.value is error
+        client.chat_with_images.assert_called_once()  # never retried
+
+    def test_timeout_propagates_without_retry(self):
+        analyzer, client = _vision_analyzer()
+        client.chat_with_images.side_effect = VisionTimeoutError("too slow")
+
+        with pytest.raises(VisionTimeoutError):
+            analyzer.analyze_with_vision_model([Path("/a.jpg")], "", model="m")
+
+        client.chat_with_images.assert_called_once()
+
+    def test_empty_content_retried_once_then_raises(self):
+        """Empty content (e.g. thinking used the whole budget) is retried once."""
+        analyzer, client = _vision_analyzer()
+        client.chat_with_images.return_value = VisionChatResult(
+            content="", thinking="hmm" * 100, done_reason="length"
+        )
+
+        with pytest.raises(VisionResponseError, match="no content.*done_reason=length.*thinking_chars=300"):
+            analyzer.analyze_with_vision_model([Path("/a.jpg")], "", model="m")
+
+        assert client.chat_with_images.call_count == 2
+
+    def test_retry_succeeds_on_second_attempt(self):
+        analyzer, client = _vision_analyzer()
+        client.chat_with_images.side_effect = [_reply(content=""), _reply(name="Second Try")]
+
+        metadata = analyzer.analyze_with_vision_model([Path("/a.jpg")], "", model="m")
+
+        assert metadata.name == "Second Try"
+        assert client.chat_with_images.call_count == 2
+
+    def test_all_null_reply_raises(self):
+        """A reply without name, distillery or release is unusable."""
+        analyzer, client = _vision_analyzer()
+        client.chat_with_images.return_value = _reply(proof=90, confidence="low")
+
+        with pytest.raises(VisionResponseError, match="no identifying fields"):
+            analyzer.analyze_with_vision_model([Path("/a.jpg")], "", model="m")
+
+        assert client.chat_with_images.call_count == 2
+
+    def test_truncated_non_json_reply_raises(self):
+        analyzer, client = _vision_analyzer()
+        client.chat_with_images.return_value = _reply(
+            content='name: Partial\n{"distillery": "Cut', done_reason="length"
+        )
+
+        with pytest.raises(VisionResponseError, match="cut off"):
+            analyzer.analyze_with_vision_model([Path("/a.jpg")], "", model="m")
+
+    def test_same_bottle_false_adds_warning(self):
+        analyzer, client = _vision_analyzer()
+        client.chat_with_images.return_value = _reply(name="Four Roses", same_bottle=False)
+
+        metadata = analyzer.analyze_with_vision_model([Path("/a.jpg"), Path("/b.jpg")], "", model="m")
+
+        assert metadata.name == "Four Roses"
+        assert metadata.warnings == [MIXED_GROUP_WARNING]
+        assert metadata.same_bottle is False  # read by the batch split check
+
+    def test_same_bottle_true_exposed(self):
+        analyzer, client = _vision_analyzer()
+        client.chat_with_images.return_value = _reply(name="Four Roses", same_bottle=True)
+
+        metadata = analyzer.analyze_with_vision_model([Path("/a.jpg"), Path("/b.jpg")], "", model="m")
+
+        assert metadata.same_bottle is True
+
+    def test_same_bottle_false_on_single_image_adds_no_warning(self):
+        """One photo cannot show different products: background bottles are not a mixed group."""
+        analyzer, client = _vision_analyzer()
+        client.chat_with_images.return_value = _reply(name="Stagg", same_bottle=False)
+
+        metadata = analyzer.analyze_with_vision_model([Path("/a.jpg")], "", model="m")
+
+        assert metadata.warnings == []
+        assert metadata.same_bottle is None
+        kwargs = client.chat_with_images.call_args.kwargs
+        assert "same_bottle" not in kwargs["format"]["required"]
+        assert "same_bottle" not in kwargs["prompt"]
+
+    def test_analyze_with_vision_model_custom_model(self):
+        """Custom vision model is used."""
+        analyzer, client = _vision_analyzer()
+        client.chat_with_images.return_value = _reply(name="Test Model")
+
+        analyzer.analyze_with_vision_model([Path("/test.jpg")], "OCR", model="qwen3-vl:32b")
+
+        client.chat_with_images.assert_called_once()
+        assert client.chat_with_images.call_args.kwargs["model"] == "qwen3-vl:32b"
+
+    def test_default_model_when_none_given(self):
+        analyzer, client = _vision_analyzer()
+        client.chat_with_images.return_value = _reply(name="X")
+
+        metadata = analyzer.analyze_with_vision_model([Path("/test.jpg")], "")
+
+        assert client.chat_with_images.call_args.kwargs["model"] == DEFAULT_VISION_MODEL
+        assert metadata.vision_model == DEFAULT_VISION_MODEL
+
+    def test_no_images_returns_ocr_only_without_calling_model(self):
+        analyzer, client = _vision_analyzer()
+
+        metadata = analyzer.analyze_with_vision_model([], ["a", "", "b"], model="m")
+
+        client.chat_with_images.assert_not_called()
+        assert metadata.full_text == "a\nb"
+        assert metadata.source_images == []
 
 
-class TestBottleAnalyzerImagesBelongTogether:
-    """Test _images_belong_together method."""
+class TestBottleAnalyzerVisionSelection:
+    """Photo selection, model precedence and failure handling in process_single_bottle."""
 
-    def test_images_belong_together_same_hash(self):
-        """Test images with same MD5 hash belong together."""
-        analyzer = BottleAnalyzer()
+    def test_selects_four_non_bill_images_primary_first(self):
+        analyzer, client = _vision_analyzer()
+        client.chat_with_images.return_value = _reply(name="Bottle")
+        images = [
+            Image(path="/1.jpg", category=ImageCategory.ANGLE),
+            Image(path="/bill.jpg", category=ImageCategory.BILL),
+            Image(path="/primary.jpg", category=ImageCategory.ANGLE, is_primary=True),
+            Image(path="/3.jpg", category=ImageCategory.BOX),
+            Image(path="/4.jpg", category=ImageCategory.DETAIL),
+            Image(path="/5.jpg", category=ImageCategory.ANGLE),
+        ]
 
-        img1 = Image(path="/img1.jpg", category="BOTTLE")
-        img1.md5_hash = "abc123"
+        bottle_dict, metadata = analyzer.process_single_bottle(images, vision_model="m")
 
-        img2 = Image(path="/img2.jpg", category="BOTTLE")
-        img2.md5_hash = "abc123"
+        sent = client.chat_with_images.call_args.kwargs["image_paths"]
+        assert sent == [Path("/primary.jpg"), Path("/1.jpg"), Path("/3.jpg"), Path("/4.jpg")]
+        # Every photo of the group is kept, primary first.
+        expected = ["/primary.jpg", "/1.jpg", "/bill.jpg", "/3.jpg", "/4.jpg", "/5.jpg"]
+        assert metadata.source_images == expected
+        assert bottle_dict["images"] == expected
 
-        result = analyzer._images_belong_together(img1, img2)
-        assert result is True
+    def test_bill_string_category_skipped(self):
+        analyzer, _ = _vision_analyzer()
+        images = [
+            Image(path="/bill.jpg", category="BILL"),
+            Image(path="/bottle.jpg", category="BOTTLE"),
+        ]
+        assert analyzer.select_vision_images(images) == [images[1]]
 
-    def test_images_belong_together_different_hashes_similar_names(self):
-        """Test images with similar names but different hashes."""
-        analyzer = BottleAnalyzer()
+    def test_duplicates_and_burst_retakes_skipped(self):
+        analyzer, _ = _vision_analyzer()
+        front = Image(path="/front.jpg")
+        retake = Image(path="/retake.jpg", near_duplicate_of="/front.jpg")
+        copy = Image(path="/copy.jpg", is_duplicate=True, duplicate_of_id="/front.jpg")
+        back = Image(path="/back.jpg")
+        assert analyzer.select_vision_images([front, retake, copy, back]) == [front, back]
 
-        img1 = Image(path="/bottle_front.jpg", category="BOTTLE")
-        img1.md5_hash = "hash1"
+    def test_only_retakes_left_are_still_used(self):
+        analyzer, _ = _vision_analyzer()
+        retake = Image(path="/retake.jpg", near_duplicate_of="/gone.jpg")
+        assert analyzer.select_vision_images([retake]) == [retake]
 
-        img2 = Image(path="/bottle_side.jpg", category="BOTTLE")
-        img2.md5_hash = "hash2"
+    def test_only_bills_are_used_when_nothing_else(self):
+        analyzer, _ = _vision_analyzer()
+        images = [Image(path="/bill.jpg", category=ImageCategory.BILL)]
+        assert analyzer.select_vision_images(images) == images
 
-        result = analyzer._images_belong_together(img1, img2)
-        # "bottle" is common prefix, should be > 70%
-        assert result is True
+    def test_ocr_hints_aligned_with_selected_paths(self):
+        extractor = Mock(spec=TextExtractor)
+        extractor.extract_with_retry.side_effect = ["TEXT A", "", "TEXT C"]
+        analyzer, client = _vision_analyzer(text_extractor=extractor)
+        client.chat_with_images.return_value = _reply(name="Bottle")
+        images = [
+            Image(path="/a.jpg", category=ImageCategory.ANGLE),
+            Image(path="/b.jpg", category=ImageCategory.ANGLE),
+            Image(path="/c.jpg", category=ImageCategory.ANGLE, is_primary=True),
+        ]
 
-    def test_images_belong_together_different_names(self):
-        """Test images with different names don't belong together."""
-        analyzer = BottleAnalyzer()
+        with patch.object(analyzer, "analyze_with_vision_model", wraps=analyzer.analyze_with_vision_model) as spy:
+            _, metadata = analyzer.process_single_bottle(images, vision_model="m")
 
-        img1 = Image(path="/imageA123.jpg", category="BOTTLE")
-        img1.md5_hash = "hash1"
+        paths, hints, model = spy.call_args.args
+        assert paths == [Path("/c.jpg"), Path("/a.jpg"), Path("/b.jpg")]
+        assert hints == ["TEXT C", "TEXT A", ""]
+        assert model == "m"
+        prompt = client.chat_with_images.call_args.kwargs["prompt"]
+        assert '<ocr photo="1">\nTEXT C\n</ocr>' in prompt
+        assert '<ocr photo="2">\nTEXT A\n</ocr>' in prompt
+        # OCR of all photos, in input order, is kept in the metadata.
+        assert metadata.full_text == "TEXT A\nTEXT C"
+        assert metadata.selected_text == "TEXT A\nTEXT C"
 
-        img2 = Image(path="/imageB456.jpg", category="BOTTLE")
-        img2.md5_hash = "hash2"
+    def test_bottle_dict_has_model_used_and_upper_confidence(self):
+        analyzer, client = _vision_analyzer()
+        client.chat_with_images.return_value = _reply(name="Bottle", confidence="medium")
 
-        result = analyzer._images_belong_together(img1, img2)
-        # "image" is only common part, not > 70%
-        assert result is False
+        bottle_dict, metadata = analyzer.process_single_bottle(
+            [Image(path="/a.jpg", category=ImageCategory.ANGLE)], vision_model="m"
+        )
 
-    def test_images_belong_together_no_hashes(self):
-        """Test without MD5 hashes falls back to name comparison."""
-        analyzer = BottleAnalyzer()
+        assert bottle_dict["model_used"] == "m"
+        assert bottle_dict["confidence"] == "MEDIUM"
+        assert bottle_dict["quantity"] == 1
+        assert metadata.vision_model == "m"
 
-        img1 = Image(path="/bottle_front.jpg", category="BOTTLE")
-        img1.md5_hash = None
+    def test_confidence_falls_back_to_completeness(self):
+        analyzer, _ = _vision_analyzer()
+        metadata = ExtractedMetadata(name="X")
+        with patch.object(analyzer, "analyze_with_vision_model", return_value=metadata):
+            bottle_dict, _ = analyzer.process_single_bottle([Image(path="/a.jpg")], vision_model="m")
+        assert bottle_dict["confidence"] == "LOW"
 
-        img2 = Image(path="/bottle_back.jpg", category="BOTTLE")
-        img2.md5_hash = None
+    def test_vision_failure_propagates_and_records_failed_usage(self):
+        selector = Mock()
+        selector.get_model.return_value = "selector-model"
+        analyzer, client = _vision_analyzer(model_selector=selector)
+        client.chat_with_images.side_effect = VisionTimeoutError("too slow")
 
-        result = analyzer._images_belong_together(img1, img2)
-        assert result is True
+        with pytest.raises(VisionTimeoutError):
+            analyzer.process_single_bottle([Image(path="/a.jpg")], vision_model="m")
 
-    def test_images_belong_together_one_has_hash(self):
-        """Test when only one image has hash doesn't cause error."""
-        analyzer = BottleAnalyzer()
+        selector.record_usage.assert_called_once()
+        kwargs = selector.record_usage.call_args.kwargs
+        assert kwargs["stage"] is ModelStage.VISION_ANALYSIS
+        assert kwargs["model"] == "m"
+        assert kwargs["success"] is False
+        assert "VisionTimeoutError: too slow" in kwargs["error"]
 
-        img1 = Image(path="/img1.jpg", category="BOTTLE")
-        img1.md5_hash = "hash1"
+    def test_success_records_usage_with_tokens(self):
+        selector = Mock()
+        analyzer, client = _vision_analyzer(model_selector=selector)
+        client.chat_with_images.return_value = _reply(name="Bottle")
 
-        img2 = Image(path="/img2.jpg", category="BOTTLE")
-        img2.md5_hash = None
+        analyzer.process_single_bottle([Image(path="/a.jpg")], vision_model="m")
 
-        result = analyzer._images_belong_together(img1, img2)
-        # Falls back to name comparison
-        assert isinstance(result, bool)
+        kwargs = selector.record_usage.call_args.kwargs
+        assert kwargs["success"] is True
+        assert kwargs["error"] is None
+        assert kwargs["input_tokens"] == 10
+        assert kwargs["output_tokens"] == 5
+        assert kwargs["fallback_used"] is False
+
+    def test_explicit_model_beats_selector(self):
+        selector = Mock()
+        selector.get_model.return_value = "selector-model"
+        analyzer, client = _vision_analyzer(model_selector=selector)
+        client.chat_with_images.return_value = _reply(name="Bottle")
+
+        analyzer.process_single_bottle([Image(path="/a.jpg")], vision_model="explicit")
+
+        assert client.chat_with_images.call_args.kwargs["model"] == "explicit"
+
+    def test_selector_used_when_no_explicit_model(self):
+        selector = Mock()
+        selector.get_model.return_value = "selector-model"
+        analyzer, client = _vision_analyzer(model_selector=selector)
+        client.chat_with_images.return_value = _reply(name="Bottle")
+
+        analyzer.process_single_bottle([Image(path="/a.jpg")])
+
+        selector.get_model.assert_called_with(ModelStage.VISION_ANALYSIS)
+        assert client.chat_with_images.call_args.kwargs["model"] == "selector-model"
+
+    def test_default_model_without_selector(self):
+        analyzer, client = _vision_analyzer()
+        client.chat_with_images.return_value = _reply(name="Bottle")
+
+        analyzer.process_single_bottle([Image(path="/a.jpg")])
+
+        assert client.chat_with_images.call_args.kwargs["model"] == DEFAULT_VISION_MODEL
+
+    def test_selector_returning_non_string_ignored(self):
+        selector = Mock()  # get_model returns a Mock, not a model name
+        analyzer, _ = _vision_analyzer(model_selector=selector)
+        assert analyzer._resolve_vision_model(None) == DEFAULT_VISION_MODEL
 
 
 class TestBottleAnalyzerEstimateQuantityFromImages:
@@ -805,7 +1095,7 @@ class TestBottleAnalyzerBuildBottleDict:
 
         assert bottle_dict["name"] == "Unknown Bottle"
         assert bottle_dict["distillery"] == "Unknown Distillery"
-        assert bottle_dict["msrp"] == "0.00"
+        assert bottle_dict["msrp"] is None  # unknown, not $0.00
         assert bottle_dict["specific_release"] == ""
         assert bottle_dict["quantity"] == 1
 
@@ -952,3 +1242,88 @@ class TestBottleAnalyzerParseVisionResponse:
 
         assert metadata["batch_number"] == "123"
         assert metadata["specific_release"] == "Single"
+
+
+class TestBottleAnalyzerOcrSemantics:
+    """OCR call contract between BottleAnalyzer and TextExtractor (B5)."""
+
+    @staticmethod
+    def _analyzer(text_extractor):
+        analyzer = BottleAnalyzer(
+            text_extractor=text_extractor,
+            ollama_client=Mock(spec=OllamaClient),
+            image_organizer=Mock(),
+        )
+        metadata = ExtractedMetadata(
+            name="Test",
+            distillery="Test",
+            msrp="29.99",
+            full_text="",
+            selected_text="",
+            source_images=["/a.jpg"],
+        )
+        return analyzer, metadata
+
+    @patch("image_processor.bottle_analyzer.OllamaClient")
+    @patch("image_processor.bottle_analyzer.ImageOrganizer")
+    def test_default_text_extractor_uses_own_retry_policy(self, mock_organizer, mock_ollama):
+        """The analyzer's generic retry manager must not be handed to OCR."""
+        shared_retry = Mock(spec=RetryManager)
+        with patch("image_processor.bottle_analyzer.TextExtractor") as mock_extractor:
+            BottleAnalyzer(retry_manager=shared_retry)
+        mock_extractor.assert_called_once_with()
+
+    def test_ocr_called_with_path_only(self):
+        """is_primary is not an orientation hint; OCR decides rotation itself."""
+        extractor = Mock(spec=TextExtractor)
+        extractor.extract_with_retry.return_value = "BOURBON"
+        analyzer, metadata = self._analyzer(extractor)
+
+        with patch.object(analyzer, "analyze_with_vision_model", return_value=metadata) as vision:
+            analyzer.process_single_bottle(
+                [Image(path="/a.jpg", category="BOTTLE", is_primary=True)]
+            )
+
+        extractor.extract_with_retry.assert_called_once_with(Path("/a.jpg"))
+        assert vision.call_args.args[1] == ["BOURBON"]
+
+    def test_configuration_error_stops_ocr_for_bottle(self, caplog):
+        """A missing tesseract fails every image the same way: log once, stop OCR."""
+        from lib.exceptions import ConfigurationError
+
+        extractor = Mock(spec=TextExtractor)
+        extractor.extract_with_retry.side_effect = ConfigurationError("no tesseract")
+        analyzer, metadata = self._analyzer(extractor)
+        images = [
+            Image(path="/a.jpg", category="BOTTLE"),
+            Image(path="/b.jpg", category="BOTTLE"),
+            Image(path="/c.jpg", category="BOTTLE"),
+        ]
+
+        with (
+            patch.object(analyzer, "analyze_with_vision_model", return_value=metadata) as vision,
+            caplog.at_level("ERROR", logger="image_processor.bottle_analyzer"),
+        ):
+            analyzer.process_single_bottle(images)
+
+        assert extractor.extract_with_retry.call_count == 1
+        assert sum("OCR unavailable" in r.message for r in caplog.records) == 1
+        vision.assert_called_once()  # the vision model still runs without OCR
+        assert vision.call_args.args[1] == ["", "", ""]
+
+    def test_other_ocr_errors_logged_and_continue(self, caplog):
+        extractor = Mock(spec=TextExtractor)
+        extractor.extract_with_retry.side_effect = [OSError("broken"), "KENTUCKY"]
+        analyzer, metadata = self._analyzer(extractor)
+
+        with (
+            patch.object(analyzer, "analyze_with_vision_model", return_value=metadata) as vision,
+            caplog.at_level("WARNING", logger="image_processor.bottle_analyzer"),
+        ):
+            analyzer.process_single_bottle(
+                [Image(path="/a.jpg", category="BOTTLE"), Image(path="/b.jpg", category="BOTTLE")]
+            )
+
+        assert extractor.extract_with_retry.call_count == 2
+        assert any("OCR failed for /a.jpg: OSError: broken" in r.message for r in caplog.records)
+        assert vision.call_args.args[1] == ["", "KENTUCKY"]

@@ -1,5 +1,13 @@
 # Implementation Plan: Model Selector
 
+> **Superseded (2026-11): Ollama is the only model-serving backend.** The MTPLX/MPLTX
+> backend described below (`MpltxServer`, `ServerBackend.MPLTX`, `mpltx_*` config
+> fields, `--server-backend mpltx` as the default) was removed: MTPLX runs only on
+> Apple Silicon and this tool must stay portable to Linux. `--server-backend`
+> accepts only `ollama`; `mtplx`/`mpltx` values and `mpltx_*` settings are
+> rejected with an explanation. Only the vision-analysis model is called (no
+> fallback chain, no gpt-oss metadata stage). See README.md for current behaviour.
+
 **Branch**: `002-model-selector` | **Date**: 2026-11-21 | **Spec**: [spec.md](spec.md)
 
 **Input**: Feature specification from `/specs/002-model-selector/spec.md`

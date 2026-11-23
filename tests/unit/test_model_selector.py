@@ -15,7 +15,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from lib.config import DEFAULT_VISION_MODEL
 from lib.model_selector import (
+    IMPLEMENTED_MODEL_STAGES,
     ModelSelector,
     ModelStage,
     ModelSpec,
@@ -123,9 +125,10 @@ class TestDefaultSpecs:
         assert len(specs) == 2
         assert specs[1].name == "qwen2-vl:7b"
 
-    def test_vision_primary_is_qwen3_vl_32b(self):
+    def test_vision_primary_is_default_vision_model(self):
         specs = _DEFAULT_MODELS[ModelStage.VISION_ANALYSIS]
-        assert specs[0].name == "qwen3-vl:32b"
+        assert specs[0].name == DEFAULT_VISION_MODEL
+        assert "qwen3-vl" not in specs[0].description.lower()
 
     def test_vision_fallback_is_qwen2_vl_7b(self):
         specs = _DEFAULT_MODELS[ModelStage.VISION_ANALYSIS]
@@ -262,13 +265,13 @@ class TestModelSelector:
     def test_default_selector(self):
         selector = ModelSelector()
         assert len(selector.models) == 8
-        assert selector.default_model == "qwen3-vl:32b"
+        assert selector.default_model == DEFAULT_VISION_MODEL
         assert selector.allow_fallback is True
         assert selector.usage is not None
 
     def test_get_model_vision(self):
         selector = ModelSelector()
-        assert selector.get_model(ModelStage.VISION_ANALYSIS) == "qwen3-vl:32b"
+        assert selector.get_model(ModelStage.VISION_ANALYSIS) == DEFAULT_VISION_MODEL
 
     def test_get_model_ocr(self):
         selector = ModelSelector()
@@ -301,7 +304,7 @@ class TestModelSelector:
     def test_get_fallback_chain(self):
         selector = ModelSelector()
         chain = selector.get_fallback_chain(ModelStage.VISION_ANALYSIS)
-        assert chain == ["qwen3-vl:32b", "qwen2-vl:7b"]
+        assert chain == [DEFAULT_VISION_MODEL, "qwen2-vl:7b"]
 
     def test_get_fallback_chain_single_model(self):
         selector = ModelSelector()
@@ -339,6 +342,31 @@ class TestModelSelector:
         # No per-stage override attributes
         selector = ModelSelector.from_config(config)
         assert selector.get_model(ModelStage.VISION_ANALYSIS) == "qwen3-vl:32b"
+
+    def test_implemented_stages_are_vision_only(self):
+        assert frozenset({ModelStage.VISION_ANALYSIS}) == IMPLEMENTED_MODEL_STAGES
+
+    def test_required_models_only_vision(self):
+        from types import SimpleNamespace
+
+        selector = ModelSelector.from_config(SimpleNamespace(model="gemma4:26b"))
+        required = selector.required_models()
+        assert required == ["gemma4:26b"]
+        assert "gpt-oss:120b" not in required  # unimplemented metadata stage
+        assert "qwen2-vl:7b" not in required  # fallbacks are never required
+
+    def test_required_models_custom_stages_dedupe_in_stage_order(self):
+        selector = ModelSelector()
+        stages = [ModelStage.METADATA_GENERATION, ModelStage.VISION_ANALYSIS,
+                  ModelStage.VISION_ANALYSIS]
+        assert selector.required_models(stages) == [DEFAULT_VISION_MODEL, "gpt-oss:120b"]
+
+    def test_bare_selector_requires_default_vision_model(self):
+        # Not the 20 GB qwen3-vl:32b of the old table.
+        assert ModelSelector().required_models() == [DEFAULT_VISION_MODEL]
+
+    def test_required_models_empty(self):
+        assert ModelSelector().required_models([]) == []
 
     def test_record_usage(self):
         selector = ModelSelector()
@@ -378,8 +406,20 @@ class TestModelSelector:
         with caplog.at_level(logging.INFO):
             selector.print_stage_report()
         assert "MODEL SELECTOR STAGE REPORT" in caplog.text
-        assert "qwen3-vl:32b" in caplog.text
+        assert DEFAULT_VISION_MODEL in caplog.text
         assert "Tesseract" in caplog.text or "tesseract" in caplog.text
+
+    def test_stage_report_describes_resolved_model(self, caplog):
+        from types import SimpleNamespace
+
+        selector = ModelSelector.from_config(SimpleNamespace(model="gemma4:26b"))
+        with caplog.at_level(logging.INFO):
+            selector.print_stage_report()
+        assert "Qwen3-VL" not in caplog.text
+        assert "gemma4:26b" in caplog.text
+        assert "METADATA_GENERATION (not used by the pipeline)" in caplog.text
+        assert "VISION_ANALYSIS (not used" not in caplog.text
+        assert "qwen2-vl:7b (not used: no automatic fallback)" in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -393,11 +433,11 @@ class TestConvenienceFunctions:
     def test_create_default_selector(self):
         selector = create_default_selector()
         assert isinstance(selector, ModelSelector)
-        assert selector.get_model(ModelStage.VISION_ANALYSIS) == "qwen3-vl:32b"
+        assert selector.get_model(ModelStage.VISION_ANALYSIS) == DEFAULT_VISION_MODEL
 
     def test_get_stage_models(self):
         models = get_stage_models(ModelStage.VISION_ANALYSIS)
-        assert models == ["qwen3-vl:32b", "qwen2-vl:7b"]
+        assert models == [DEFAULT_VISION_MODEL, "qwen2-vl:7b"]
 
     def test_get_stage_models_single(self):
         models = get_stage_models(ModelStage.WEB_RESEARCH)

@@ -5,13 +5,74 @@ and prepares bottle image sets for processing.
 """
 
 import logging
+import os
+from collections import Counter
+from collections.abc import Iterable
+from itertools import pairwise
 from pathlib import Path
 from typing import ClassVar
 
+from image_processor.capture_grouping import (
+    DEFAULT_GAP_SECONDS,
+    DEFAULT_MAX_GROUP_SIZE,
+    NEAR_DUP_MAX_GAP_SECONDS,
+    angle_base,
+    dhash64,
+    is_near_duplicate,
+    natural_key,
+    resolve_capture_times,
+    segment_by_time,
+)
 from lib.duplicates import DuplicateDetector
 from models.image import Image
 
 logger = logging.getLogger(__name__)
+
+#: Marker file written into every output directory. A directory below the
+#: scan root that contains it holds earlier results and is never scanned.
+OUTPUT_MARKER = ".bourbon_output"
+
+
+def _dir_identity(path: Path) -> tuple[int, int] | None:
+    """``(st_dev, st_ino)`` of an existing directory, else None.
+
+    Comparing identities instead of resolved paths also matches paths that
+    differ only in letter case on case-insensitive filesystems (the macOS
+    default) and paths reached through symlinks or hard-to-normalize mounts.
+    """
+    try:
+        st = os.stat(path)
+    except (TypeError, ValueError, OSError):
+        return None
+    return (st.st_dev, st.st_ino)
+
+
+def _resolve_excludes(root: Path, exclude: Iterable[Path]) -> set[tuple[int, int]]:
+    """Identities of exclude directories, dropping unusable ones and ancestors of ``root``.
+
+    Entries that do not exist or cannot be turned into a path (e.g. mocks in
+    tests) are skipped. An entry that is ``root`` or contains it is ignored,
+    so ``-f processed/x -o processed`` still scans ``processed/x``.
+
+    Args:
+        root: Resolved scan root.
+        exclude: Directories to leave out of the scan.
+
+    Returns:
+        ``(st_dev, st_ino)`` of each exclude directory below ``root`` or elsewhere.
+    """
+    root_and_parents = {ident for ident in map(_dir_identity, [root, *root.parents]) if ident}
+    identities: set[tuple[int, int]] = set()
+    for entry in exclude or ():
+        try:
+            path = Path(entry)
+        except (TypeError, ValueError):
+            continue
+        ident = _dir_identity(path)
+        if ident is None or ident in root_and_parents:
+            continue
+        identities.add(ident)
+    return identities
 
 
 class ImageOrganizer:
@@ -30,57 +91,122 @@ class ImageOrganizer:
     def __init__(
         self,
         duplicate_detector: DuplicateDetector | None = None,
+        gap_seconds: float = DEFAULT_GAP_SECONDS,
+        max_group_size: int = DEFAULT_MAX_GROUP_SIZE,
+        detect_near_duplicates: bool = True,
     ):
         """Initialize image organizer.
 
         Args:
             duplicate_detector: Optional DuplicateDetector instance.
+            gap_seconds: Most seconds between consecutive photos of one
+                bottle (see :mod:`image_processor.capture_grouping`).
+            max_group_size: Most photos per bottle group (0 = no cap).
+            detect_near_duplicates: Flag burst retakes (near-identical photos
+                taken a few seconds apart) with ``Image.near_duplicate_of``.
         """
         self.duplicate_detector = duplicate_detector or DuplicateDetector()
+        self.gap_seconds = gap_seconds
+        self.max_group_size = max_group_size
+        self.detect_near_duplicates = detect_near_duplicates
+
+    def iter_image_paths(
+        self,
+        folder: Path,
+        recursive: bool = True,
+        exclude: Iterable[Path] = (),
+    ) -> list[Path]:
+        """List supported image files below ``folder`` in sorted order.
+
+        Leaves out hidden files and directories (including AppleDouble
+        ``._*`` files and in-progress ``.partial`` output), subdirectories
+        that contain :data:`OUTPUT_MARKER` and anything under ``exclude``.
+        Paths are returned as found below ``folder`` (not resolved).
+        Symlinked subdirectories are not entered (logged at INFO), matching
+        ``Path.glob('**/*')``/``rglob`` on the supported Python versions;
+        exclusions are matched by filesystem identity, so they also hold
+        when a path differs only in letter case.
+
+        Args:
+            folder: Directory to scan.
+            recursive: Whether to descend into subdirectories.
+            exclude: Directories to skip, typically the output directory. An
+                entry that is ``folder`` itself or one of its ancestors is
+                ignored.
+
+        Returns:
+            Paths of supported image files, sorted by directory then name.
+        """
+        try:
+            root = Path(folder).resolve()
+        except (TypeError, ValueError, OSError):
+            return []
+        excludes = _resolve_excludes(root, exclude)
+
+        found: list[Path] = []
+        for dirpath, dirnames, filenames in os.walk(folder):
+            current = Path(dirpath)
+            if recursive:
+                kept = []
+                for name in sorted(dirnames):
+                    if name.startswith("."):
+                        continue
+                    subdir = current / name
+                    if (subdir / OUTPUT_MARKER).exists():
+                        logger.info("Skipping earlier output directory: %s", subdir)
+                        continue
+                    if subdir.is_symlink():
+                        # Same as the previous Path.glob('**/*') scan and the
+                        # pre-flight rglob count: symlinked dirs are not entered.
+                        logger.info("Not following symlinked directory: %s", subdir)
+                        continue
+                    if excludes and _dir_identity(subdir) in excludes:
+                        logger.debug("Skipping excluded directory: %s", subdir)
+                        continue
+                    kept.append(name)
+                dirnames[:] = kept
+            else:
+                dirnames[:] = []
+
+            for name in sorted(filenames):
+                if name.startswith("."):
+                    continue
+                path = current / name
+                if path.suffix.lower() in self.SUPPORTED_EXTENSIONS:
+                    found.append(path)
+        return found
 
     def scan_images(
         self,
         folder: Path,
         recursive: bool = True,
+        exclude: Iterable[Path] = (),
     ) -> list[Image]:
-        """Recursively scan folder for supported image formats.
+        """Scan a folder for supported images (see :meth:`iter_image_paths`).
 
         Args:
             folder: Path to folder to scan.
             recursive: Whether to scan subdirectories recursively.
+            exclude: Directories to skip, typically the output directory.
 
         Returns:
-            List of Image objects with filepath populated.
+            List of Image objects (path, md5 hash and file size populated),
+            sorted by directory then name.
         """
         if not folder.exists() or not folder.is_dir():
             logger.warning("Folder does not exist or is not a directory: %s", folder)
             return []
 
         images: list[Image] = []
-
-        # Recursively or flat scan based on flag
-        pattern = "**/*" if recursive else "*"
-        for path in folder.glob(pattern):
-            # Skip directories
-            if path.is_dir():
-                continue
-
-            # Check extension
-            if path.suffix.lower() in self.SUPPORTED_EXTENSIONS:
-                try:
-                    # Create Image object
-                    img = Image(path=str(path))
-
-                    # Generate hash
-                    img.md5_hash = self.duplicate_detector.generate_hash(path)
-
-                    # Get file size
-                    img.file_size = path.stat().st_size
-
-                    images.append(img)
-                    logger.debug("Found image: %s", path)
-                except Exception as e:
-                    logger.warning("Failed to process image %s: %s", path, e)
+        for path in self.iter_image_paths(folder, recursive=recursive, exclude=exclude):
+            try:
+                img = Image(path=str(path))
+                img.md5_hash = self.duplicate_detector.generate_hash(path)
+                img.file_size = path.stat().st_size
+                images.append(img)
+                logger.debug("Found image: %s", path)
+            except Exception as e:
+                logger.warning("Failed to process image %s: %s", path, e)
 
         logger.info("Scanned %d images from %s", len(images), folder)
         return images
@@ -88,72 +214,126 @@ class ImageOrganizer:
     def group_by_bottle(
         self,
         images: list[Image],
-        similarity_threshold: float = 0.8,
+        similarity_threshold: float | None = None,
+        *,
+        gap_seconds: float | None = None,
+        max_group_size: int | None = None,
     ) -> list[list[Image]]:
-        """Group images that belong to the same bottle.
+        """Group images that belong to the same bottle, by capture time.
 
-        Uses hash-based duplicate detection and filename similarity
-        to group related images (multi-angle photos of same bottle).
+        Photos taken by one camera at most ``gap_seconds`` apart form a group;
+        groups longer than ``max_group_size`` are split at their largest
+        time gap (see :mod:`image_processor.capture_grouping`). Photos
+        without a capture time are single-photo groups unless they share an
+        angle-suffix base name (``IMG_1_front`` / ``IMG_1_back``). Exact
+        duplicates (same file hash) join their original's group, marked
+        ``is_duplicate``. File names are otherwise never compared, so
+        consecutive numbers like ``IMG_4653``/``IMG_4654`` do not merge.
+
+        Sets ``capture_time``, ``capture_time_source`` and (for burst
+        retakes) ``near_duplicate_of`` on the images.
 
         Args:
-            images: List of Image objects to group.
-            similarity_threshold: Minimum similarity threshold for grouping (0.0-1.0).
+            images: Image objects to group.
+            similarity_threshold: Ignored; kept for API compatibility.
+            gap_seconds: Override of the organizer's gap.
+            max_group_size: Override of the organizer's cap.
 
         Returns:
-            List of image groups, where each group is a list of Image objects
-                for the same bottle.
+            Groups in capture order; each group is a list of Image objects for
+            one bottle.
         """
         if not images:
             return []
+        if similarity_threshold is not None:
+            logger.debug("group_by_bottle: similarity_threshold is ignored (grouping is by capture time)")
+        gap = self.gap_seconds if gap_seconds is None else gap_seconds
+        cap = self.max_group_size if max_group_size is None else max_group_size
 
-        if len(images) == 1:
-            return [images]
-
-        # Detect duplicates first
         self.detect_duplicates(images)
+        reps = [img for img in images if not img.is_duplicate]
+        infos = resolve_capture_times([img.path for img in reps])
+        for img, info in zip(reps, infos, strict=True):
+            img.capture_time = info.time
+            img.capture_time_source = info.source
 
-        # Group by hash (exact duplicates first)
-        hash_groups: dict[str, list[Image]] = {}
-        for img in images:
-            if img.md5_hash:
-                if img.md5_hash not in hash_groups:
-                    hash_groups[img.md5_hash] = []
-                hash_groups[img.md5_hash].append(img)
-            else:
-                # Images without hashes get their own group
-                hash_groups[f"no_hash_{img.path}"] = [img]
-
-        # Now group related hashes together based on visual similarity
-        # For simplicity, we use filename similarity as a proxy
+        # Timed photos: chain within each camera's own stream, so two devices
+        # shooting at once never interleave into mixed groups. Photos with no
+        # camera tags (e.g. timed by a trusted mtime) join the camera stream
+        # when there is exactly one camera; with several they form their own.
+        cameras = {info.camera for info in infos if info.time is not None and info.camera}
+        only_camera = next(iter(cameras)) if len(cameras) == 1 else ""
+        streams: dict[str, list[Image]] = {}
+        for img, info in zip(reps, infos, strict=True):
+            if info.time is not None:
+                streams.setdefault(info.camera or only_camera, []).append(img)
         groups: list[list[Image]] = []
+        for stream in streams.values():
+            stream.sort(key=lambda img: (img.capture_time, natural_key(img.path)))
+            segments = segment_by_time([img.capture_time for img in stream], gap, cap)
+            groups.extend([stream[k] for k in seg] for seg in segments)
 
-        for hash_images in hash_groups.values():
-            # Use first image from hash group as representative
-            representative = hash_images[0]
+        # Untimed photos: alone, unless explicit angle suffixes pair them.
+        by_base: dict[str, list[Image]] = {}
+        for img in sorted((i for i in reps if i.capture_time is None), key=lambda i: natural_key(i.path)):
+            base = angle_base(img.path)
+            if base is None:
+                groups.append([img])
+            else:
+                if base not in by_base:
+                    by_base[base] = []
+                    groups.append(by_base[base])
+                by_base[base].append(img)
 
-            # Try to find existing group to join
-            assigned = False
-            for group in groups:
-                # Check if similar to any image in existing group
-                for group_img in group:
-                    if self._images_similar(representative, group_img, similarity_threshold):
-                        group.extend(hash_images)
-                        assigned = True
-                        break
+        groups.sort(
+            key=lambda g: (g[0].capture_time is None, g[0].capture_time or 0.0, natural_key(g[0].path))
+        )
 
-                if assigned:
-                    break
+        # Exact duplicates follow their original.
+        group_of = {str(img.path): group for group in groups for img in group}
+        for img in images:
+            if not img.is_duplicate:
+                continue
+            group = group_of.get(str(img.duplicate_of_id))
+            if group is None:
+                groups.append([img])
+                continue
+            position = next(k for k, g in enumerate(group) if str(g.path) == str(img.duplicate_of_id))
+            while position + 1 < len(group) and group[position + 1].is_duplicate:
+                position += 1  # after earlier copies of the same original
+            group.insert(position + 1, img)
 
-            # Create new group if not assigned
-            if not assigned:
-                groups.append(hash_images)
+        if self.detect_near_duplicates:
+            self._mark_near_duplicates(groups)
 
-        # Log grouping results
-        logger.info("Grouped %d images into %d bottle groups", len(images), len(groups))
+        sizes = Counter(len(group) for group in groups)
+        sources = Counter(img.capture_time_source for img in reps)
+        logger.info(
+            "Grouped %d images into %d bottle groups by capture time (gap %.1fs, max %s per group); "
+            "group sizes %s; time sources %s",
+            len(images), len(groups), gap, cap if cap and cap > 0 else "unlimited",
+            dict(sorted(sizes.items())), dict(sources),
+        )
         for i, group in enumerate(groups, 1):
-            logger.debug("Group %d: %d images", i, len(group))
-
+            logger.debug("Group %d: %s", i, [Path(img.path).name for img in group])
         return groups
+
+    @staticmethod
+    def _mark_near_duplicates(groups: list[list[Image]]) -> None:
+        """Set ``near_duplicate_of`` on burst retakes within each group."""
+        for group in groups:
+            timed = [img for img in group if not img.is_duplicate and img.capture_time is not None]
+            hashes: dict[str, int | None] = {}
+            for prev, cur in pairwise(timed):
+                gap = cur.capture_time - prev.capture_time  # type: ignore[operator]
+                if gap > NEAR_DUP_MAX_GAP_SECONDS:
+                    continue
+                for img in (prev, cur):
+                    if str(img.path) not in hashes:
+                        hashes[str(img.path)] = dhash64(img.path)
+                if is_near_duplicate(hashes[str(prev.path)], hashes[str(cur.path)], gap):
+                    cur.near_duplicate_of = str(prev.near_duplicate_of or prev.path)
+                    logger.info("Burst retake: %s is a near copy of %s", Path(cur.path).name, Path(prev.path).name)
 
     def detect_duplicates(
         self,
@@ -211,85 +391,27 @@ class ImageOrganizer:
         self,
         img1: Image,
         img2: Image,
-        threshold: float = 0.6,
+        threshold: float = 0.6,  # noqa: ARG002 - kept for API compatibility
     ) -> bool:
-        """Check if two images are similar using filename heuristics.
+        """Whether two images are the same bottle by file evidence alone.
 
-        This is a simplified similarity check based on filename patterns.
-        Groups multi-angle shots of the same bottle (e.g., "IMG_1234_front",
-        "IMG_1234_back") while avoiding false positives on distinct bottles.
+        Deprecated helper: true for exact duplicates (same hash) and for
+        explicit angle-suffix pairs in one folder (``IMG_1_front`` /
+        ``IMG_1_back``). Name prefixes are not compared: consecutive camera
+        numbers say nothing about the bottle.
 
         Args:
             img1: First image.
             img2: Second image.
-            threshold: Minimum similarity percentage for grouping (0.0-1.0).
+            threshold: Ignored.
 
         Returns:
-            True if images appear similar, False otherwise.
+            True if the images belong together.
         """
-        # Exact match (duplicate)
         if self.is_duplicate_image(img1, img2):
             return True
-
-        # Check same directory
-        path1 = Path(img1.path).parent
-        path2 = Path(img2.path).parent
-        if path1 != path2:
-            return False
-
-        # Extract basename
-        name1 = Path(img1.path).stem.lower()
-        name2 = Path(img2.path).stem.lower()
-
-        # List of common suffixes to strip for comparison
-        # These indicate multi-angle shots of same item
-        # Use underscore prefixes to avoid stripping just digits
-        suffixes = ["_front", "_back", "_left", "_right", "_top", "_bottom",
-                   "_side", "_detail", "_box", "_label", "_cap"]
-
-        # Strip suffixes to get base name
-        base1 = name1
-        base2 = name2
-
-        # Only strip suffixes starting with underscore to avoid false matches on digits
-        for suffix in suffixes:
-            if base1.endswith(suffix):
-                base1 = base1[:-len(suffix)]
-            if base2.endswith(suffix):
-                base2 = base2[:-len(suffix)]
-
-        # If bases match exactly after stripping suffixes, likely same bottle
-        if base1 == base2 and len(base1) > 0:
-            return True
-
-        # Otherwise compare original names with stricter criteria
-        # Calculate common prefix length
-        common_len = 0
-        for c1, c2 in zip(name1, name2, strict=False):
-            if c1 == c2:
-                common_len += 1
-            else:
-                break
-
-        # Use max length to avoid matching very short common prefixes
-        max_len = max(len(name1), len(name2))
-        if max_len == 0:
-            return False
-
-        # Calculate matching percentage
-        match_pct = common_len / max_len
-
-        # For short names (< 8 chars), require near-perfect match to avoid false positives
-        # For longer names, use the provided threshold
-        required_threshold = 0.9 if max_len < 8 else threshold
-
-        # Also require minimum absolute length to avoid false positives on very short names
-        min_match_len = min(5, max_len)  # At least 5 chars for very short names
-
-        if common_len >= min_match_len and match_pct >= required_threshold:
-            return True
-
-        return False
+        base = angle_base(img1.path)
+        return base is not None and base == angle_base(img2.path)
 
     def filter_duplicate_images(
         self,

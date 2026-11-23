@@ -3,10 +3,14 @@
 Tests image scanning, grouping, duplicate detection, and filtering.
 """
 
+import datetime as dt
+import shutil
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 import pytest
+from PIL import Image as PILImage
+from PIL import ImageDraw
 
 from image_processor.image_organizer import ImageOrganizer
 from lib.duplicates import DuplicateDetector
@@ -41,83 +45,51 @@ class TestImageOrganizerInitialization:
         assert ".bmp" in ImageOrganizer.SUPPORTED_EXTENSIONS
 
 
+def _touch(path: Path, data: bytes = b"img") -> Path:
+    """Create a small file (and its parent directories)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    return path
+
+
 class TestImageOrganizerScanImages:
-    """Test scan_images method."""
+    """Test scan_images method (real files under tmp_path)."""
 
-    @patch("pathlib.Path.is_dir", return_value=True)
-    @patch("pathlib.Path.exists", return_value=True)
-    @patch("pathlib.Path.glob")
-    def test_scan_images_success(self, mock_glob, mock_exists, mock_is_dir):
-        """Test scanning folder finds supported images."""
-        # Mock file paths
-        mock_jpg = Mock()
-        mock_jpg.is_dir.return_value = False
-        mock_jpg.suffix.lower.return_value = ".jpg"
-        mock_jpg.stat.return_value.st_size = 1024
+    def test_scan_images_success(self, tmp_path):
+        """Scanning finds supported images with hash and size populated."""
+        _touch(tmp_path / "a.jpg", b"x" * 1024)
+        _touch(tmp_path / "b.png", b"y" * 2048)
+        (tmp_path / "subdir").mkdir()
 
-        mock_png = Mock()
-        mock_png.is_dir.return_value = False
-        mock_png.suffix.lower.return_value = ".png"
-        mock_png.stat.return_value.st_size = 2048
-
-        mock_dir = Mock()
-        mock_dir.is_dir.return_value = True
-
-        mock_glob.return_value = [mock_jpg, mock_png, mock_dir]
-
-        # Mock DuplicateDetector
         mock_detector = Mock()
         mock_detector.generate_hash.side_effect = ["hash1", "hash2"]
 
         organizer = ImageOrganizer(duplicate_detector=mock_detector)
-        images = organizer.scan_images(Path("/tmp/test"), recursive=False)
+        images = organizer.scan_images(tmp_path, recursive=False)
 
-        assert len(images) == 2
+        assert [Path(i.path).name for i in images] == ["a.jpg", "b.png"]
         assert images[0].md5_hash == "hash1"
         assert images[0].file_size == 1024
         assert images[1].md5_hash == "hash2"
         assert images[1].file_size == 2048
 
-    @patch("pathlib.Path.is_dir", return_value=True)
-    @patch("pathlib.Path.exists", return_value=True)
-    @patch("pathlib.Path.glob")
-    def test_scan_images_recursive(self, mock_glob, mock_exists, mock_is_dir):
-        """Test recursive scanning includes subdirectories."""
-        mock_file = Mock()
-        mock_file.is_dir.return_value = False
-        mock_file.suffix.lower.return_value = ".jpeg"
-        mock_file.stat.return_value.st_size = 512
+    def test_scan_images_recursive(self, tmp_path):
+        """Recursive scanning includes subdirectories."""
+        _touch(tmp_path / "top.jpeg")
+        _touch(tmp_path / "nested" / "deeper" / "low.jpeg")
 
-        mock_glob.return_value = [mock_file]
+        images = ImageOrganizer().scan_images(tmp_path, recursive=True)
 
-        mock_detector = Mock()
-        mock_detector.generate_hash.return_value = "hash"
+        assert sorted(Path(i.path).name for i in images) == ["low.jpeg", "top.jpeg"]
 
-        organizer = ImageOrganizer(duplicate_detector=mock_detector)
-        images = organizer.scan_images(Path("/tmp/test"), recursive=True)
+    def test_scan_images_non_recursive(self, tmp_path):
+        """Non-recursive scanning only looks at the top level."""
+        _touch(tmp_path / "top.bmp")
+        _touch(tmp_path / "nested" / "low.bmp")
 
-        assert len(images) == 1
-        assert mock_glob.call_args[0][0] == "**/*"
+        images = ImageOrganizer().scan_images(tmp_path, recursive=False)
 
-    @patch("pathlib.Path.is_dir", return_value=True)
-    @patch("pathlib.Path.exists", return_value=True)
-    @patch("pathlib.Path.glob")
-    def test_scan_images_non_recursive(self, mock_glob, mock_exists, mock_is_dir):
-        """Test non-recursive scanning only top level."""
-        mock_file = Mock()
-        mock_file.is_dir.return_value = False
-        mock_file.suffix.lower.return_value = ".bmp"
-        mock_file.stat.return_value.st_size = 256
-
-        mock_glob.return_value = [mock_file]
-
-        mock_detector = Mock()
-        mock_detector.generate_hash.return_value = "hash"
-
-        organizer = ImageOrganizer(duplicate_detector=mock_detector)
-        images = organizer.scan_images(Path("/tmp/test"), recursive=False)
-
-        assert mock_glob.call_args[0][0] == "*"
+        assert [Path(i.path).name for i in images] == ["top.bmp"]
 
     @patch("pathlib.Path.exists", return_value=False)
     def test_scan_images_folder_not_exists(self, mock_exists):
@@ -136,80 +108,156 @@ class TestImageOrganizerScanImages:
 
         assert images == []
 
-    @patch("pathlib.Path.glob")
-    def test_scan_images_empty_folder(self, mock_glob):
+    def test_scan_images_empty_folder(self, tmp_path):
         """Test scan_images returns empty list for folder with no images."""
-        mock_glob.return_value = []
+        assert ImageOrganizer().scan_images(tmp_path) == []
 
-        organizer = ImageOrganizer()
-        images = organizer.scan_images(Path("/tmp/empty"))
-
-        assert images == []
-
-    @patch("pathlib.Path.glob")
-    def test_scan_images_filters_unsupported_extensions(self, mock_glob):
+    def test_scan_images_filters_unsupported_extensions(self, tmp_path):
         """Test scan_images skips unsupported file types."""
-        mock_txt = Mock()
-        mock_txt.is_dir.return_value = False
-        mock_txt.suffix.lower.return_value = ".txt"
+        for name in ("notes.txt", "doc.doc", "scan.pdf"):
+            _touch(tmp_path / name)
 
-        mock_doc = Mock()
-        mock_doc.is_dir.return_value = False
-        mock_doc.suffix.lower.return_value = ".doc"
+        assert ImageOrganizer().scan_images(tmp_path) == []
 
-        mock_pdf = Mock()
-        mock_pdf.is_dir.return_value = False
-        mock_pdf.suffix.lower.return_value = ".pdf"
+    def test_scan_images_supports_all_extensions(self, tmp_path):
+        """All supported extensions are detected, case-insensitively."""
+        extensions = [".jpg", ".jpeg", ".png", ".tiff", ".heic", ".webp", ".bmp", ".JPG"]
+        for i, ext in enumerate(extensions):
+            _touch(tmp_path / f"img{i}{ext}", f"data{i}".encode())
 
-        mock_glob.return_value = [mock_txt, mock_doc, mock_pdf]
-
-        organizer = ImageOrganizer()
-        images = organizer.scan_images(Path("/tmp/test"))
-
-        assert len(images) == 0
-
-    @patch("pathlib.Path.is_dir", return_value=True)
-    @patch("pathlib.Path.exists", return_value=True)
-    @patch("pathlib.Path.glob")
-    def test_scan_images_supports_all_extensions(self, mock_glob, mock_exists, mock_is_dir):
-        """Test all supported extensions are detected."""
-        extensions = [".jpg", ".jpeg", ".png", ".tiff", ".heic", ".webp", ".bmp"]
-
-        files = []
-        for ext in extensions:
-            mock_file = Mock()
-            mock_file.is_dir.return_value = False
-            mock_file.suffix.lower.return_value = ext
-            mock_file.stat.return_value.st_size = 100
-            files.append(mock_file)
-
-        mock_glob.return_value = files
-
-        mock_detector = Mock()
-        mock_detector.generate_hash.side_effect = [f"hash{i}" for i in range(len(files))]
-
-        organizer = ImageOrganizer(duplicate_detector=mock_detector)
-        images = organizer.scan_images(Path("/tmp/test"))
+        images = ImageOrganizer().scan_images(tmp_path)
 
         assert len(images) == len(extensions)
 
-    @patch("pathlib.Path.glob")
-    def test_scan_images_hash_error_skips_file(self, mock_glob):
+    def test_scan_images_hash_error_skips_file(self, tmp_path):
         """Test scan_images logs warning and skips file on hash error."""
-        mock_file = Mock()
-        mock_file.is_dir.return_value = False
-        mock_file.suffix.lower.return_value = ".jpg"
-
-        mock_glob.return_value = [mock_file]
-
+        _touch(tmp_path / "a.jpg")
         mock_detector = Mock()
         mock_detector.generate_hash.side_effect = Exception("Hash error")
 
         organizer = ImageOrganizer(duplicate_detector=mock_detector)
-        images = organizer.scan_images(Path("/tmp/test"))
+        images = organizer.scan_images(tmp_path)
 
         # Should skip the file but not crash
-        assert len(images) == 0
+        assert images == []
+
+
+class TestImageOrganizerScanExclusion:
+    """Earlier outputs, hidden files and excluded dirs are never scanned."""
+
+    def test_output_dir_under_input_is_excluded(self, tmp_path):
+        _touch(tmp_path / "IMG_1.jpg")
+        _touch(tmp_path / "processed" / "eagle_rare" / "images" / "IMG_1.jpg")
+
+        paths = ImageOrganizer().iter_image_paths(tmp_path, exclude=[tmp_path / "processed"])
+
+        assert paths == [tmp_path / "IMG_1.jpg"]
+
+    def test_exclude_matches_relative_and_absolute_spellings(self, tmp_path, monkeypatch):
+        _touch(tmp_path / "IMG_1.jpg")
+        _touch(tmp_path / "out" / "IMG_2.jpg")
+        monkeypatch.chdir(tmp_path)
+
+        paths = ImageOrganizer().iter_image_paths(tmp_path, exclude=[Path("out")])
+
+        assert paths == [tmp_path / "IMG_1.jpg"]
+
+    def test_subdir_with_marker_is_skipped_but_marked_root_is_scanned(self, tmp_path):
+        from image_processor.image_organizer import OUTPUT_MARKER
+
+        _touch(tmp_path / OUTPUT_MARKER, b"")
+        _touch(tmp_path / "IMG_root.jpg")
+        _touch(tmp_path / "old_run" / OUTPUT_MARKER, b"")
+        _touch(tmp_path / "old_run" / "bottle" / "images" / "IMG_old.jpg")
+        _touch(tmp_path / "keep" / "IMG_keep.jpg")
+
+        names = [p.name for p in ImageOrganizer().iter_image_paths(tmp_path)]
+
+        assert names == ["IMG_root.jpg", "IMG_keep.jpg"]
+
+    def test_hidden_dirs_and_appledouble_files_are_skipped(self, tmp_path):
+        _touch(tmp_path / "IMG_1.jpg")
+        _touch(tmp_path / "._IMG_1.jpg")
+        _touch(tmp_path / ".hidden" / "IMG_2.jpg")
+        _touch(tmp_path / ".bottle.abc123.partial" / "images" / "IMG_3.jpg")
+
+        assert ImageOrganizer().iter_image_paths(tmp_path) == [tmp_path / "IMG_1.jpg"]
+
+    def test_results_are_sorted(self, tmp_path):
+        for name in ("c.jpg", "a.jpg", "b.jpg"):
+            _touch(tmp_path / name)
+        _touch(tmp_path / "z_dir" / "a.jpg")
+        _touch(tmp_path / "a_dir" / "z.jpg")
+
+        paths = ImageOrganizer().iter_image_paths(tmp_path)
+
+        assert paths == [
+            tmp_path / "a.jpg",
+            tmp_path / "b.jpg",
+            tmp_path / "c.jpg",
+            tmp_path / "a_dir" / "z.jpg",
+            tmp_path / "z_dir" / "a.jpg",
+        ]
+
+    def test_exclude_that_is_ancestor_of_root_is_ignored(self, tmp_path):
+        root = tmp_path / "processed" / "x"
+        _touch(root / "IMG_1.jpg")
+
+        organizer = ImageOrganizer()
+
+        assert organizer.iter_image_paths(root, exclude=[tmp_path / "processed"]) == [root / "IMG_1.jpg"]
+        assert organizer.iter_image_paths(root, exclude=[root]) == [root / "IMG_1.jpg"]
+
+    def test_unusable_exclude_entries_are_ignored(self, tmp_path):
+        from unittest.mock import MagicMock
+
+        _touch(tmp_path / "IMG_1.jpg")
+
+        paths = ImageOrganizer().iter_image_paths(tmp_path, exclude=[MagicMock(), None, 42])
+
+        assert paths == [tmp_path / "IMG_1.jpg"]
+
+    def test_exclude_matches_by_identity_through_symlink(self, tmp_path):
+        """An exclude spelled via a symlink still matches the real directory."""
+        root = tmp_path / "root"
+        _touch(root / "IMG_1.jpg")
+        _touch(root / "out" / "bottle" / "IMG_2.jpg")
+        alias = tmp_path / "alias"
+        alias.symlink_to(root / "out", target_is_directory=True)
+
+        paths = ImageOrganizer().iter_image_paths(root, exclude=[alias])
+
+        assert paths == [root / "IMG_1.jpg"]
+
+    def test_exclude_differing_only_in_case_matches_on_case_insensitive_fs(self, tmp_path):
+        _touch(tmp_path / "IMG_1.jpg")
+        _touch(tmp_path / "Processed" / "bottle" / "IMG_2.jpg")
+        if not (tmp_path / "PROCESSED").exists():
+            pytest.skip("filesystem is case-sensitive")
+
+        paths = ImageOrganizer().iter_image_paths(tmp_path, exclude=[tmp_path / "processed"])
+
+        assert paths == [tmp_path / "IMG_1.jpg"]
+
+    def test_symlinked_subdirectory_is_not_followed_and_is_logged(self, tmp_path, caplog):
+        root = tmp_path / "root"
+        _touch(root / "IMG_1.jpg")
+        _touch(tmp_path / "elsewhere" / "IMG_2.jpg")
+        (root / "link").symlink_to(tmp_path / "elsewhere", target_is_directory=True)
+
+        with caplog.at_level("INFO", logger="image_processor.image_organizer"):
+            paths = ImageOrganizer().iter_image_paths(root)
+
+        assert paths == [root / "IMG_1.jpg"]
+        assert "Not following symlinked directory" in caplog.text
+
+    def test_scan_images_passes_exclude(self, tmp_path):
+        _touch(tmp_path / "IMG_1.jpg", b"same")
+        _touch(tmp_path / "processed" / "bottle" / "IMG_1.jpg", b"same")
+
+        images = ImageOrganizer().scan_images(tmp_path, exclude=[tmp_path / "processed"])
+
+        assert [i.path for i in images] == [str(tmp_path / "IMG_1.jpg")]
 
 
 class TestImageOrganizerGroupByBottle:
@@ -695,5 +743,143 @@ class TestImageOrganizerImagesSimilar:
         organizer = ImageOrganizer()
         similar = organizer._images_similar(img1, img2, 0.8)
 
-        # Should still check filename similarity
-        assert similar is True
+        # A shared name prefix is not evidence of the same bottle (that rule
+        # merged whole IMG_46x0-46x9 decades of different bottles).
+        assert similar is False
+
+
+_T0 = dt.datetime(2026, 11, 7, 16, 0, 0)
+
+
+def _photo(path: Path, seconds=None, text="A", color=(180, 120, 60), size=(120, 160)) -> Image:
+    """A small JPEG with an EXIF capture time, scanned into an Image (hash set)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    picture = PILImage.new("RGB", size, color)
+    draw = ImageDraw.Draw(picture)
+    draw.rectangle([20, 30, 100, 130], outline=(0, 0, 0), width=4)
+    draw.text((40, 60), text, fill=(255, 255, 255))
+    exif = PILImage.Exif()
+    if seconds is not None:
+        exif.get_ifd(0x8769)[0x9003] = (_T0 + dt.timedelta(seconds=seconds)).strftime("%Y:%m:%d %H:%M:%S")
+    picture.save(path, "JPEG", exif=exif.tobytes())
+    return _scanned(path)
+
+
+def _scanned(path: Path) -> Image:
+    img = Image(path=str(path))
+    img.md5_hash = DuplicateDetector().generate_hash(path)
+    return img
+
+
+def _names(groups):
+    return [[Path(img.path).name for img in group] for group in groups]
+
+
+class TestGroupByCaptureTime:
+    """group_by_bottle groups by capture time, never by file-name prefix."""
+
+    def test_consecutive_names_of_different_bottles_stay_separate(self, tmp_path):
+        """Regression: IMG_4653/IMG_4654 and IMG_4660/IMG_4668 used to merge by name prefix."""
+        times = {"IMG_4653": 0, "IMG_4654": 60, "IMG_4660": 400, "IMG_4668": 900}
+        images = [_photo(tmp_path / f"{name}.jpeg", t, text=name) for name, t in times.items()]
+
+        groups = ImageOrganizer().group_by_bottle(images)
+
+        assert _names(groups) == [[f"{n}.jpeg"] for n in times]
+
+    def test_untimed_consecutive_names_stay_separate(self, tmp_path):
+        images = [_photo(tmp_path / f"IMG_{n}.jpeg", None, text=str(n)) for n in (4653, 4654, 4668)]
+
+        groups = ImageOrganizer().group_by_bottle(images)
+
+        assert len(groups) == 3
+
+    def test_group_by_bottle_uses_capture_time(self, tmp_path):
+        times = [0, 5, 40, 44, 120]
+        images = [_photo(tmp_path / f"IMG_{i}.jpeg", t, text=str(i)) for i, t in enumerate(times)]
+
+        groups = ImageOrganizer().group_by_bottle(list(reversed(images)))
+
+        assert _names(groups) == [["IMG_0.jpeg", "IMG_1.jpeg"], ["IMG_2.jpeg", "IMG_3.jpeg"], ["IMG_4.jpeg"]]
+
+    def test_group_by_bottle_sets_capture_fields(self, tmp_path):
+        img = _photo(tmp_path / "IMG_1.jpeg", 0)
+        other = _photo(tmp_path / "IMG_2.jpeg", 100, text="B")
+
+        ImageOrganizer().group_by_bottle([img, other])
+
+        assert img.capture_time is not None
+        assert img.capture_time_source == "exif_original"
+        assert other.capture_time - img.capture_time == pytest.approx(100)
+
+    def test_group_by_bottle_duplicates_follow_original(self, tmp_path):
+        original = _photo(tmp_path / "IMG_1.jpeg", 0)
+        later = _photo(tmp_path / "IMG_2.jpeg", 300, text="B")
+        shutil.copy(original.path, tmp_path / "copy_of_1.jpeg")
+        copy = _scanned(tmp_path / "copy_of_1.jpeg")
+
+        groups = ImageOrganizer().group_by_bottle([original, later, copy])
+
+        assert _names(groups) == [["IMG_1.jpeg", "copy_of_1.jpeg"], ["IMG_2.jpeg"]]
+        assert copy.is_duplicate and copy.duplicate_of_id == original.path
+
+    def test_group_by_bottle_marks_near_duplicate(self, tmp_path):
+        first = _photo(tmp_path / "IMG_1.jpeg", 0, text="FRONT")
+        retake = _photo(tmp_path / "IMG_2.jpeg", 1, text="FRONT")
+        back = _photo(tmp_path / "IMG_3.jpeg", 3, text="BACK", color=(20, 40, 160), size=(160, 120))
+
+        groups = ImageOrganizer().group_by_bottle([first, retake, back])
+
+        assert len(groups) == 1
+        assert retake.near_duplicate_of == first.path
+        assert back.near_duplicate_of is None
+        assert first.near_duplicate_of is None
+
+    def test_group_by_bottle_ignores_similarity_threshold(self, tmp_path):
+        images = [_photo(tmp_path / f"IMG_{i}.jpeg", i * 60, text=str(i)) for i in range(3)]
+
+        assert len(ImageOrganizer().group_by_bottle(images, similarity_threshold=0.01)) == 3
+
+    def test_constructor_gap_and_cap_respected(self, tmp_path):
+        images = [_photo(tmp_path / f"IMG_{i}.jpeg", t, text=str(i)) for i, t in enumerate([0, 2, 11, 13])]
+
+        assert [len(g) for g in ImageOrganizer().group_by_bottle(images)] == [2, 2]
+        assert [len(g) for g in ImageOrganizer(max_group_size=0).group_by_bottle(images)] == [4]
+        assert [len(g) for g in ImageOrganizer(gap_seconds=1).group_by_bottle(images)] == [1, 1, 1, 1]
+
+    def test_two_cameras_shooting_at_once_do_not_interleave(self, tmp_path):
+        def shot(name, seconds, model):
+            path = tmp_path / name
+            picture = PILImage.new("RGB", (80, 80), (100, 100, 100))
+            exif = PILImage.Exif()
+            exif[0x0110] = model
+            exif.get_ifd(0x8769)[0x9003] = (_T0 + dt.timedelta(seconds=seconds)).strftime("%Y:%m:%d %H:%M:%S")
+            picture.save(path, "JPEG", exif=exif.tobytes())
+            return _scanned(path)
+
+        images = [
+            shot("a1.jpeg", 0, "PhoneA"), shot("b1.jpeg", 1, "PhoneB"), shot("a2.jpeg", 3, "PhoneA"),
+            shot("b2.jpeg", 4, "PhoneB"),
+        ]
+
+        groups = ImageOrganizer(detect_near_duplicates=False).group_by_bottle(images)
+
+        assert sorted(_names(groups)) == [["a1.jpeg", "a2.jpeg"], ["b1.jpeg", "b2.jpeg"]]
+
+    def test_photo_without_camera_tags_joins_the_only_camera(self, tmp_path):
+        """A photo timed without camera tags still chains with the one camera's photos."""
+
+        def shot(name, seconds, model=None):
+            path = tmp_path / name
+            exif = PILImage.Exif()
+            if model:
+                exif[0x0110] = model
+            exif.get_ifd(0x8769)[0x9003] = (_T0 + dt.timedelta(seconds=seconds)).strftime("%Y:%m:%d %H:%M:%S")
+            PILImage.new("RGB", (80, 80), (100, 100, 100)).save(path, "JPEG", exif=exif.tobytes())
+            return _scanned(path)
+
+        images = [shot("a1.jpeg", 0, "PhoneA"), shot("x.jpeg", 4), shot("a2.jpeg", 60, "PhoneA")]
+
+        groups = ImageOrganizer(detect_near_duplicates=False).group_by_bottle(images)
+
+        assert _names(groups) == [["a1.jpeg", "x.jpeg"], ["a2.jpeg"]]

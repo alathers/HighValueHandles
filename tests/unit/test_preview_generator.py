@@ -3,6 +3,7 @@
 Tests markdown generation, file operations, and interactive feedback handling.
 """
 
+import json
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
@@ -197,153 +198,448 @@ class TestPreviewGeneratorMarkdownGeneration:
         assert "Value per bottle: $75.00" in markdown
         assert "Total value: $900.00" in markdown
 
+    def test_unknown_msrp_renders_unknown_not_zero(self, tmp_path):
+        """No visible price: the .md says Unknown and the JSON has nulls, never $0.00."""
+        bottle = Bottle.from_analysis(
+            {"name": "George T. Stagg", "abv": "65.1%"},
+            ExtractedMetadata(source_images=[Path("IMG_4668.jpeg")]),
+            quantity=2,
+        )
+        generator = PreviewGenerator(output_dir=tmp_path)
+
+        markdown = generator.generate_bottle_markdown(bottle)
+
+        assert "## MSRP\nUnknown" in markdown
+        assert "Total value: Unknown" in markdown
+        assert "Value per bottle" not in markdown
+        assert "$0.00" not in markdown
+        assert "- **ABV:** 65.1%" in markdown
+
+        folder = generator.save_bottle_files(bottle)
+        data = json.loads((folder / f"{folder.name}.json").read_text())
+        assert data["msrp"] is None
+        assert data["total_value"] is None
+
+    def test_extracted_timestamp_has_offset(self):
+        bottle = Bottle.from_analysis({"name": "X"})
+        markdown = PreviewGenerator().generate_bottle_markdown(bottle)
+        line = next(line for line in markdown.splitlines() if line.startswith("- **Extracted**"))
+        # e.g. 2026-11-22T21:38:09-06:00 (local time with its offset)
+        assert line[-6] in "+-" and line[-3] == ":"
+
+
+def _jpeg(path: Path, color=(120, 60, 20)) -> Path:
+    """Write a tiny real JPEG."""
+    from PIL import Image as PILImage
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    PILImage.new("RGB", (8, 8), color).save(path, "JPEG")
+    return path
+
+
+def _bottle(name="Test Bourbon", images=(), full_text="OCR text", **kwargs) -> Bottle:
+    metadata = ExtractedMetadata(
+        full_text=full_text,
+        selected_text=full_text,
+        source_images=[Path(p) for p in images],
+    )
+    return Bottle(
+        name=name,
+        distillery=kwargs.pop("distillery", "Test Distillery"),
+        specific_release=kwargs.pop("specific_release", "Regular"),
+        msrp=kwargs.pop("msrp", Decimal("99.99")),
+        metadata=metadata,
+        **kwargs,
+    )
+
+
+def _visible_entries(directory: Path) -> list:
+    return sorted(p.name for p in directory.iterdir() if not p.name.startswith("."))
+
+
+class TestSlugify:
+    """slugify() makes safe, lowercase folder names."""
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("Eagle Rare 10 Year", "eagle_rare_10_year"),
+            ("Blanton's: Gold/Edition? <1>", "blantons_gold_edition_1"),
+            ("Élevé Café", "eleve_cafe"),
+            ("../../etc", "etc"),
+            ("Test/Bourbon\\With Slashes", "test_bourbon_with_slashes"),
+            ("", "bottle"),
+            (None, "bottle"),
+            ("???", "bottle"),
+        ],
+    )
+    def test_slugify(self, text, expected):
+        from image_processor.preview_generator import slugify
+
+        assert slugify(text) == expected
+
+    def test_slugify_truncates_without_trailing_underscore(self):
+        from image_processor.preview_generator import slugify
+
+        slug = slugify("a" * 59 + " bcd")
+        assert len(slug) <= 60
+        assert not slug.endswith("_")
+
 
 class TestPreviewGeneratorSaveBottleFiles:
-    """Test bottle file saving operations."""
+    """save_bottle_files writes <slug>/{<slug>.md,.json,.txt,images/} atomically."""
 
-    @patch("pathlib.Path.mkdir")
-    @patch("pathlib.Path.exists")
-    @patch.object(PreviewGenerator, "generate_bottle_markdown")
-    @patch("builtins.open")
-    @patch("shutil.copy2")
-    def test_save_bottle_files_basic(
-        self, mock_copy, mock_open, mock_md, mock_exists, mock_mkdir
-    ):
-        """Test basic file saving with auto-generated folder name."""
-        mock_exists.return_value = True
-        mock_md.return_value = "# Test Bourbon\n\nTest content"
-        mock_open.return_value.__enter__ = Mock()
-        mock_open.return_value.__exit__ = Mock()
+    def test_save_bottle_files_basic(self, tmp_path):
+        """Layout, JSON contents and round trip."""
+        photos = tmp_path / "photos"
+        img1 = _jpeg(photos / "image1.jpg")
+        img2 = _jpeg(photos / "image2.jpg", (10, 10, 10))
+        bottle = _bottle(images=[img1, img2], full_text="OCR text\nmore")
+        out = tmp_path / "out"
 
+        folder = PreviewGenerator(output_dir=out).save_bottle_files(
+            bottle, bottle.metadata, model_used="qwen3.6:35b-a3b", confidence="HIGH"
+        )
+
+        assert folder == out / "test_bourbon"
+        assert _visible_entries(folder) == ["images", "test_bourbon.json", "test_bourbon.md", "test_bourbon.txt"]
+        assert _visible_entries(folder / "images") == ["image1.jpg", "image2.jpg"]
+        assert (folder / "images" / "image1.jpg").read_bytes() == img1.read_bytes()
+        assert (folder / "test_bourbon.txt").read_text(encoding="utf-8") == "OCR text\nmore"
+
+        data = json.loads((folder / "test_bourbon.json").read_text(encoding="utf-8"))
+        assert data["msrp"] == "99.99"
+        assert len(data["metadata"]["source_images"]) == 2
+        assert data["images"] == ["images/image1.jpg", "images/image2.jpg"]
+        assert data["source_images"] == [str(img1), str(img2)]
+        assert data["missing_images"] == []
+        assert data["bottle_id"] == "image1"
+        assert data["model_used"] == "qwen3.6:35b-a3b"
+        assert data["confidence"] == "HIGH"
+        assert data["schema_version"] == 1
+        restored = Bottle.from_json((folder / "test_bourbon.json").read_text(encoding="utf-8"))
+        assert restored.name == "Test Bourbon"
+        assert restored.msrp == Decimal("99.99")
+
+        md = (folder / "test_bourbon.md").read_text(encoding="utf-8")
+        assert md.startswith("# Test Bourbon\n")
+        assert "[image1.jpg](images/image1.jpg) (primary)" in md
+        assert "- **Model**: qwen3.6:35b-a3b" in md
+        assert (out / ".bourbon_output").exists()
+
+    def test_save_bottle_files_with_custom_prefix(self, tmp_path):
+        """A prefix replaces the bottle name and is slugified too."""
+        bottle = _bottle(name="Any Name", images=[_jpeg(tmp_path / "image.jpg")])
+
+        folder = PreviewGenerator(output_dir=tmp_path / "out").save_bottle_files(
+            bottle, bottle.metadata, prefix="custom folder"
+        )
+
+        assert folder.name == "custom_folder"
+        assert (folder / "custom_folder.md").is_file()
+
+    def test_save_bottle_files_sanitizes_folder_name(self, tmp_path):
+        """Path separators and '..' never escape output_dir."""
+        out = tmp_path / "out"
+        generator = PreviewGenerator(output_dir=out)
+        image = _jpeg(tmp_path / "image.jpg")
+
+        slashes = generator.save_bottle_files(_bottle(name="Test/Bourbon\\With Slashes", images=[image]))
+        escape = generator.save_bottle_files(_bottle(name="../../x", images=[image]))
+
+        assert slashes == out / "test_bourbon_with_slashes"
+        assert escape == out / "x"
+        assert escape.resolve().parent == out.resolve()
+
+    def test_save_bottle_files_skips_missing_images(self, tmp_path):
+        """A missing image is listed, not copied, and is not an error."""
+        existing = _jpeg(tmp_path / "existing.jpg")
+        missing = tmp_path / "missing.jpg"
+        bottle = _bottle(images=[existing, missing])
+
+        folder = PreviewGenerator(output_dir=tmp_path / "out").save_bottle_files(bottle, bottle.metadata)
+
+        assert _visible_entries(folder / "images") == ["existing.jpg"]
+        data = json.loads((folder / "test_bourbon.json").read_text(encoding="utf-8"))
+        assert data["missing_images"] == [str(missing)]
+
+    def test_same_bottle_twice_never_overwrites(self, tmp_path):
+        out = tmp_path / "out"
+        generator = PreviewGenerator(output_dir=out)
+        bottle = _bottle(images=[_jpeg(tmp_path / "image.jpg")])
+
+        first = generator.save_bottle_files(bottle, bottle.metadata)
+        first_json = (first / "test_bourbon.json").read_bytes()
+        second = generator.save_bottle_files(bottle, bottle.metadata)
+
+        assert first.name == "test_bourbon"
+        assert second.name == "test_bourbon_2"
+        assert (second / "test_bourbon_2.json").is_file()
+        assert (second / "test_bourbon_2.md").is_file()
+        assert (first / "test_bourbon.json").read_bytes() == first_json
+
+    def test_copy_failure_leaves_nothing_behind(self, tmp_path):
+        from lib.exceptions import FileSystemError
+
+        out = tmp_path / "out"
+        generator = PreviewGenerator(output_dir=out)
+        bottle = _bottle(images=[_jpeg(tmp_path / "image.jpg")])
+
+        with patch("shutil.copy2", side_effect=OSError(28, "No space left on device")):
+            with pytest.raises(FileSystemError, match="No space left on device"):
+                generator.save_bottle_files(bottle, bottle.metadata)
+
+        assert sorted(p.name for p in out.iterdir()) == [".bourbon_output"]
+
+    def test_write_failure_leaves_nothing_behind(self, tmp_path):
+        from lib.exceptions import FileSystemError
+
+        out = tmp_path / "out"
+        generator = PreviewGenerator(output_dir=out)
+        bottle = _bottle(images=[_jpeg(tmp_path / "image.jpg")])
+
+        with patch.object(PreviewGenerator, "generate_bottle_markdown", side_effect=RuntimeError("boom")):
+            with pytest.raises(FileSystemError, match="RuntimeError: boom"):
+                generator.save_bottle_files(bottle, bottle.metadata)
+
+        assert sorted(p.name for p in out.iterdir()) == [".bourbon_output"]
+
+    def test_rename_race_moves_to_next_free_name(self, tmp_path):
+        """If another run claims the chosen name first, the next suffix is used."""
+        out = tmp_path / "out"
+        generator = PreviewGenerator(output_dir=out)
+        bottle = _bottle(images=[_jpeg(tmp_path / "image.jpg")])
+        real_rename = Path.rename
+        raced = []
+
+        def racing_rename(self, target):
+            if not raced and Path(target).name == "test_bourbon":
+                raced.append(target)
+                Path(target).mkdir()
+                (Path(target) / "theirs.txt").write_text("other run")
+            return real_rename(self, target)
+
+        with patch.object(Path, "rename", racing_rename):
+            folder = generator.save_bottle_files(bottle, bottle.metadata)
+
+        assert folder.name == "test_bourbon_2"
+        assert (folder / "test_bourbon_2.json").is_file()
+        assert (out / "test_bourbon" / "theirs.txt").read_text() == "other run"
+
+    def test_bottle_without_metadata_uses_metadata_argument(self, tmp_path):
+        """Regression: Bottle(metadata=None) used to crash on .source_images."""
+        image = _jpeg(tmp_path / "image.jpg")
+        bottle = Bottle(name="Plain", distillery="D", specific_release="", msrp=Decimal("10"))
+        metadata = ExtractedMetadata(full_text="ocr", source_images=[image])
+
+        folder = PreviewGenerator(output_dir=tmp_path / "out").save_bottle_files(bottle, metadata)
+
+        assert _visible_entries(folder / "images") == ["image.jpg"]
+        assert (folder / "plain.txt").read_text(encoding="utf-8") == "ocr"
+
+    def test_duplicate_basenames_get_suffix(self, tmp_path):
+        a = _jpeg(tmp_path / "a" / "IMG_1.jpg")
+        b = _jpeg(tmp_path / "b" / "IMG_1.jpg", (1, 2, 3))
+        bottle = _bottle(images=[a, b])
+
+        folder = PreviewGenerator(output_dir=tmp_path / "out").save_bottle_files(bottle, bottle.metadata)
+
+        assert _visible_entries(folder / "images") == ["IMG_1.jpg", "IMG_1_2.jpg"]
+        assert (folder / "images" / "IMG_1_2.jpg").read_bytes() == b.read_bytes()
+
+    @pytest.mark.parametrize("name", ["Unknown Bottle", "unknown", ""])
+    def test_unknown_name_uses_primary_image_stem(self, tmp_path, name):
+        bottle = _bottle(name=name, images=[_jpeg(tmp_path / "IMG_4653.jpeg")])
+
+        folder = PreviewGenerator(output_dir=tmp_path / "out").save_bottle_files(bottle, bottle.metadata)
+
+        assert folder.name == "unknown_img_4653"
+
+    def test_originals_are_not_modified(self, tmp_path):
+        image = _jpeg(tmp_path / "image.jpg")
+        before = (image.read_bytes(), image.stat().st_mtime_ns)
+        bottle = _bottle(images=[image])
+
+        PreviewGenerator(output_dir=tmp_path / "out").save_bottle_files(bottle, bottle.metadata)
+
+        assert (image.read_bytes(), image.stat().st_mtime_ns) == before
+
+    def test_extra_keys_added_to_json(self, tmp_path):
+        bottle = _bottle(images=[_jpeg(tmp_path / "image.jpg")])
+
+        folder = PreviewGenerator(output_dir=tmp_path / "out").save_bottle_files(
+            bottle, bottle.metadata, extra={"vision_raw_response": "{...}"}
+        )
+
+        data = json.loads((folder / "test_bourbon.json").read_text(encoding="utf-8"))
+        assert data["vision_raw_response"] == "{...}"
+
+
+class TestBottleMarkdownProcessingDetails:
+    """generate_bottle_markdown copes with missing metadata and links images."""
+
+    def test_metadata_none_does_not_raise(self, tmp_path):
+        bottle = Bottle(name="Plain", distillery="D", specific_release="", msrp=Decimal("10"))
+
+        md = PreviewGenerator(output_dir=tmp_path).generate_bottle_markdown(bottle)
+
+        assert "## Images" in md
+        assert "## Processing Details" in md
+        assert "- **Images Processed**: 0" in md
+        assert "- **Model**: unknown" in md
+
+    def test_image_links_and_details(self, tmp_path):
         metadata = ExtractedMetadata(
-            full_text="OCR text",
-            selected_text="OCR text",
-            source_images=[Path("image1.jpg"), Path("image2.jpg")],
+            batch_number="B-17", source_images=[Path("a.jpg")], warnings=["photos show different products"]
         )
-        bottle = Bottle(
-            name="Test Bourbon",
-            distillery="Test Distillery",
-            specific_release="Regular",
-            msrp=Decimal("99.99"),
-            metadata=metadata,
+        bottle = _bottle(images=[])
+        bottle.metadata = metadata
+
+        md = PreviewGenerator(output_dir=tmp_path).generate_bottle_markdown(
+            bottle, image_links=["images/a.jpg", "images/b.jpg"], model_used="m", confidence="LOW"
         )
 
-        with patch("datetime.datetime") as mock_dt:
-            mock_dt.now.return_value.strftime.return_value = "20250113_120000"
-            generator = PreviewGenerator()
-            result_path = generator.save_bottle_files(bottle, metadata)
+        assert "1. [a.jpg](images/a.jpg) (primary)" in md
+        assert "2. [b.jpg](images/b.jpg)" in md
+        assert "- **Batch:** B-17" in md
+        assert "- **Images Processed**: 2" in md
+        assert "- **Extraction Confidence**: LOW" in md
+        assert "- **Warning**: photos show different products" in md
+        assert "\n\n\n" not in md
 
-        assert mock_mkdir.called
-        assert mock_copy.call_count == 2
-        assert mock_open.call_count == 2  # markdown + OCR text
 
-    @patch("pathlib.Path.mkdir")
-    @patch("pathlib.Path.exists")
-    @patch.object(PreviewGenerator, "generate_bottle_markdown")
-    @patch("builtins.open")
-    @patch("shutil.copy2")
-    def test_save_bottle_files_with_custom_prefix(
-        self, mock_copy, mock_open, mock_md, mock_exists, mock_mkdir
-    ):
-        """Test file saving with custom folder prefix."""
-        mock_exists.return_value = True
-        mock_md.return_value = "# Custom\n\nContent"
-        mock_open.return_value.__enter__ = Mock()
-        mock_open.return_value.__exit__ = Mock()
+class TestBottleIdFor:
+    """bottle_id_for() matches BatchProcessor's failed-bottle IDs."""
 
-        metadata = ExtractedMetadata(
-            full_text="OCR text",
-            selected_text="OCR text",
-            source_images=[Path("image.jpg")],
+    def test_prefers_metadata_primary(self):
+        metadata = ExtractedMetadata(source_images=[Path("/p/IMG_2.jpg")])
+        assert PreviewGenerator.bottle_id_for({"images": ["/p/IMG_9.jpg"]}, metadata) == "IMG_2"
+
+    def test_falls_back_to_dict_images_then_unknown(self):
+        assert PreviewGenerator.bottle_id_for({"images": ["/p/IMG_9.jpg"]}, ExtractedMetadata()) == "IMG_9"
+        assert PreviewGenerator.bottle_id_for(None, None) == "unknown"
+
+
+class TestOutputPermissions:
+    """Saved folders and reports get umask-derived modes, like a plain mkdir/open."""
+
+    @pytest.fixture
+    def umask_022(self):
+        import os
+
+        previous = os.umask(0o022)
+        yield 0o022
+        os.umask(previous)
+
+    def test_bottle_folder_mode_matches_plain_mkdir(self, tmp_path, umask_022):
+        out = tmp_path / "out"
+        out.mkdir()
+        reference = out / "reference_dir"
+        reference.mkdir()
+        bottle = _bottle(images=[_jpeg(tmp_path / "photos" / "IMG_1.jpg")])
+
+        folder = PreviewGenerator(output_dir=out).save_bottle_files(bottle, bottle.metadata)
+
+        expected = reference.stat().st_mode & 0o777
+        assert expected == 0o755
+        assert folder.stat().st_mode & 0o777 == expected
+        assert (folder / "images").stat().st_mode & 0o777 == expected
+
+    def test_failure_report_mode_matches_plain_open(self, tmp_path, umask_022):
+        out = tmp_path / "out"
+        out.mkdir()
+        reference = out / "reference.json"
+        reference.write_text("{}")
+
+        report = PreviewGenerator(output_dir=out).save_failure_report("IMG_1", [], "boom", stage="save")
+
+        assert reference.stat().st_mode & 0o777 == 0o644
+        assert report.stat().st_mode & 0o777 == 0o644
+
+
+class TestSaveFailureReport:
+    """save_failure_report writes the dict format retry_command reads."""
+
+    def test_report_created_concurrently_is_not_overwritten(self, tmp_path):
+        """A report that appears after the free name was chosen is kept; the next suffix is used."""
+        import image_processor.preview_generator as pg
+
+        out = tmp_path / "out"
+        out.mkdir()
+        real_unique_path = pg._unique_path
+        calls = []
+
+        def racing_unique_path(directory, stem, suffix=""):
+            chosen = real_unique_path(directory, stem, suffix)
+            if not calls:
+                chosen.write_text("other run", encoding="utf-8")  # another run wins the race
+            calls.append(chosen)
+            return chosen
+
+        with patch.object(pg, "_unique_path", racing_unique_path):
+            report = PreviewGenerator(output_dir=out).save_failure_report("IMG_1", [], "boom", stage="save")
+
+        assert (out / "error_report_img_1.json").read_text(encoding="utf-8") == "other run"
+        assert report == out / "error_report_img_1_2.json"
+        assert json.loads(report.read_text(encoding="utf-8"))["error_message"] == "boom"
+        assert not list(out.glob(".*.tmp"))
+
+    def test_report_falls_back_without_hard_links(self, tmp_path):
+        out = tmp_path / "out"
+        out.mkdir()
+        (out / "error_report_img_1.json").write_text("first", encoding="utf-8")
+
+        with patch("image_processor.preview_generator.os.link", side_effect=PermissionError("no links")):
+            report = PreviewGenerator(output_dir=out).save_failure_report("IMG_1", [], "boom", stage="save")
+
+        assert report == out / "error_report_img_1_2.json"
+        assert (out / "error_report_img_1.json").read_text(encoding="utf-8") == "first"
+        assert json.loads(report.read_text(encoding="utf-8"))["bottle_id"] == "IMG_1"
+        assert not list(out.glob(".*.tmp"))
+
+    def test_report_has_retry_fields_and_never_overwrites(self, tmp_path):
+        out = tmp_path / "out"
+        generator = PreviewGenerator(output_dir=out)
+        try:
+            raise OSError(28, "No space left on device")
+        except OSError as e:
+            first = generator.save_failure_report("IMG_1", ["/p/IMG_1.jpg", "/p/IMG_2.jpg"], e, stage="save")
+        second = generator.save_failure_report("IMG_1", ["/p/IMG_1.jpg"], "analysis failed", stage="analysis")
+
+        assert first == out / "error_report_img_1.json"
+        assert second == out / "error_report_img_1_2.json"
+        data = json.loads(first.read_text(encoding="utf-8"))
+        assert {"bottle_id", "images", "error_message"} <= data.keys()
+        assert data["bottle_id"] == "IMG_1"
+        assert data["images"] == ["/p/IMG_1.jpg", "/p/IMG_2.jpg"]
+        assert data["error_message"] == "OSError: [Errno 28] No space left on device"
+        assert data["stage"] == "save"
+        assert "Traceback" in data["details"]
+        second_data = json.loads(second.read_text(encoding="utf-8"))
+        assert second_data["error_message"] == "analysis failed"
+        assert second_data["error_type"] == "UNKNOWN"
+        assert not list(out.glob(".*.tmp"))
+
+    def test_report_images_are_absolute(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        path = PreviewGenerator(output_dir=tmp_path / "out").save_failure_report(
+            "x", ["rel/IMG_1.jpg"], "boom", stage="rejected"
         )
-        bottle = Bottle(
-            name="Any Name",
-            distillery="Any Distillery",
-            specific_release="Regular",
-            msrp=Decimal("75.00"),
-            metadata=metadata,
+        assert json.loads(path.read_text())["images"] == [str(tmp_path / "rel" / "IMG_1.jpg")]
+
+    def test_retry_command_accepts_generated_report(self, tmp_path):
+        """A generated report passes retry_command's validation (server mocked away)."""
+        from cli.commands import parse_args, retry_command
+
+        image = _jpeg(tmp_path / "IMG_1.jpg")
+        report = PreviewGenerator(output_dir=tmp_path / "out").save_failure_report(
+            "IMG_1", [str(image)], RuntimeError("boom"), stage="save"
         )
-
-        generator = PreviewGenerator()
-        result_path = generator.save_bottle_files(
-            bottle, metadata, prefix="custom_folder"
-        )
-
-        assert mock_mkdir.called
-
-    @patch("pathlib.Path.mkdir")
-    @patch("pathlib.Path.exists")
-    @patch.object(PreviewGenerator, "generate_bottle_markdown")
-    @patch("builtins.open")
-    @patch("shutil.copy2")
-    def test_save_bottle_files_sanitizes_folder_name(
-        self, mock_copy, mock_open, mock_md, mock_exists, mock_mkdir
-    ):
-        """Test folder name is sanitized for filesystem."""
-        mock_exists.return_value = True
-        mock_md.return_value = "# Sanitized\n\nContent"
-        mock_open.return_value.__enter__ = Mock()
-        mock_open.return_value.__exit__ = Mock()
-
-        metadata = ExtractedMetadata(
-            full_text="OCR text",
-            selected_text="OCR text",
-            source_images=[Path("image.jpg")],
-        )
-        bottle = Bottle(
-            name="Test/Bourbon\\With Slashes",
-            distillery="Test Distillery",
-            specific_release="Regular",
-            msrp=Decimal("99.99"),
-            metadata=metadata,
-        )
-
-        with patch("datetime.datetime") as mock_dt:
-            mock_dt.now.return_value.strftime.return_value = "20250113_120000"
-            generator = PreviewGenerator()
-            result_path = generator.save_bottle_files(bottle, metadata)
-
-        # Verify mkdir was called
-        assert mock_mkdir.called
-        # The folder name in result_path should be sanitized
-        assert "/" not in str(result_path.name)
-        assert "\\" not in str(result_path.name)
-
-    @patch("pathlib.Path.mkdir")
-    @patch("pathlib.Path.exists")
-    @patch.object(PreviewGenerator, "generate_bottle_markdown")
-    @patch("builtins.open")
-    @patch("shutil.copy2")
-    def test_save_bottle_files_skips_missing_images(
-        self, mock_copy, mock_open, mock_md, mock_exists, mock_mkdir
-    ):
-        """Test images that don't exist are skipped."""
-        # First exists returns True, second returns False
-        mock_exists.side_effect = [True, False]
-        mock_md.return_value = "# Test\n\nContent"
-        mock_open.return_value.__enter__ = Mock()
-        mock_open.return_value.__exit__ = Mock()
-
-        metadata = ExtractedMetadata(
-            full_text="OCR text",
-            selected_text="OCR text",
-            source_images=[Path("existing.jpg"), Path("missing.jpg")],
-        )
-        bottle = Bottle(
-            name="Test Bourbon",
-            distillery="Test Distillery",
-            specific_release="Regular",
-            msrp=Decimal("99.99"),
-            metadata=metadata,
-        )
-
-        with patch("datetime.datetime") as mock_dt:
-            mock_dt.now.return_value.strftime.return_value = "20250113_120000"
-            generator = PreviewGenerator()
-            generator.save_bottle_files(bottle, metadata)
-
-        # Only one image copied (existing.jpg)
-        assert mock_copy.call_count == 1
+        args = parse_args(["retry", "--report", str(report), "-o", str(tmp_path / "out")])
+        with patch("cli.commands.ModelServerManager") as MockManager:
+            MockManager.return_value.ensure_running.return_value = False
+            assert retry_command(args) == 1  # got past validation to the server check
+        MockManager.return_value.ensure_running.assert_called_once()
 
 
 class TestPreviewGeneratorErrorReport:
@@ -707,6 +1003,27 @@ class TestPreviewGeneratorSaveBatchPreview:
         )
 
         assert result_path == custom_path
+
+    def test_save_batch_preview_into_directory_writes_md_and_json(self, tmp_path):
+        """output_path may be a directory; a sibling batch_<id>.json is written."""
+        metadata = ExtractedMetadata(full_text="Text", source_images=[Path("bottle.jpg")])
+        bottle_dicts = [{"name": "Test", "distillery": "Dist", "msrp": "99.99", "quantity": 2}]
+        target = tmp_path / "reports"
+        target.mkdir()
+
+        generator = PreviewGenerator(output_dir=tmp_path / "out")
+        result_path = generator.save_batch_preview(
+            bottle_dicts, [metadata], batch_id="20261122_120000_001",
+            output_path=target, rejected_bottles=["IMG_7"],
+        )
+
+        assert result_path == target / "batch_20261122_120000_001_preview.md"
+        assert "IMG_7" in result_path.read_text(encoding="utf-8")
+        data = json.loads((target / "batch_20261122_120000_001.json").read_text(encoding="utf-8"))
+        assert data["batch_id"] == "20261122_120000_001"
+        assert data["bottles"] == bottle_dicts
+        assert data["rejected"] == ["IMG_7"]
+        assert ExtractedMetadata.from_dict(data["metadata"][0]).full_text == "Text"
 
 
 class TestPreviewGeneratorInteractivePrompt:
@@ -1087,3 +1404,25 @@ class TestPreviewGeneratorHandleInteractiveChoice:
         assert isinstance(result["corrected_at"], str)
         # Should parse as ISO format datetime
         datetime.fromisoformat(result["corrected_at"])
+
+
+class TestOutputMarkers:
+    """Bottle folders are marked as output; the root marker is optional."""
+
+    def test_bottle_folder_carries_its_own_marker(self, tmp_path):
+        from image_processor.image_organizer import OUTPUT_MARKER, ImageOrganizer
+
+        photo = tmp_path / "photos" / "IMG_1.jpg"
+        photo.parent.mkdir()
+        photo.write_bytes(b"\xff\xd8\xff")
+        generator = PreviewGenerator(output_dir=tmp_path / "photos" / "out", mark_output_dir=False)
+        folder = generator.save_bottle_files(
+            Bottle.from_analysis({"name": "X"}, ExtractedMetadata(source_images=[str(photo)]))
+        )
+
+        assert (folder / OUTPUT_MARKER).exists()
+        assert not (generator.output_dir / OUTPUT_MARKER).exists()
+        # Scanning the photo folder never re-ingests the copied images.
+        assert ImageOrganizer().iter_image_paths(tmp_path / "photos") == [photo]
+        # Not even when the output root itself is the scan root.
+        assert ImageOrganizer().iter_image_paths(generator.output_dir) == []

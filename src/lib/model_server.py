@@ -1,103 +1,175 @@
-"""MPLTX model serving manager.
+"""Model server lifecycle management.
 
-Manages the full lifecycle of model serving via MPLTX: start, stop,
-health-check, model pull, resource monitoring, and cold-start management.
+Starts (or adopts), health-checks, warms and shuts down the local model server
+the pipeline talks to. The only backend is :class:`OllamaServer`, which talks
+to Ollama's REST endpoints (``/api/version``, ``/api/tags``, ``/api/ps``,
+``/api/generate``) and, if Ollama is not running on a local URL, can spawn
+``ollama serve``. Ollama runs on macOS and Linux, and the lifecycle code here
+only uses POSIX facilities. Further backends plug in by subclassing
+:class:`BaseModelServer` and adding a :class:`ServerBackend` member.
 
-Replaces the current external-Ollama assumption with codebase-managed
-model serving. The serving manager is pluggable — swap backends by
-changing the concrete implementation.
+Ownership rules (see :class:`Ownership`):
 
-Current backends:
-    - MpltxServer: Native MPLTX serving (process management)
-    - OllamaServer: Ollama with auto-start (backward compatible)
+- A server that already answers its identity probe is adopted as
+  ``EXTERNAL``. It is never stopped or signalled by this program.
+- A server this program spawns is ``OWNED``: its output goes to a log file in
+  :func:`lib.process_supervisor.default_log_dir`, it runs in its own process
+  group, it is reaped at interpreter exit, and :meth:`BaseModelServer.stop`
+  terminates the whole group (SIGTERM, then SIGKILL after a grace period).
+
+Models are never downloaded implicitly: :meth:`ModelServerManager.ensure_model`
+only pulls when called with ``allow_pull=True``, and then only after checking
+the download size (from the registry manifest) against free space on the model
+store (see :mod:`lib.model_availability`). Missing, non-vision or too-large
+models produce an error that lists the installed vision-capable models and the
+exact ``ollama pull`` command.
 
 Usage::
 
     from lib.model_server import ModelServerManager, ServerBackend
 
-    manager = ModelServerManager(backend=ServerBackend.MPLTX)
-
-    # Ensure model is loaded and ready
-    manager.ensure_model("qwen3-vl:32b")
-
-    # Use the client (serving is guaranteed running)
-    client = manager.get_client()
-    result = client.image_to_text(image_path, prompt, model="qwen3-vl:32b")
-
-    # Clean shutdown
-    manager.close()
-
+    manager = ModelServerManager(backend=ServerBackend.OLLAMA)
+    if manager.ensure_running() and manager.ensure_model(
+        "qwen3.6:35b-a3b", capability="vision", warm=True
+    ):
+        client = manager.get_client()
+        text = client.image_to_text(image_path, prompt, model="qwen3.6:35b-a3b")
+    manager.close()  # stops the server only if this program started it
 """
 
+from __future__ import annotations
+
+import atexit
 import json
 import logging
 import os
-import signal
+import shlex
+import shutil
 import subprocess
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from enum import Enum, auto
+from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlparse
+
+import requests
+
+from lib.exceptions import ModelServerError
+from lib.model_availability import (
+    DEFAULT_MIN_FREE_BYTES,
+    LINUX_SERVICE_MODELS_DIR,
+    DiskCheck,
+    PullEstimate,
+    check_disk,
+    fetch_pull_estimate,
+    format_gb,
+    is_local_url,
+    make_disk_guard,
+    normalize_model_name,
+    ollama_models_dir,
+)
+from lib.process_supervisor import (
+    ManagedProcess,
+    ProbeResult,
+    default_log_dir,
+    port_in_use,
+    wait_until_ready,
+)
 
 logger = logging.getLogger(__name__)
 
+#: Default Ollama endpoint.
+DEFAULT_OLLAMA_URL = "http://localhost:11434"
+#: Per-request timeout (seconds) for inference clients. One warm vision call on
+#: a full-resolution photo was measured at ~43s; a cold load adds minutes.
+DEFAULT_REQUEST_TIMEOUT = 600
+
+#: Backend names that were supported once; parsing them explains the removal.
+_REMOVED_BACKENDS = frozenset({"mtplx", "mpltx"})
+
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+_ZERO_USAGE = {"memory_mb": 0.0, "gpu_percent": 0.0, "cpu_percent": 0.0}
+
+
+class ServerStartError(RuntimeError):
+    """A server cannot be spawned as configured (raised by ``_spawn_argv``)."""
+
 
 # ---------------------------------------------------------------------------
-# Backend enumeration
+# Enumerations and state
 # ---------------------------------------------------------------------------
 
 class ServerBackend(Enum):
     """Model serving backend.
 
     Attributes:
-        MPLTX: Native MPLTX serving (preferred).
-        OLLAMA: Ollama with auto-start (backward compatible).
+        OLLAMA: Ollama (the only backend; the default).
     """
 
-    MPLTX = auto()
-    """Native MPLTX model serving."""
-
-    OLLAMA = auto()
-    """Ollama with automatic start/stop."""
+    OLLAMA = "ollama"
 
     @classmethod
-    def parse(cls, value: "ServerBackend | str") -> "ServerBackend":
-        """Coerce a CLI/config string ("mpltx", "ollama") or enum into a ServerBackend.
+    def parse(cls, value: ServerBackend | str) -> ServerBackend:
+        """Coerce a CLI/config string or enum member into a ServerBackend.
+
+        Matching is case-insensitive and ignores surrounding whitespace.
 
         Raises:
-            ValueError: If the value does not name a known backend.
+            ValueError: If the value does not name a supported backend. A
+                backend whose support was removed gets a message saying so.
         """
         if isinstance(value, cls):
             return value
         if isinstance(value, str):
+            key = value.strip().lower()
             try:
-                return cls[value.strip().upper()]
-            except KeyError:
+                return cls(key)
+            except ValueError:
                 pass
-        valid = ", ".join(b.name.lower() for b in cls)
+            if key in _REMOVED_BACKENDS:
+                raise ValueError(
+                    f"Backend {value!r} is no longer supported: MTPLX support was removed "
+                    "because it only runs on Apple Silicon. Use 'ollama'."
+                )
+        valid = ", ".join(repr(b.value) for b in cls)
         raise ValueError(f"Unknown backend: {value!r} (expected one of: {valid})")
 
 
-# ---------------------------------------------------------------------------
-# Server state
-# ---------------------------------------------------------------------------
+class Ownership(Enum):
+    """Who is responsible for a server process.
+
+    Attributes:
+        NONE: No server is known to be running.
+        EXTERNAL: A server was already running; it is never stopped by us.
+        OWNED: We spawned the server; we stop it on close/exit.
+    """
+
+    NONE = "none"
+    EXTERNAL = "external"
+    OWNED = "owned"
+
 
 @dataclass
 class ServerState:
-    """Current state of the model server.
+    """Snapshot of the model server's status.
 
     Attributes:
         backend: Serving backend in use.
-        is_running: Whether the server process is alive.
+        is_running: Whether the server answered its identity probe.
         base_url: HTTP URL for API requests.
-        pid: Process ID (0 if not managed by us).
-        models_loaded: List of currently loaded model names.
-        memory_usage_mb: Approximate memory usage (0 if unknown).
-        gpu_usage_percent: GPU utilization (0 if no GPU).
-        cold_start_seconds: Time since last cold start (0 if warm).
-        uptime_seconds: How long the server has been running.
+        pid: Process ID if we own the server (0 otherwise).
+        models_loaded: Models currently resident in memory.
+        memory_usage_mb: Approximate (V)RAM used by loaded models (0 if unknown).
+        gpu_usage_percent: GPU utilization (0 if unknown).
+        cold_start_seconds: Time the last start took (0 if adopted).
+        uptime_seconds: Seconds since we started the server (0 if adopted).
+        error_message: Last lifecycle error, if any.
+        owned: Whether this program started (and will stop) the server.
+        version: Server version string, if reported.
+        log_path: Log file of an owned server ('' otherwise).
     """
 
     backend: ServerBackend
@@ -110,981 +182,1006 @@ class ServerState:
     cold_start_seconds: float = 0.0
     uptime_seconds: float = 0.0
     error_message: Optional[str] = None
+    owned: bool = False
+    version: str = ""
+    log_path: str = ""
 
 
 # ---------------------------------------------------------------------------
-# Abstract server interface
+# Abstract server
 # ---------------------------------------------------------------------------
 
 class BaseModelServer(ABC):
-    """Abstract interface for model serving backends.
+    """Template for a model server backend.
 
-    All concrete backends (MPLTX, Ollama, etc.) implement this interface.
-    The ModelSelector uses this abstraction to interact with any backend.
-    """
+    :meth:`start` implements one algorithm for every backend: adopt a server
+    that already answers, otherwise (if allowed and the port is free) spawn
+    one, wait for it to become ready and verify it. Subclasses provide the
+    hooks (``_identity_probe``, ``_can_spawn``, ``_spawn_argv``,
+    ``_spawn_env``) and the model operations. Ollama (:class:`OllamaServer`)
+    is the only implementation; the split keeps the lifecycle algorithm
+    separate from the Ollama HTTP API.
 
-    @property
-    @abstractmethod
-    def backend(self) -> ServerBackend:
-        """Return the backend enum value."""
-
-    @abstractmethod
-    def start(self) -> bool:
-        """Start the model server.
-
-        Returns:
-            True if server started successfully, False otherwise.
-        """
-
-    @abstractmethod
-    def stop(self) -> bool:
-        """Stop the model server gracefully.
-
-        Returns:
-            True if server stopped successfully, False otherwise.
-        """
-
-    @abstractmethod
-    def health_check(self) -> bool:
-        """Check if the server is healthy and responsive.
-
-        Returns:
-            True if server is healthy, False otherwise.
-        """
-
-    @abstractmethod
-    def get_state(self) -> ServerState:
-        """Get current server state.
-
-        Returns:
-            ServerState with current status information.
-        """
-
-    @abstractmethod
-    def is_model_available(self, model_name: str) -> bool:
-        """Check if a model is available on this server.
-
-        Args:
-            model_name: Model name to check.
-
-        Returns:
-            True if model is available, False otherwise.
-        """
-
-    @abstractmethod
-    def pull_model(self, model_name: str, **kwargs: Any) -> bool:
-        """Pull/download a model from the registry.
-
-        Args:
-            model_name: Model name to pull.
-            **kwargs: Backend-specific options (e.g., insecure flag).
-
-        Returns:
-            True if model pulled successfully, False otherwise.
-        """
-
-    @abstractmethod
-    def list_models(self) -> list[str]:
-        """List all models available on this server.
-
-        Returns:
-            List of model names.
-        """
-
-    @abstractmethod
-    def get_resource_usage(self) -> dict[str, float]:
-        """Get current resource usage (memory, GPU, CPU).
-
-        Returns:
-            Dictionary with resource metrics.
-        """
-
-    @abstractmethod
-    def load_model(self, model_name: str) -> bool:
-        """Explicitly load a model into memory (warm start).
-
-        Some servers unload idle models to free resources. This forces
-        a model to stay loaded.
-
-        Args:
-            model_name: Model to load.
-
-        Returns:
-            True if model loaded successfully, False otherwise.
-        """
-
-    @abstractmethod
-    def unload_model(self, model_name: str) -> bool:
-        """Explicitly unload a model from memory.
-
-        Args:
-            model_name: Model to unload.
-
-        Returns:
-            True if model unloaded successfully, False otherwise.
-        """
-
-    @abstractmethod
-    def get_client(self) -> Any:  # noqa: ANN401
-        """Get an API client for making requests to this server.
-
-        Returns:
-            API client instance (e.g., OllamaClient, MpltxClient).
-        """
-
-
-# ---------------------------------------------------------------------------
-# MPLTX server implementation
-# ---------------------------------------------------------------------------
-
-class MpltxServer(BaseModelServer):
-    """MPLTX model serving backend.
-
-    Manages a local MPLTX server process: start, stop, health-check,
-    model pull, resource monitoring, and cold-start management.
-
-    Configuration (environment variables):
-        MPLTX_HOME: Path to MPLTX data directory (default: ~/.mpltx)
-        MPLTX_PORT: Port for the HTTP API (default: 11435)
-        MPLTX_MODEL: Default model to load on startup
-        MPLTX_GPU_LAYERS: Number of layers to offload to GPU (default: -1 = all)
-        MPLTX_CONTEXT_SIZE: Context window size (default: 4096)
+    Liveness is :meth:`health_check`; there is deliberately no cached
+    ``is_running`` attribute on servers.
 
     Attributes:
-        home_dir: Path to MPLTX data directory.
-        port: HTTP API port.
-        model: Default model to load.
-        gpu_layers: GPU offload configuration.
-        context_size: Context window size.
-        process: Subprocess handle (None if not started).
-        start_time: When the server was started (0 if not started).
+        host: Host the server listens on.
+        port: TCP port.
+        base_url: HTTP base URL.
+        startup_timeout: Seconds to wait for a spawned server to be ready.
+        stop_grace_seconds: Seconds between SIGTERM and SIGKILL on stop.
+        ownership: Whether the server is external or owned by us.
+        last_error: Actionable description of the last failure (or None).
+        model_listing_failed: True if the last listing of installed models
+            failed (server error), as opposed to an empty listing.
     """
+
+    _display_name = "model server"
+    _port_hint = "the port option"
+    _install_hint = ""
 
     def __init__(
         self,
-        home_dir: Optional[str] = None,
-        port: int = 11435,
-        model: Optional[str] = None,
-        gpu_layers: int = -1,
-        context_size: int = 4096,
-        keep_alive: str = "-1",  # Never auto-unload
+        *,
+        host: str,
+        port: int,
+        base_url: str,
+        startup_timeout: float,
+        stop_grace_seconds: float,
     ):
-        """Initialize MPLTX server manager.
-
-        Args:
-            home_dir: Path to MPLTX data directory.
-            port: HTTP API port.
-            model: Default model to load on startup.
-            gpu_layers: Number of layers to offload to GPU (-1 = all).
-            context_size: Context window size.
-            keep_alive: How long to keep model loaded ("0" = unload after use,
-                       "-1" = never unload, "5m" = 5 minutes).
-        """
-        self.home_dir = Path(home_dir) if home_dir else Path.home() / ".mpltx"
+        """Initialize lifecycle bookkeeping shared by all backends."""
+        self.host = host
         self.port = port
-        self.base_url = f"http://localhost:{port}"
-        self.model = model
-        self.gpu_layers = gpu_layers
-        self.context_size = context_size
-        self.keep_alive = keep_alive
-        self.process: Optional[subprocess.Popen] = None
-        self.start_time: float = 0.0
-        self._env: dict[str, str] = self._build_env()
+        self.base_url = base_url.rstrip("/")
+        self.startup_timeout = startup_timeout
+        self.stop_grace_seconds = stop_grace_seconds
+        self.ownership = Ownership.NONE
+        self.last_error: Optional[str] = None
+        # True when the last attempt to list installed models failed (server
+        # error or unreachable), as opposed to an empty/complete listing.
+        self.model_listing_failed = False
+        self.version = ""
+        self.start_time = 0.0
+        self.cold_start_seconds = 0.0
+        self._proc: Optional[ManagedProcess] = None
+        self._atexit_registered = False
+
+    # -- identity ----------------------------------------------------------
 
     @property
+    @abstractmethod
     def backend(self) -> ServerBackend:
         """Return the backend enum value."""
-        return ServerBackend.MPLTX
 
-    def _build_env(self) -> dict[str, str]:
-        """Build environment variables for the MPLTX process.
+    @property
+    def process(self) -> Optional[subprocess.Popen]:
+        """Popen handle of an owned server, or None."""
+        return self._proc.popen if self._proc is not None else None
 
-        Returns:
-            Dictionary of environment variables.
+    @property
+    def pid(self) -> int:
+        """PID of an owned server (0 if none)."""
+        return self._proc.pid if self._proc is not None else 0
+
+    @property
+    def log_path(self) -> str:
+        """Log file of an owned server ('' if none)."""
+        return str(self._proc.log_path) if self._proc is not None else ""
+
+    # -- hooks -------------------------------------------------------------
+
+    @abstractmethod
+    def _identity_probe(self) -> ProbeResult:
+        """Probe ``base_url`` and report whether it is this kind of server."""
+
+    @abstractmethod
+    def _can_spawn(self) -> tuple[bool, str]:
+        """Return ``(True, '')`` if a local server may be spawned, else ``(False, why)``."""
+
+    @abstractmethod
+    def _spawn_argv(self) -> list[str]:
+        """Command line for spawning the server.
+
+        Raises:
+            ServerStartError: If the server cannot be launched as configured.
         """
-        env = os.environ.copy()
-        env["HOME"] = str(self.home_dir)
-        env.setdefault("MPLTX_HOME", str(self.home_dir))
-        env.setdefault("MPLTX_PORT", str(self.port))
-        return env
 
-    def _build_args(self) -> list[str]:
-        """Build command-line arguments for the MPLTX process.
+    def _spawn_env(self) -> dict[str, str]:
+        """Environment for the spawned server (inherits ours; HOME untouched)."""
+        return os.environ.copy()
 
-        Returns:
-            List of command-line arguments.
+    def _stop_hint(self) -> str:
+        """How a user can stop a detached owned server."""
+        return f"kill -TERM -{self.pid}"
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def can_start(self) -> tuple[bool, str]:
+        """Whether :meth:`start` may launch a local server: ``(True, '')`` or ``(False, why)``.
+
+        Never starts anything; used by dry runs to predict a real run.
         """
-        args = ["mpltx"]
-
-        # Check if mpltx binary is available
-        mpltx_path = self._find_mpltx_binary()
-        if mpltx_path:
-            args = [mpltx_path]
-        else:
-            # If binary not found, assume it's in PATH
-            args = ["mpltx"]
-
-        args.extend([
-            "--port", str(self.port),
-            "--ctx-size", str(self.context_size),
-            "--gpu-layers", str(self.gpu_layers),
-            "--keep-alive", self.keep_alive,
-        ])
-
-        if self.model:
-            args.extend(["--model", self.model])
-
-        return args
-
-    def _find_mpltx_binary(self) -> Optional[str]:
-        """Find the MPLTX binary on the system.
-
-        Searches:
-        1. MPLTX_HOME/bin/
-        2. PATH
-
-        Returns:
-            Path to binary, or None if not found.
-        """
-        # Check MPLTX_HOME/bin first
-        bin_path = self.home_dir / "bin" / "mpltx"
-        if bin_path.exists() and bin_path.is_file():
-            return str(bin_path)
-
-        # Check PATH
         try:
-            result = subprocess.run(
-                ["which", "mpltx"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if result.returncode == 0:
-                return result.stdout.strip()
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            pass
-
-        return None
-
-    def start(self) -> bool:
-        """Start the MPLTX server process.
-
-        Attempts to start the server and waits for it to become healthy.
-        If the server is already running, returns True without starting.
-
-        Returns:
-            True if server is running and healthy, False otherwise.
-        """
-        if self.is_running:
-            return self.health_check()
-
-        logger.info("Starting MPLTX server on port %d...", self.port)
-
-        try:
-            args = self._build_args()
-            logger.debug("MPLTX command: %s", " ".join(args))
-
-            self.process = subprocess.Popen(
-                args,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=self._env,
-                start_new_session=True,  # Separate process group
-            )
-
-            self.start_time = time.time()
-            logger.info("MPLTX server started (PID: %d)", self.process.pid)
-
-            # Wait for server to become healthy (up to 60 seconds)
-            if self._wait_for_healthy(timeout=60):
-                logger.info("MPLTX server is healthy")
-                return True
-            else:
-                logger.error("MPLTX server failed to become healthy within 60 seconds")
-                self.stop()
-                return False
-
-        except FileNotFoundError:
-            logger.error("MPLTX binary not found. Install MPLTX or set MPLTX_HOME.")
-            return False
+            return self._can_spawn()
         except Exception as e:
-            logger.exception("Failed to start MPLTX server: %s", e)
-            return False
-
-    def stop(self) -> bool:
-        """Stop the MPLTX server gracefully.
-
-        Sends SIGTERM and waits up to 10 seconds for clean shutdown.
-        If the process doesn't exit, sends SIGKILL.
-
-        Returns:
-            True if server stopped successfully, False otherwise.
-        """
-        if self.process is None:
-            return True
-
-        logger.info("Stopping MPLTX server (PID: %d)...", self.process.pid)
-
-        try:
-            # Send SIGTERM for graceful shutdown
-            if hasattr(signal, "SIGTERM"):
-                os.kill(self.process.pid, signal.SIGTERM)
-
-            # Wait up to 10 seconds for clean exit
-            self.process.wait(timeout=10)
-
-            self.process = None
-            self.start_time = 0.0
-            logger.info("MPLTX server stopped")
-            return True
-
-        except subprocess.TimeoutExpired:
-            logger.warning("MPLTX server did not stop gracefully, sending SIGKILL")
-            try:
-                os.kill(self.process.pid, signal.SIGKILL)
-                self.process.wait(timeout=5)
-            except Exception:
-                pass
-
-            self.process = None
-            self.start_time = 0.0
-            return True
-
-        except Exception as e:
-            logger.exception("Error stopping MPLTX server: %s", e)
-            return False
+            return False, f"cannot check whether a server can be started: {e}"
 
     def health_check(self) -> bool:
-        """Check if the server is healthy and responsive.
-
-        Returns:
-            True if server is healthy, False otherwise.
-        """
-        if self.process is None or self.process.poll() is not None:
-            return False
-
+        """Return True if the server answers its identity probe. Never raises."""
         try:
-            import requests
-
-            response = requests.get(
-                f"{self.base_url}/api/tags",
-                timeout=5,
-            )
-            return response.status_code == 200
+            return bool(self._identity_probe().ready)
         except Exception:
             return False
 
-    def _wait_for_healthy(self, timeout: int = 60) -> bool:
-        """Wait for the server to become healthy.
+    def start(self) -> bool:
+        """Make sure the server is running, adopting or spawning it.
 
-        Polls the health endpoint every 2 seconds until healthy or timeout.
-
-        Args:
-            timeout: Maximum seconds to wait.
+        Idempotent and never raises. On failure :attr:`last_error` holds an
+        actionable message.
 
         Returns:
-            True if server became healthy within timeout.
+            True if the server is ready for requests.
         """
-        import requests
+        self.last_error = None
 
-        start = time.time()
-        while time.time() - start < timeout:
-            try:
-                response = requests.get(
-                    f"{self.base_url}/api/tags",
-                    timeout=5,
+        if self.ownership is Ownership.OWNED and self._proc is not None:
+            if self._proc.is_alive():
+                return self.health_check() or self._await_owned_ready()
+            logger.warning(
+                "%s (pid %d) exited unexpectedly; see %s",
+                self._display_name, self._proc.pid, self._proc.log_path,
+            )
+            self._proc.terminate(self.stop_grace_seconds)  # reap stragglers, close the log
+            self._forget_owned()
+
+        probe = self._safe_probe()
+        if probe.ready:
+            if self.ownership is not Ownership.EXTERNAL:
+                logger.info(
+                    "Using already-running %s at %s (not managed by this run)",
+                    self._display_name, self.base_url,
                 )
-                if response.status_code == 200:
-                    return True
-            except Exception:
-                pass
-            time.sleep(2)
+            self.ownership = Ownership.EXTERNAL
+            return True
 
+        allowed, why = self._can_spawn()
+        if not allowed:
+            self.last_error = (
+                f"{self._display_name} is not reachable at {self.base_url} ({probe.detail}) and {why}"
+            )
+            return False
+
+        if port_in_use(self.host, self.port):
+            self.last_error = (
+                f"Port {self.port} on {self.host} is in use by a process that is not answering "
+                f"as {self._display_name} ({probe.detail}). Stop that process or choose another "
+                f"port with {self._port_hint}."
+            )
+            return False
+
+        try:
+            argv = self._spawn_argv()
+        except ServerStartError as e:
+            self.last_error = str(e)
+            return False
+
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        log_path = default_log_dir() / f"{self.backend.value}-{self.port}-{timestamp}.log"
+        proc = ManagedProcess(argv, log_path=log_path, env=self._spawn_env(), name=self._display_name)
+        logger.info("Starting %s: %s", self._display_name, " ".join(argv))
+        try:
+            proc.spawn()
+        except FileNotFoundError:
+            self.last_error = f"{self._display_name} executable not found ({argv[0]}). {self._install_hint}"
+            return False
+        except OSError as e:
+            self.last_error = f"Could not start {self._display_name}: {e}"
+            return False
+
+        self._proc = proc
+        self.ownership = Ownership.OWNED
+        self.start_time = time.time()
+        self._register_atexit()
+        logger.info(
+            "Started %s (pid %d); log: %s", self._display_name, proc.pid, proc.log_path
+        )
+        return self._await_owned_ready()
+
+    def _await_owned_ready(self) -> bool:
+        """Wait for an owned server to become ready; stop it on failure."""
+        proc = self._proc
+        if proc is None:
+            return False
+        result = wait_until_ready(
+            self._safe_probe, timeout=self.startup_timeout, is_alive=proc.is_alive
+        )
+        if result.ready:
+            self.cold_start_seconds = time.time() - self.start_time
+            logger.info(
+                "%s is ready at %s after %.1fs",
+                self._display_name, self.base_url, self.cold_start_seconds,
+            )
+            return True
+
+        exit_code = proc.returncode
+        tail = proc.tail_log().rstrip()
+        exit_note = f" (exit code {exit_code})" if exit_code is not None else ""
+        self.last_error = (
+            f"{self._display_name} failed to become ready: {result.detail}{exit_note}. "
+            f"Last log lines:\n{tail or '(log is empty)'}\nFull log: {proc.log_path}"
+        )
+        self.stop()
         return False
 
-    def get_state(self) -> ServerState:
-        """Get current server state.
+    def stop(self) -> bool:
+        """Stop the server if this program owns it; otherwise do nothing.
+
+        An external server is never contacted or signalled.
 
         Returns:
-            ServerState with current status information.
+            True unless an owned server could not be reaped.
         """
-        state = ServerState(
-            backend=self.backend,
-            is_running=self.process is not None and self.process.poll() is None,
-            base_url=self.base_url,
-            pid=self.process.pid if self.process else 0,
+        if self.ownership is not Ownership.OWNED or self._proc is None:
+            if self.ownership is Ownership.EXTERNAL:
+                logger.debug(
+                    "Leaving external %s at %s running", self._display_name, self.base_url
+                )
+            return True
+        logger.info("Stopping %s (pid %d)...", self._display_name, self._proc.pid)
+        ok = self._proc.terminate(self.stop_grace_seconds)
+        self._forget_owned()
+        return ok
+
+    def detach(self) -> None:
+        """Leave an owned server running after this program exits (``--keep-server``)."""
+        if self.ownership is not Ownership.OWNED or self._proc is None:
+            return
+        logger.info(
+            "Leaving %s running (pid %d, log %s); stop it later with: %s",
+            self._display_name, self._proc.pid, self._proc.log_path, self._stop_hint(),
+        )
+        self._proc.detach()
+        self._proc = None
+        self._unregister_atexit()
+        self.ownership = Ownership.EXTERNAL
+
+    def _forget_owned(self) -> None:
+        self._unregister_atexit()
+        self._proc = None
+        self.ownership = Ownership.NONE
+        self.start_time = 0.0
+
+    def _safe_probe(self) -> ProbeResult:
+        try:
+            return self._identity_probe()
+        except Exception as e:  # probes must never break the lifecycle
+            return ProbeResult(False, f"probe failed: {e}")
+
+    def _register_atexit(self) -> None:
+        if not self._atexit_registered:
+            atexit.register(self._atexit_stop)
+            self._atexit_registered = True
+
+    def _unregister_atexit(self) -> None:
+        if self._atexit_registered:
+            atexit.unregister(self._atexit_stop)
+            self._atexit_registered = False
+
+    def _atexit_stop(self) -> None:
+        try:
+            self.stop()
+        except Exception:
+            pass
+
+    # -- model operations --------------------------------------------------
+
+    @abstractmethod
+    def get_state(self) -> ServerState:
+        """Return a status snapshot (never starts anything)."""
+
+    @abstractmethod
+    def is_model_available(self, model_name: str) -> bool:
+        """Return True if ``model_name`` can be served without downloading."""
+
+    @abstractmethod
+    def pull_model(
+        self,
+        model_name: str,
+        *,
+        should_abort: Optional[Callable[[], Optional[str]]] = None,
+    ) -> bool:
+        """Download a model. Only called when the caller explicitly allows it.
+
+        ``should_abort() -> str | None`` is polled during the download and
+        returns a reason to stop (e.g. the disk guard).
+        """
+
+    @abstractmethod
+    def list_models(self) -> list[str]:
+        """List models available without downloading."""
+
+    # Non-abstract defaults: a backend that cannot answer these reports
+    # "unknown", which makes ModelServerManager refuse automatic pulls.
+
+    def model_store_path(self) -> Optional[Path]:
+        """Local directory the server stores models in, or None if unknown/remote."""
+        return None
+
+    def estimate_pull(self, model_name: str) -> PullEstimate:
+        """Estimate how much pulling ``model_name`` would download (default: unknown)."""
+        return PullEstimate(
+            model_name,
+            error=f"size estimation is not supported by the {self.backend.value} backend",
         )
 
-        if state.is_running:
-            try:
-                import requests
+    def get_capabilities(self, model_name: str) -> Optional[set[str]]:  # noqa: ARG002
+        """Capabilities of an installed model (e.g. ``{'completion', 'vision'}``), or None if unknown."""
+        return None
 
-                response = requests.get(
-                    f"{self.base_url}/api/tags",
-                    timeout=5,
-                )
-                if response.status_code == 200:
-                    data = response.json()
-                    state.models_loaded = [m["name"] for m in data.get("models", [])]
-            except Exception:
-                pass
-
-            resource = self.get_resource_usage()
-            state.memory_usage_mb = int(resource.get("memory_mb", 0))
-            state.gpu_usage_percent = resource.get("gpu_percent", 0.0)
-
-            if self.start_time > 0:
-                state.uptime_seconds = time.time() - self.start_time
-
-        return state
-
-    def is_model_available(self, model_name: str) -> bool:
-        """Check if a model is available on this server.
-
-        Args:
-            model_name: Model name to check.
-
-        Returns:
-            True if model is available, False otherwise.
-        """
-        try:
-            import requests
-
-            response = requests.get(
-                f"{self.base_url}/api/tags",
-                timeout=5,
-            )
-            if response.status_code == 200:
-                models = response.json().get("models", [])
-                return any(m.get("name") == model_name for m in models)
-        except Exception:
-            pass
-
-        return False
-
-    def pull_model(self, model_name: str, **kwargs: Any) -> bool:
-        """Pull/download a model from the registry.
-
-        Args:
-            model_name: Model name to pull.
-            **kwargs: Backend-specific options.
-
-        Returns:
-            True if model pulled successfully, False otherwise.
-        """
-        try:
-            import requests
-
-            payload = {
-                "name": model_name,
-                "stream": False,
-            }
-
-            response = requests.post(
-                f"{self.base_url}/api/pull",
-                json=payload,
-                timeout=300,  # Model pulls can take a while
-            )
-            return response.status_code in (200, 201)
-
-        except Exception as e:
-            logger.exception("Failed to pull model %s: %s", model_name, e)
-            return False
-
-    def list_models(self) -> list[str]:
-        """List all models available on this server.
-
-        Returns:
-            List of model names.
-        """
-        try:
-            import requests
-
-            response = requests.get(
-                f"{self.base_url}/api/tags",
-                timeout=5,
-            )
-            if response.status_code == 200:
-                return [m["name"] for m in response.json().get("models", [])]
-        except Exception:
-            pass
-
+    def list_vision_models(self) -> list[str]:
+        """Installed models that accept images (default: none known)."""
         return []
 
+    def manual_pull_command(self, model_name: str) -> str:
+        """Shell command a user can run to download ``model_name`` themselves."""
+        return f"ollama pull {shlex.quote(model_name)}"
+
+    @abstractmethod
     def get_resource_usage(self) -> dict[str, float]:
-        """Get current resource usage (memory, GPU, CPU).
+        """Return ``memory_mb`` / ``gpu_percent`` / ``cpu_percent`` (zeros if unknown)."""
 
-        Returns:
-            Dictionary with resource metrics.
-        """
-        usage: dict[str, float] = {"memory_mb": 0.0, "gpu_percent": 0.0, "cpu_percent": 0.0}
-
-        if self.process is None or self.process.poll() is not None:
-            return usage
-
-        try:
-            import requests
-
-            response = requests.get(
-                f"{self.base_url}/api/usage",
-                timeout=5,
-            )
-            if response.status_code == 200:
-                data = response.json()
-                usage["memory_mb"] = float(data.get("memory_used", 0) / (1024 * 1024))
-                usage["gpu_percent"] = float(data.get("gpu_utilization", 0))
-                usage["cpu_percent"] = float(data.get("cpu_usage", 0))
-        except Exception:
-            # If /api/usage doesn't exist, try to get from process stats
-            try:
-                import psutil
-
-                proc = psutil.Process(self.process.pid)
-                mem_info = proc.memory_info()
-                usage["memory_mb"] = float(mem_info.rss) / (1024 * 1024)
-                usage["cpu_percent"] = proc.cpu_percent(interval=0.1)
-            except Exception:
-                pass
-
-        return usage
-
+    @abstractmethod
     def load_model(self, model_name: str) -> bool:
-        """Explicitly load a model into memory (warm start).
+        """Load a model into memory now (warm start)."""
 
-        Sends a dummy request to trigger model loading, keeping it
-        resident for subsequent requests.
-
-        Args:
-            model_name: Model to load.
-
-        Returns:
-            True if model loaded successfully, False otherwise.
-        """
-        try:
-            import requests
-
-            # Send a minimal request to trigger model loading
-            response = requests.post(
-                f"{self.base_url}/api/generate",
-                json={
-                    "model": model_name,
-                    "prompt": "",
-                    "stream": False,
-                    "options": {
-                        "num_predict": 1,
-                    },
-                },
-                timeout=120,  # Cold start can take a while
-            )
-            return response.status_code in (200, 201)
-
-        except Exception as e:
-            logger.warning("Failed to pre-load model %s: %s", model_name, e)
-            return False
-
+    @abstractmethod
     def unload_model(self, model_name: str) -> bool:
-        """Explicitly unload a model from memory.
+        """Release a model from memory."""
 
-        Args:
-            model_name: Model to unload.
-
-        Returns:
-            True if model unloaded successfully, False otherwise.
-        """
-        try:
-            import requests
-
-            response = requests.post(
-                f"{self.base_url}/api/gc",
-                json={"models": [model_name]},
-                timeout=10,
-            )
-            return response.status_code == 200
-
-        except Exception:
-            return False
-
+    @abstractmethod
     def get_client(self) -> Any:  # noqa: ANN401
-        """Get an API client for making requests to this server.
-
-        Returns:
-            OllamaClient configured to talk to this server.
-            (MPLTX uses the same API as Ollama.)
-        """
-        from lib.ollama_client import OllamaClient
-
-        return OllamaClient(
-            base_url=self.base_url,
-            timeout=120,  # Longer timeout for model loading
-            model=self.model,
-        )
+        """Return an API client for this server (e.g. an OllamaClient)."""
 
 
 # ---------------------------------------------------------------------------
-# Ollama server with auto-start (backward compatible)
+# Ollama
 # ---------------------------------------------------------------------------
 
 class OllamaServer(BaseModelServer):
-    """Ollama server with automatic start/stop.
+    """Ollama backend.
 
-    Extends the current OllamaClient with lifecycle management.
-    If Ollama is not running, automatically starts it.
-
-    This is the backward-compatible path — it keeps the existing
-    OllamaClient API but adds process management.
+    Adopts a running Ollama (the desktop app, a systemd service or a manual
+    ``ollama serve``) as external, or spawns
+    ``ollama serve`` when the URL is local and auto-start is enabled.
 
     Attributes:
-        base_url: Ollama server URL.
-        timeout: Request timeout in seconds.
-        model: Default model.
-        auto_start: Whether to start Ollama if not running.
+        timeout: Per-request timeout for inference clients (seconds).
+        model: Default model for clients.
+        auto_start: Whether ``ollama serve`` may be spawned.
+        keep_alive: How long a warmed model stays resident (Ollama duration).
+        probe_timeout: Timeout of the ``/api/version`` identity probe.
     """
+
+    _display_name = "Ollama"
+    _port_hint = "--ollama-url"
+    _install_hint = "Install it from https://ollama.com/download (macOS and Linux)."
 
     def __init__(
         self,
-        base_url: str = "http://localhost:11434",
-        timeout: int = 30,
+        base_url: str = DEFAULT_OLLAMA_URL,
+        timeout: float = DEFAULT_REQUEST_TIMEOUT,
         model: Optional[str] = None,
         auto_start: bool = True,
+        keep_alive: str = "30m",
+        startup_timeout: float = 30.0,
+        probe_timeout: float = 2.0,
     ):
-        """Initialize Ollama server manager.
+        """Initialize the Ollama backend.
 
         Args:
-            base_url: Ollama server URL.
-            timeout: Request timeout in seconds.
-            model: Default model.
-            auto_start: Whether to start Ollama if not running.
+            base_url: Ollama URL.
+            timeout: Per-request timeout for inference clients (seconds).
+            model: Default model for clients.
+            auto_start: Allow spawning ``ollama serve`` for a local URL.
+            keep_alive: Residency duration used when warming a model.
+            startup_timeout: Seconds to wait for a spawned server.
+            probe_timeout: Identity probe timeout.
+
+        Raises:
+            ValueError: If ``base_url`` has an invalid port.
         """
-        self.base_url = base_url.rstrip("/")
+        base_url = base_url.rstrip("/")
+        parsed = urlparse(base_url)
+        super().__init__(
+            host=parsed.hostname or "localhost",
+            port=parsed.port or 11434,
+            base_url=base_url,
+            startup_timeout=startup_timeout,
+            stop_grace_seconds=10.0,
+        )
         self.timeout = timeout
         self.model = model
         self.auto_start = auto_start
-        self.client = None  # OllamaClient instance (created on demand)
+        self.keep_alive = keep_alive
+        self.probe_timeout = probe_timeout
+        self._binary: Optional[str] = None
 
     @property
     def backend(self) -> ServerBackend:
         """Return the backend enum value."""
         return ServerBackend.OLLAMA
 
-    def start(self) -> bool:
-        """Start the Ollama server if not already running.
+    # -- lifecycle hooks ---------------------------------------------------
 
-        Tries to start Ollama via `ollama serve` if it's not already running.
+    def _identity_probe(self) -> ProbeResult:
+        """``GET /api/version``: 200 with a ``version`` field means Ollama."""
+        try:
+            response = requests.get(f"{self.base_url}/api/version", timeout=self.probe_timeout)
+        except requests.Timeout:
+            return ProbeResult(False, "probe timed out")
+        except requests.RequestException:
+            return ProbeResult(False, "connection refused")
+        if response.status_code != 200:
+            return ProbeResult(False, f"HTTP {response.status_code} from /api/version")
+        try:
+            payload = response.json()
+        except ValueError:
+            return ProbeResult(False, "unexpected /api/version response")
+        if not isinstance(payload, dict) or "version" not in payload:
+            return ProbeResult(False, "unexpected /api/version response")
+        self.version = str(payload.get("version", ""))
+        return ProbeResult(True, f"Ollama {self.version}", payload)
 
-        Returns:
-            True if server is running, False otherwise.
-        """
+    def _can_spawn(self) -> tuple[bool, str]:
         if not self.auto_start:
-            return self.health_check()
-
-        if self.health_check():
-            return True
-
-        logger.info("Ollama not running, attempting to start...")
-
-        try:
-            # Try to start Ollama in the background
-            self.process = subprocess.Popen(
-                ["ollama", "serve"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
+            return False, "auto-start is disabled (--no-server-autostart)"
+        if self.host not in _LOOPBACK_HOSTS:
+            return False, (
+                f"{self.host} is not this machine, so it cannot be started automatically; "
+                "start Ollama there or fix --ollama-url"
             )
-
-            if self._wait_for_healthy(timeout=30):
-                logger.info("Ollama started successfully")
-                return True
-            else:
-                logger.error("Failed to start Ollama")
-                return False
-
-        except FileNotFoundError:
-            logger.error(
-                "Ollama not found. Install Ollama or start it manually, "
-                "then set BOURBON_OLLAMA_URL to its address."
+        self._binary = shutil.which(os.environ.get("OLLAMA_BIN", "ollama"))
+        if self._binary is None:
+            return False, (
+                "the 'ollama' executable is not on PATH; install it from "
+                "https://ollama.com/download, or start Ollama yourself (desktop app, "
+                "`ollama serve`, or the systemd service on Linux)"
             )
+        if self._store_is_linux_service():
+            # An `ollama serve` started by this user would use ~/.ollama/models,
+            # not the service's store: installed models would look missing, a
+            # --pull would download a second copy and the disk check would
+            # measure the wrong filesystem.
+            return False, (
+                "Ollama is installed as a systemd service (models in "
+                f"{LINUX_SERVICE_MODELS_DIR}); start it with `sudo systemctl start ollama`, "
+                "or set OLLAMA_MODELS / run `ollama serve` yourself"
+            )
+        return True, ""
+
+    @staticmethod
+    def _store_is_linux_service() -> bool:
+        """True if the store in use is the Linux service's and OLLAMA_MODELS is unset."""
+        if (os.environ.get("OLLAMA_MODELS") or "").strip():
             return False
-
-    def stop(self) -> bool:
-        """Stop the Ollama server.
-
-        Returns:
-            True if server stopped, False otherwise.
-        """
         try:
-            import requests
-
-            response = requests.post(
-                f"{self.base_url}/api/close",
-                timeout=5,
-            )
-            return response.status_code == 200
+            return ollama_models_dir() == LINUX_SERVICE_MODELS_DIR
         except Exception:
             return False
 
-    def health_check(self) -> bool:
-        """Check if the server is healthy.
+    def _spawn_argv(self) -> list[str]:
+        binary = self._binary or shutil.which(os.environ.get("OLLAMA_BIN", "ollama")) or "ollama"
+        return [binary, "serve"]
 
-        Returns:
-            True if server is healthy, False otherwise.
-        """
+    def _spawn_env(self) -> dict[str, str]:
+        env = super()._spawn_env()
+        host = f"[{self.host}]" if ":" in self.host else self.host
+        env["OLLAMA_HOST"] = f"{host}:{self.port}"  # bind where we will probe
+        return env
+
+    def _stop_hint(self) -> str:
+        return f"kill {self.pid}"
+
+    # -- state -------------------------------------------------------------
+
+    def _ps(self) -> list[dict[str, Any]]:
+        """Models resident in memory (``GET /api/ps``); [] on error."""
         try:
-            import requests
-
-            response = requests.get(
-                f"{self.base_url}/api/tags",
-                timeout=5,
-            )
-            return response.status_code == 200
-        except Exception:
-            return False
-
-    def _wait_for_healthy(self, timeout: int = 30) -> bool:
-        """Wait for the server to become healthy.
-
-        Args:
-            timeout: Maximum seconds to wait.
-
-        Returns:
-            True if server became healthy.
-        """
-        import requests
-
-        start = time.time()
-        while time.time() - start < timeout:
-            try:
-                response = requests.get(
-                    f"{self.base_url}/api/tags",
-                    timeout=5,
-                )
-                if response.status_code == 200:
-                    return True
-            except Exception:
-                pass
-            time.sleep(2)
-
-        return False
+            response = requests.get(f"{self.base_url}/api/ps", timeout=5)
+            if response.status_code == 200:
+                models = response.json().get("models", [])
+                return [m for m in models if isinstance(m, dict)]
+        except (requests.RequestException, ValueError, AttributeError):
+            pass
+        return []
 
     def get_state(self) -> ServerState:
-        """Get current server state.
-
-        Returns:
-            ServerState with current status.
-        """
+        """Return a status snapshot; ``models_loaded`` comes from ``/api/ps``."""
         state = ServerState(
             backend=self.backend,
             is_running=self.health_check(),
             base_url=self.base_url,
+            pid=self.pid,
+            error_message=self.last_error,
+            owned=self.ownership is Ownership.OWNED,
+            version=self.version,
+            log_path=self.log_path,
+            cold_start_seconds=self.cold_start_seconds,
         )
-
         if state.is_running:
-            try:
-                import requests
-
-                response = requests.get(
-                    f"{self.base_url}/api/tags",
-                    timeout=5,
-                )
-                if response.status_code == 200:
-                    data = response.json()
-                    state.models_loaded = [m["name"] for m in data.get("models", [])]
-            except Exception:
-                pass
-
+            loaded = self._ps()
+            state.models_loaded = [str(m.get("name", "")) for m in loaded]
+            state.memory_usage_mb = int(self._vram_mb(loaded))
+            if self.start_time > 0:
+                state.uptime_seconds = time.time() - self.start_time
         return state
 
-    def is_model_available(self, model_name: str) -> bool:
-        """Check if a model is available.
+    @staticmethod
+    def _vram_mb(loaded: list[dict[str, Any]]) -> float:
+        total = 0
+        for m in loaded:
+            value = m.get("size_vram", 0)
+            if isinstance(value, (int, float)):
+                total += value
+        return total / 2**20
 
-        Args:
-            model_name: Model name to check.
+    def get_resource_usage(self) -> dict[str, float]:
+        """Return VRAM used by resident models (from ``/api/ps``); zeros on error."""
+        usage = dict(_ZERO_USAGE)
+        usage["memory_mb"] = float(self._vram_mb(self._ps()))
+        return usage
 
-        Returns:
-            True if model is available.
+    # -- models ------------------------------------------------------------
+
+    def _tags(self) -> list[dict[str, Any]]:
+        """Installed models (``GET /api/tags``); [] on any error.
+
+        Sets :attr:`model_listing_failed` so callers can tell "the server
+        could not be asked" apart from "the model is not installed".
         """
         try:
-            import requests
-
-            response = requests.get(
-                f"{self.base_url}/api/tags",
-                timeout=5,
-            )
+            response = requests.get(f"{self.base_url}/api/tags", timeout=5)
             if response.status_code == 200:
                 models = response.json().get("models", [])
-                return any(model_name in m.get("name", "") for m in models)
-        except Exception:
+                if isinstance(models, list):
+                    self.model_listing_failed = False
+                    return [m for m in models if isinstance(m, dict)]
+        except (requests.RequestException, ValueError, AttributeError):
             pass
+        self.model_listing_failed = True
+        return []
 
-        return False
+    @staticmethod
+    def _tag_matches(entry: dict[str, Any], target: str) -> bool:
+        """Whether a ``/api/tags`` entry is the model whose normalized name is ``target``."""
+        return any(
+            isinstance(entry.get(key), str) and normalize_model_name(entry[key]) == target
+            for key in ("name", "model")
+        )
 
-    def pull_model(self, model_name: str, **kwargs: Any) -> bool:
-        """Pull a model from the registry.
+    def _find_tag(self, model_name: str, tags: Optional[list[dict[str, Any]]] = None) -> Optional[dict[str, Any]]:
+        target = normalize_model_name(model_name)
+        for entry in self._tags() if tags is None else tags:
+            if self._tag_matches(entry, target):
+                return entry
+        return None
+
+    def is_model_available(self, model_name: str) -> bool:
+        """Check whether a model is installed (``GET /api/tags``).
+
+        Matching is exact after normalization: ``Drews54/llama3.2-vision``
+        matches ``Drews54/llama3.2-vision:latest`` but ``qwen3`` does not
+        match ``qwen3-coder:latest``.
+
+        Args:
+            model_name: Model tag to check.
+
+        Returns:
+            True if the model is installed.
+        """
+        return self._find_tag(model_name) is not None
+
+    def _show_capabilities(self, model_name: str) -> Optional[set[str]]:
+        """Capabilities from ``POST /api/show``; None on error or if not reported."""
+        try:
+            response = requests.post(
+                f"{self.base_url}/api/show", json={"model": model_name}, timeout=10
+            )
+            if response.status_code != 200:
+                return None
+            caps = response.json().get("capabilities")
+        except (requests.RequestException, ValueError, AttributeError):
+            return None
+        if isinstance(caps, list):
+            return {str(c).lower() for c in caps}
+        return None
+
+    @staticmethod
+    def _entry_capabilities(entry: dict[str, Any]) -> Optional[set[str]]:
+        caps = entry.get("capabilities")
+        if isinstance(caps, list):
+            return {str(c).lower() for c in caps}
+        return None
+
+    def get_capabilities(self, model_name: str) -> Optional[set[str]]:
+        """Capabilities of an installed model.
+
+        Uses the ``capabilities`` field of ``/api/tags`` (recent Ollama
+        versions) and falls back to ``POST /api/show``.
+
+        Args:
+            model_name: Installed model name.
+
+        Returns:
+            Lower-case capability names (e.g. ``{'completion', 'vision'}``),
+            or None if Ollama does not report them.
+        """
+        entry = self._find_tag(model_name)
+        caps = self._entry_capabilities(entry) if entry is not None else None
+        if caps is not None:
+            return caps
+        return self._show_capabilities(str(entry.get("name")) if entry and entry.get("name") else model_name)
+
+    def list_vision_models(self) -> list[str]:
+        """Installed models whose capabilities include ``vision``, in ``/api/tags`` order."""
+        names: list[str] = []
+        for entry in self._tags():
+            name = entry.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            caps = self._entry_capabilities(entry)
+            if caps is None:
+                caps = self._show_capabilities(name)
+            if caps and "vision" in caps:
+                names.append(name)
+        return names
+
+    def model_store_path(self) -> Optional[Path]:
+        """The local Ollama model store, or None when the server is remote.
+
+        See :func:`lib.model_availability.ollama_models_dir` for how the
+        path is resolved (``$OLLAMA_MODELS``, ``~/.ollama/models``, the Linux
+        systemd service store).
+        """
+        if not is_local_url(self.base_url):
+            return None
+        return ollama_models_dir()
+
+    def estimate_pull(self, model_name: str) -> PullEstimate:
+        """Download size of ``model_name`` from its registry manifest.
+
+        Blobs already complete in the local store are subtracted. For a
+        remote server the local store says nothing, so every blob counts and
+        the manifest variant is not guessed from this machine's platform.
+        """
+        store = self.model_store_path()
+        if store is None:
+            return fetch_pull_estimate(model_name, system=None, machine=None)
+        return fetch_pull_estimate(model_name, blobs_dir=store / "blobs")
+
+    def pull_model(
+        self,
+        model_name: str,
+        *,
+        progress: Optional[Callable[[str, int, int], None]] = None,
+        should_abort: Optional[Callable[[], Optional[str]]] = None,
+        read_timeout: float = 600.0,
+        progress_interval: float = 5.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> bool:
+        """Download a model from its registry with a streaming ``POST /api/pull``.
+
+        Only reached through ``ModelServerManager.ensure_model(allow_pull=True)``.
+        Progress is reported at most every ``progress_interval`` seconds and
+        on status changes. Closing the connection (on abort, error or Ctrl-C)
+        makes Ollama stop the download; it keeps the partial blobs and
+        resumes them on the next pull. Nothing is ever deleted here.
 
         Args:
             model_name: Model name to pull.
-            **kwargs: Backend-specific options.
+            progress: ``progress(status, completed_bytes, total_bytes)``;
+                default logs at INFO.
+            should_abort: Polled every ``progress_interval`` seconds; a
+                returned reason aborts the pull (e.g. the disk guard).
+            read_timeout: Seconds without data before giving up (digest
+                verification of a large blob is silent for a while).
+            progress_interval: Seconds between progress reports and abort polls.
+            clock: Monotonic clock (for tests).
 
         Returns:
-            True if model pulled successfully.
-        """
-        try:
-            import requests
+            True only if Ollama reported ``success``.
 
+        Raises:
+            KeyboardInterrupt: Re-raised after closing the connection.
+        """
+        response = None
+        try:
             response = requests.post(
                 f"{self.base_url}/api/pull",
-                json={"name": model_name, "stream": False},
-                timeout=300,
+                json={"model": model_name, "stream": True},
+                stream=True,
+                timeout=(10, read_timeout),
             )
-            return response.status_code in (200, 201)
-        except Exception as e:
-            logger.exception("Failed to pull model %s: %s", model_name, e)
+            if response.status_code != 200:
+                logger.error(
+                    "Pull of '%s' failed: HTTP %s %s",
+                    model_name, response.status_code, (response.text or "")[:500],
+                )
+                return False
+            return self._consume_pull_stream(
+                model_name, response, progress, should_abort, progress_interval, clock
+            )
+        except requests.RequestException as e:
+            logger.error("Pull of '%s' failed: %s", model_name, e)
             return False
+        except KeyboardInterrupt:
+            logger.warning(
+                "Pull of '%s' interrupted; the partial download is kept and will resume next time",
+                model_name,
+            )
+            raise
+        finally:
+            if response is not None:
+                try:
+                    response.close()
+                except Exception:
+                    pass
+
+    def _consume_pull_stream(
+        self,
+        model_name: str,
+        response: Any,  # noqa: ANN401
+        progress: Optional[Callable[[str, int, int], None]],
+        should_abort: Optional[Callable[[], Optional[str]]],
+        interval: float,
+        clock: Callable[[], float],
+    ) -> bool:
+        """Read ``/api/pull`` NDJSON events until success, error or end of stream."""
+        totals: dict[str, int] = {}
+        completed: dict[str, int] = {}
+        last_status = ""
+        start = clock()
+        last_report = start
+        last_guard = start
+
+        def report(status: str) -> None:
+            done, total = sum(completed.values()), sum(totals.values())
+            if progress is not None:
+                progress(status, done, total)
+            elif total:
+                logger.info(
+                    "Pulling %s: %s / %s (%d%%) [%s]",
+                    model_name, format_gb(done), format_gb(total), int(100 * done / total), status,
+                )
+            else:
+                logger.info("Pulling %s: %s", model_name, status)
+
+        for raw in response.iter_lines():
+            if not raw:
+                continue
+            try:
+                event = json.loads(raw)
+            except ValueError:
+                logger.debug("Ignoring malformed pull event: %r", raw)
+                continue
+            if not isinstance(event, dict):
+                continue
+            if event.get("error"):
+                logger.error("Pull of '%s' failed: %s", model_name, event["error"])
+                return False
+            status = str(event.get("status", ""))
+            digest = event.get("digest")
+            if isinstance(digest, str) and digest:
+                if isinstance(event.get("total"), int):
+                    totals[digest] = event["total"]
+                if isinstance(event.get("completed"), int):
+                    completed[digest] = event["completed"]
+            if status == "success":
+                report(status)
+                return True
+
+            now = clock()
+            if status != last_status or now - last_report >= interval:
+                report(status)
+                last_status, last_report = status, now
+            if should_abort is not None and now - last_guard >= interval:
+                last_guard = now
+                reason = should_abort()
+                if reason:
+                    logger.error(
+                        "Aborting pull of '%s': %s (the partial download is kept)", model_name, reason
+                    )
+                    return False
+
+        logger.error("Pull of '%s' ended without a success status", model_name)
+        return False
 
     def list_models(self) -> list[str]:
-        """List all available models.
+        """List installed models (``GET /api/tags``).
 
         Returns:
             List of model names.
         """
-        try:
-            import requests
-
-            response = requests.get(
-                f"{self.base_url}/api/tags",
-                timeout=5,
-            )
-            if response.status_code == 200:
-                return [m["name"] for m in response.json().get("models", [])]
-        except Exception:
-            pass
-
-        return []
-
-    def get_resource_usage(self) -> dict[str, float]:
-        """Get resource usage.
-
-        Returns:
-            Dictionary with resource metrics.
-        """
-        return {"memory_mb": 0.0, "gpu_percent": 0.0, "cpu_percent": 0.0}
+        return [str(m["name"]) for m in self._tags() if m.get("name")]
 
     def load_model(self, model_name: str) -> bool:
-        """Pre-load a model into memory.
+        """Load a model now so the first image does not pay the cold start.
+
+        Sends ``POST /api/generate {model, keep_alive, stream: false}`` with no
+        prompt, which loads the model and returns immediately once resident.
 
         Args:
             model_name: Model to load.
 
         Returns:
-            True if model loaded successfully.
+            True if Ollama reported success.
         """
         try:
-            import requests
-
             response = requests.post(
                 f"{self.base_url}/api/generate",
-                json={
-                    "model": model_name,
-                    "prompt": "",
-                    "stream": False,
-                },
-                timeout=120,
+                json={"model": model_name, "keep_alive": self.keep_alive, "stream": False},
+                timeout=max(self.timeout, 300),
             )
-            return response.status_code in (200, 201)
-        except Exception:
+        except requests.RequestException as e:
+            logger.warning("Failed to pre-load model %s: %s", model_name, e)
             return False
+        if response.status_code != 200:
+            logger.warning(
+                "Failed to pre-load model %s: HTTP %s %s",
+                model_name, response.status_code, response.text[:200],
+            )
+            return False
+        return True
 
     def unload_model(self, model_name: str) -> bool:
-        """Unload a model from memory.
+        """Release a model from memory (``POST /api/generate`` with ``keep_alive: 0``).
 
         Args:
             model_name: Model to unload.
 
         Returns:
-            True if model unloaded successfully.
+            True if Ollama reported success.
         """
         try:
-            import requests
-
             response = requests.post(
-                f"{self.base_url}/api/gc",
-                json={"models": [model_name]},
-                timeout=10,
+                f"{self.base_url}/api/generate",
+                json={"model": model_name, "keep_alive": 0, "stream": False},
+                timeout=30,
             )
             return response.status_code == 200
-        except Exception:
+        except requests.RequestException:
             return False
 
     def get_client(self) -> Any:  # noqa: ANN401
-        """Get an API client.
+        """Return an OllamaClient using this server's URL, timeout and default model.
 
-        Returns:
-            OllamaClient configured for this server.
+        ``timeout`` (the request timeout, ``--request-timeout``) is used both
+        for metadata calls and as the read timeout of vision calls, which must
+        cover a cold model load; connecting gets a short 10s timeout.
         """
-        from lib.ollama_client import OllamaClient
+        from lib.ollama_client import DEFAULT_CONNECT_TIMEOUT, OllamaClient
 
         return OllamaClient(
             base_url=self.base_url,
             timeout=self.timeout,
             model=self.model,
+            generate_timeout=self.timeout,
+            connect_timeout=DEFAULT_CONNECT_TIMEOUT,
         )
 
 
 # ---------------------------------------------------------------------------
-# Model server manager (facade)
+# Manager facade
 # ---------------------------------------------------------------------------
 
+def _cfg_str(config: Any, name: str) -> Optional[str]:  # noqa: ANN401
+    """Return ``config.<name>`` if it is a non-empty string, else None (Mock-safe)."""
+    value = getattr(config, name, None)
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _cfg_num(config: Any, name: str) -> Optional[float]:  # noqa: ANN401
+    """Return ``config.<name>`` if it is a real number (not bool), else None (Mock-safe)."""
+    value = getattr(config, name, None)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value
+
+
+class _InstalledHints:
+    """Lazily computed "installed models" text for error messages.
+
+    Listing vision models may call ``/api/show`` per model, so it is done at
+    most once per :meth:`ModelServerManager.ensure_models` call, and only
+    when an error needs it.
+    """
+
+    def __init__(self, server: BaseModelServer, capability: Optional[str]):
+        self._server = server
+        self._capability = capability
+        self._names: Optional[list[str]] = None
+
+    def invalidate(self) -> None:
+        """Forget the cached list (after a pull changed what is installed)."""
+        self._names = None
+
+    def _list(self) -> list[str]:
+        if self._names is None:
+            try:
+                if self._capability == "vision":
+                    self._names = list(self._server.list_vision_models())
+                else:
+                    self._names = list(self._server.list_models())
+            except Exception as e:  # hints must never break the check itself
+                logger.debug("Could not list installed models: %s", e)
+                self._names = []
+        return self._names
+
+    @property
+    def _kind(self) -> str:
+        return f"{self._capability}-capable models" if self._capability else "models"
+
+    def installed_line(self) -> str:
+        """``Installed vision-capable models: a, b`` (or ``(none installed)``)."""
+        return f"Installed {self._kind}: {', '.join(self._list()) or '(none installed)'}"
+
+    def choose_line(self) -> str:
+        """``Or choose an installed vision-capable model with -m: a, b``."""
+        names = ", ".join(self._list()) or "(none installed)"
+        return f"Or choose an installed {self._kind[:-1]} with -m: {names}"
+
+
+def _size_line(estimate: PullEstimate, disk: Optional[DiskCheck], disk_error: Optional[str]) -> str:
+    """Describe the download size (and free space, when measured) for an error message."""
+    if not estimate.known:
+        free = f"; {format_gb(disk.free_bytes)} free on {disk.measured_path}" if disk else ""
+        return f"Download size unknown ({estimate.error}){free}."
+    download = format_gb(estimate.missing_bytes or 0)
+    if disk is not None:
+        return (
+            f"Download size: {download}; free space on {disk.measured_path}: "
+            f"{format_gb(disk.free_bytes)} (needs {format_gb(disk.required_bytes)} incl. "
+            f"{disk.margin_text} safety margin)."
+        )
+    if disk_error:
+        return f"Download size: {download} ({disk_error})."
+    return f"Download size: {download}."
+
+
 class ModelServerManager:
-    """Manages model serving lifecycle for the pipeline.
+    """Pipeline-facing facade over one model server backend.
 
-    High-level facade that wraps a concrete backend (MPLTX or Ollama)
-    and provides convenient methods for the pipeline stages:
-
-    1. Ensure the server is running (start if needed)
-    2. Ensure the required model is pulled and loaded
-    3. Provide an API client for requests
-    4. Track resource usage and model state
-    5. Clean shutdown on exit
-
-    Usage::
-
-        # Create manager with MPLTX backend (preferred)
-        manager = ModelServerManager(backend=ServerBackend.MPLTX)
-
-        # Ensure all required models are available
-        manager.ensure_models(["qwen3-vl:32b", "gpt-oss:120b", "qwen2-vl:7b"])
-
-        # Get a client (server is guaranteed running)
-        client = manager.get_client()
-        result = client.image_to_text(image_path, prompt)
-
-        # Check resource usage
-        state = manager.get_state()
-        print(f"Memory: {state.memory_usage_mb}MB")
-
-        # Clean shutdown
-        manager.close()
+    1. :meth:`ensure_running` adopts or starts the server.
+    2. :meth:`ensure_models` checks (and, only if allowed, pulls / warms) models.
+    3. :meth:`get_client` returns a cached API client.
+    4. :meth:`close` releases the client and stops the server only if owned.
 
     Attributes:
-        backend: The serving backend.
-        server: The concrete server implementation.
+        keep_running: Detach instead of stopping an owned server on close.
     """
 
     def __init__(
         self,
-        backend: ServerBackend = ServerBackend.MPLTX,
+        backend: ServerBackend | str = ServerBackend.OLLAMA,
         config: Any | None = None,  # noqa: ANN401
+        *,
+        keep_running: bool = False,
         **kwargs: Any,
     ):
-        """Initialize the model server manager.
+        """Initialize the manager (does not start anything).
 
         Args:
-            backend: Serving backend (MPLTX preferred, Ollama fallback).
-            config: Optional Config object for configuration.
-            **kwargs: Backend-specific initialization parameters.
+            backend: Serving backend (Ollama by default).
+            config: Optional Config object to read settings from.
+            keep_running: Leave an owned server running on close.
+            **kwargs: Backend constructor parameters (override config values).
         """
         self._backend = ServerBackend.parse(backend)
+        self.keep_running = keep_running
         self._server: BaseModelServer | None = None
-        self._initialized = False
+        self._client: Any = None
+        self._closed = False
 
         if config is not None:
             self._init_from_config(config, **kwargs)
@@ -1092,185 +1189,433 @@ class ModelServerManager:
             self._init_default(**kwargs)
 
     def _init_default(self, **kwargs: Any) -> None:
-        """Initialize with default settings."""
-        if self._backend == ServerBackend.MPLTX:
-            self._server = MpltxServer(**kwargs)
-        elif self._backend == ServerBackend.OLLAMA:
+        """Create the backend server from keyword arguments."""
+        if self._backend is ServerBackend.OLLAMA:
             self._server = OllamaServer(**kwargs)
-        else:
+        else:  # pragma: no cover - parse() guarantees a known backend
             raise ValueError(f"Unknown backend: {self._backend}")
 
     def _init_from_config(self, config: Any, **kwargs: Any) -> None:  # noqa: ANN401
-        """Initialize from a Config object."""
-        if self._backend == ServerBackend.MPLTX:
-            # Check for MPLTX-specific config
-            home_dir = getattr(config, "mpltx_home", None)
-            port = getattr(config, "mpltx_port", 11435)
-            model = getattr(config, "model", None)
-            gpu_layers = getattr(config, "mpltx_gpu_layers", -1)
-            context_size = getattr(config, "mpltx_context_size", 4096)
+        """Create the backend server from a Config object.
 
-            self._server = MpltxServer(
-                home_dir=home_dir,
-                port=port,
-                model=model,
-                gpu_layers=gpu_layers,
-                context_size=context_size,
-                **kwargs,
-            )
-        elif self._backend == ServerBackend.OLLAMA:
-            base_url = getattr(config, "ollama_url", "http://localhost:11434")
-            model = getattr(config, "model", None)
-            timeout = getattr(config, "timeout", 30)
+        Only real strings/numbers on ``config`` are used, so a partially
+        populated or mocked config falls back to defaults.
+        """
+        timeout = _cfg_num(config, "timeout")
+        params: dict[str, Any] = {
+            "base_url": _cfg_str(config, "ollama_url") or DEFAULT_OLLAMA_URL,
+            "model": _cfg_str(config, "model"),
+            "timeout": timeout if timeout else DEFAULT_REQUEST_TIMEOUT,
+        }
+        params.update(kwargs)
+        self._init_default(**params)
 
-            self._server = OllamaServer(
-                base_url=base_url,
-                timeout=timeout,
-                model=model,
-                **kwargs,
-            )
-        else:
-            raise ValueError(f"Unknown backend: {self._backend}")
+    # -- accessors ---------------------------------------------------------
 
     @property
     def server(self) -> BaseModelServer:
-        """Get the underlying server implementation.
-
-        Returns:
-            The concrete server (MpltxServer or OllamaServer).
-        """
+        """The concrete server (an OllamaServer)."""
         if self._server is None:
             raise RuntimeError("ModelServerManager not initialized")
         return self._server
 
     @property
-    def state(self) -> ServerState:
-        """Get current server state.
+    def backend(self) -> ServerBackend:
+        """The selected backend."""
+        return self._backend
 
-        Returns:
-            ServerState with current status.
-        """
+    @property
+    def state(self) -> ServerState:
+        """Current server state (never starts anything)."""
         return self.server.get_state()
 
-    def ensure_running(self) -> bool:
-        """Ensure the server is running.
-
-        Starts the server if not already running.
-
-        Returns:
-            True if server is running, False otherwise.
-        """
-        if not self.server.is_running:
-            return self.server.start()
-        return self.server.health_check()
-
-    def ensure_model(self, model_name: str) -> bool:
-        """Ensure a model is available and loaded.
-
-        Checks if the model is available, pulls it if not,
-        and loads it into memory.
-
-        Args:
-            model_name: Model name to ensure.
-
-        Returns:
-            True if model is available and loaded, False otherwise.
-        """
-        if not self.ensure_running():
-            return False
-
-        if not self.server.is_model_available(model_name):
-            logger.info("Model '%s' not found, pulling...", model_name)
-            if not self.server.pull_model(model_name):
-                logger.error("Failed to pull model '%s'", model_name)
-                return False
-            logger.info("Model '%s' pulled successfully", model_name)
-
-        # Warm-load the model
-        if not self.server.load_model(model_name):
-            logger.warning("Failed to pre-load model '%s', will load on first request", model_name)
-
-        return True
-
-    def ensure_models(self, model_names: list[str]) -> bool:
-        """Ensure multiple models are available and loaded.
-
-        Args:
-            model_names: List of model names to ensure.
-
-        Returns:
-            True if all models are available, False otherwise.
-        """
-        all_ok = True
-        for name in model_names:
-            if not self.ensure_model(name):
-                all_ok = False
-                logger.warning("Model '%s' is not available", name)
-
-        return all_ok
-
-    def get_client(self) -> Any:  # noqa: ANN401
-        """Get an API client for making requests.
-
-        Ensures the server is running before returning the client.
-
-        Returns:
-            API client instance.
-
-        Raises:
-            RuntimeError: If server is not running.
-        """
-        if not self.ensure_running():
-            raise RuntimeError(
-                "Model server is not running. "
-                "Start the server with manager.ensure_running() or "
-                "ensure a model is loaded with manager.ensure_model()."
-            )
-        return self.server.get_client()
+    @property
+    def last_error(self) -> Optional[str]:
+        """The server's last lifecycle error, if any."""
+        return self.server.last_error
 
     def get_state(self) -> ServerState:
-        """Get current server state.
-
-        Returns:
-            ServerState with current status.
-        """
+        """Return the current server state."""
         return self.state
 
-    def get_resource_usage(self) -> dict[str, float]:
-        """Get current resource usage.
+    def probe(self) -> ServerState:
+        """Return the server state without starting anything. Never raises."""
+        try:
+            return self.server.get_state()
+        except Exception as e:
+            return ServerState(
+                backend=self._backend,
+                base_url=getattr(self._server, "base_url", ""),
+                error_message=str(e),
+            )
 
-        Returns:
-            Dictionary with resource metrics.
-        """
+    def get_resource_usage(self) -> dict[str, float]:
+        """Return current resource usage."""
         return self.server.get_resource_usage()
 
     def list_models(self) -> list[str]:
-        """List all available models.
-
-        Returns:
-            List of model names.
-        """
+        """List models available on the server without downloading."""
         return self.server.list_models()
 
-    def close(self) -> None:
-        """Clean shutdown: stop the server and release resources.
+    # -- lifecycle ---------------------------------------------------------
 
-        Calls the backend's stop() method if auto-start was used.
+    def ensure_running(self) -> bool:
+        """Adopt or start the server. Idempotent; never raises.
+
+        Returns:
+            True if the server is ready; otherwise False with :attr:`last_error` set.
         """
+        server = self.server
+        try:
+            ok = server.start()
+        except Exception as e:
+            logger.debug("Unexpected error starting the model server", exc_info=True)
+            server.last_error = f"Unexpected error starting {self._backend.value}: {e}"
+            ok = False
+        if ok:
+            self._closed = False
+        else:
+            logger.debug(
+                "%s model server unavailable: %s", self._backend.value, server.last_error
+            )
+        return ok
+
+    def require_running(self) -> None:
+        """Ensure the server is running or raise.
+
+        Raises:
+            ModelServerError: If the server cannot be reached or started.
+        """
+        if not self.ensure_running():
+            raise ModelServerError(
+                f"{self._backend.value} model server is not running",
+                details=self.last_error or "",
+            )
+
+    def ensure_model(
+        self,
+        model_name: str,
+        *,
+        allow_pull: bool = False,
+        dry_run: bool = False,
+        warm: bool = False,
+        capability: Optional[str] = None,
+        min_free_bytes: Optional[int] = None,
+    ) -> bool:
+        """Make sure a model can be served, without implicit downloads.
+
+        1. The server must be reachable: in a dry run it is only probed
+           (never started); otherwise :meth:`ensure_running` adopts or
+           starts it.
+        2. An installed model must have ``capability`` (if given).
+        3. A missing model is downloaded only with ``allow_pull=True``, and
+           only if its size is known and fits on the model store with a
+           safety margin (``download + max(min_free_bytes, 10%)``). A pull
+           into a remote server's store, whose disk cannot be measured, is
+           allowed with a warning. While pulling, the download is aborted if
+           free space falls below ``min_free_bytes``.
+
+        Every failure is logged as an ERROR that names the installed
+        vision-capable models and the exact manual pull command.
+
+        Args:
+            model_name: Model to check.
+            allow_pull: Download the model if it is missing. With False
+                (the default) nothing is ever downloaded.
+            dry_run: Only check: never start the server, pull or load. The
+                server must already be healthy. Returns what a real run with
+                the same arguments would do.
+            warm: Load the model into memory now (ignored in dry-run). A
+                failed warm-up is only a warning.
+            capability: Required capability (e.g. ``'vision'``); None skips
+                the check.
+            min_free_bytes: Free space to keep on the model store after a
+                pull (None means :data:`DEFAULT_MIN_FREE_BYTES`).
+
+        Returns:
+            True if the model is (or, in a dry run with ``allow_pull``, could
+            be) available.
+        """
+        if not self._ensure_reachable(dry_run):
+            return False
+        return self._ensure_one(
+            model_name,
+            allow_pull=allow_pull,
+            dry_run=dry_run,
+            warm=warm,
+            capability=capability,
+            min_free_bytes=DEFAULT_MIN_FREE_BYTES if min_free_bytes is None else int(min_free_bytes),
+            hints=_InstalledHints(self.server, capability),
+        )
+
+    def ensure_models(
+        self,
+        model_names: Iterable[str],
+        *,
+        allow_pull: bool = False,
+        dry_run: bool = False,
+        warm: bool = False,
+        capability: Optional[str] = None,
+        min_free_bytes: Optional[int] = None,
+    ) -> bool:
+        """Apply :meth:`ensure_model` to each distinct name (no short-circuit).
+
+        The server is checked once; every model is then checked so all
+        problems are reported in one run.
+
+        Args:
+            model_names: Models to check; names that normalize to the same
+                model are checked once, and an empty list succeeds without
+                contacting the server.
+            allow_pull: See :meth:`ensure_model`.
+            dry_run: See :meth:`ensure_model`.
+            warm: See :meth:`ensure_model`.
+            capability: See :meth:`ensure_model`.
+            min_free_bytes: See :meth:`ensure_model`.
+
+        Returns:
+            True if every model is available.
+        """
+        names: list[str] = []
+        seen: set[str] = set()
+        for name in model_names:
+            key = normalize_model_name(name)
+            if key not in seen:
+                seen.add(key)
+                names.append(name)
+        if not names:
+            return True
+        if not self._ensure_reachable(dry_run):
+            return False
+        hints = _InstalledHints(self.server, capability)
+        floor = DEFAULT_MIN_FREE_BYTES if min_free_bytes is None else int(min_free_bytes)
+        results = [
+            self._ensure_one(
+                name,
+                allow_pull=allow_pull,
+                dry_run=dry_run,
+                warm=warm,
+                capability=capability,
+                min_free_bytes=floor,
+                hints=hints,
+            )
+            for name in names
+        ]
+        return all(results)
+
+    def _ensure_reachable(self, dry_run: bool) -> bool:
+        """Probe (dry run) or adopt/start (real run) the server."""
+        if dry_run:
+            if not self.server.health_check():
+                logger.error(
+                    "Dry run: the %s server at %s is not running",
+                    self._backend.value, self.server.base_url,
+                )
+                return False
+            return True
+        return self.ensure_running()
+
+    def _ensure_one(
+        self,
+        name: str,
+        *,
+        allow_pull: bool,
+        dry_run: bool,
+        warm: bool,
+        capability: Optional[str],
+        min_free_bytes: int,
+        hints: _InstalledHints,
+    ) -> bool:
+        """Check (and, if allowed, pull / warm) one model; see :meth:`ensure_model`."""
+        server = self.server
+        prefix = "Dry run: " if dry_run else ""
+
+        if server.is_model_available(name):
+            if not self._check_capability(name, capability, hints):
+                return False
+            if warm and not dry_run:
+                self._warm(name)
+            logger.info("%sModel '%s' is installed", prefix, name)
+            return True
+        if getattr(server, "model_listing_failed", False) is True:
+            # The server stopped answering after the reachability check: do
+            # not claim the model is missing or suggest downloading it.
+            logger.error(
+                "%sCould not list the models installed on the %s server at %s "
+                "(is it still running?); cannot check '%s'.",
+                prefix, self._backend.value, server.base_url, name,
+            )
+            return False
+
+        what = f"{capability.capitalize()} model" if capability else "Model"
+        cmd = server.manual_pull_command(name)
+        estimate = server.estimate_pull(name)
+        if estimate.not_found:
+            logger.error(
+                "Model '%s' was not found in the registry (%s returned 404). "
+                "Check the name and tag at https://ollama.com/library.\n"
+                "  %s",
+                name, estimate.source or "the registry", hints.installed_line(),
+            )
+            return False
+
+        store = server.model_store_path()
+        disk: Optional[DiskCheck] = None
+        disk_error: Optional[str] = None
+        if store is not None:
+            # With an unknown size this only reports free space (the pull is
+            # refused below before ``disk.ok`` would matter).
+            try:
+                disk = check_disk(store, estimate.missing_bytes or 0, min_free_bytes=min_free_bytes)
+            except OSError as e:
+                disk_error = f"cannot measure free space on {store}: {e}"
+
+        if not allow_pull:
+            logger.error(
+                "%s '%s' is not installed on the %s server at %s.\n"
+                "  %s\n"
+                "  To download it, re-run with --pull, or run: %s\n"
+                "  %s",
+                what, name, self._backend.value, server.base_url,
+                _size_line(estimate, disk, disk_error), cmd, hints.choose_line(),
+            )
+            return False
+
+        if not estimate.known:
+            free_note = f" ({format_gb(disk.free_bytes)} free on {disk.measured_path})" if disk else ""
+            logger.error(
+                "Could not determine the download size of '%s' (%s); refusing to pull "
+                "automatically%s.\n"
+                "  If you are sure it fits, pull it manually: %s\n"
+                "  %s",
+                name, estimate.error, free_note, cmd, hints.choose_line(),
+            )
+            return False
+
+        download = estimate.missing_bytes or 0
+        if store is None:
+            logger.warning(
+                "Cannot verify free disk space on remote server %s; pulling '%s' needs about %s there.",
+                server.base_url, name, format_gb(download),
+            )
+        elif disk is None:
+            logger.error(
+                "Refusing to pull '%s' (%s download): %s.\n"
+                "  If you are sure it fits, pull it manually: %s\n"
+                "  %s",
+                name, format_gb(download), disk_error, cmd, hints.choose_line(),
+            )
+            return False
+        elif not disk.ok:
+            logger.error(
+                "Not enough disk space to pull '%s': need %s (%s download + %s safety margin), "
+                "%s free on %s.\n"
+                "  Free up at least %s, lower the margin with --min-free-gb, or pull it "
+                "manually when there is room: %s\n"
+                "  %s",
+                name, format_gb(disk.required_bytes), format_gb(download),
+                disk.margin_text, format_gb(disk.free_bytes), disk.measured_path,
+                format_gb(disk.shortfall_bytes), cmd, hints.choose_line(),
+            )
+            return False
+
+        if dry_run:
+            where = (
+                f"{format_gb(disk.free_bytes)} free on {disk.measured_path}"
+                if disk is not None else f"free space on {server.base_url} not verifiable"
+            )
+            logger.info("Dry run: would pull '%s' (%s download; %s)", name, format_gb(download), where)
+            return True
+
+        logger.info("Pulling '%s' (%s download, --pull)...", name, format_gb(download))
+        guard = make_disk_guard(store, min_free_bytes) if store is not None else None
+        if not server.pull_model(name, should_abort=guard):
+            logger.error("Failed to pull model '%s'. You can retry, or run: %s", name, cmd)
+            return False
+        if not server.is_model_available(name):
+            logger.error(
+                "Pull of '%s' reported success but the model is not listed by the server", name
+            )
+            return False
+        logger.info("Model '%s' pulled successfully", name)
+        hints.invalidate()
+        if not self._check_capability(name, capability, hints):
+            return False
+        if warm:
+            self._warm(name)
+        return True
+
+    def _check_capability(
+        self, name: str, capability: Optional[str], hints: _InstalledHints
+    ) -> bool:
+        """Return False (with an error) if an installed model lacks ``capability``."""
+        if not capability:
+            return True
+        caps = self.server.get_capabilities(name)
+        if caps is None:
+            logger.warning(
+                "Could not determine the capabilities of '%s'; assuming it supports %s input",
+                name, capability,
+            )
+            return True
+        if capability.lower() in caps:
+            return True
+        logger.error(
+            "Model '%s' is installed but does not support %s input (capabilities: %s).\n"
+            "  %s",
+            name, capability, ", ".join(sorted(caps)) or "none reported", hints.choose_line(),
+        )
+        return False
+
+    def _warm(self, name: str) -> None:
+        """Load a model now; a failure is only a warning."""
+        if not self.server.load_model(name):
+            logger.warning(
+                "Failed to pre-load model '%s'; it will load on the first request", name
+            )
+
+    def get_client(self) -> Any:  # noqa: ANN401
+        """Return the (cached) API client, starting the server if needed.
+
+        Raises:
+            ModelServerError: If the server is not running and cannot be started.
+        """
+        if self._client is None:
+            self.require_running()
+            self._client = self.server.get_client()
+        return self._client
+
+    def close(self) -> None:
+        """Release the client and stop the server if this program owns it.
+
+        With ``keep_running`` an owned server is detached instead. External
+        servers are never stopped. Idempotent; never raises.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        client, self._client = self._client, None
+        if client is not None and hasattr(client, "close"):
+            try:
+                client.close()
+            except Exception as e:
+                logger.warning("Error closing model client: %s", e)
         if self._server is not None:
             try:
-                self.server.stop()
+                if self.keep_running:
+                    self._server.detach()
+                else:
+                    self._server.stop()
             except Exception as e:
-                logger.warning("Error during server shutdown: %s", e)
-        self._initialized = False
+                logger.warning("Error during model server shutdown: %s", e)
 
-    def __enter__(self) -> "ModelServerManager":
-        """Context manager entry: ensure server is running."""
-        self.ensure_running()
+    def __enter__(self) -> ModelServerManager:
+        """Context manager entry: require a running server."""
+        self.require_running()
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:  # noqa: ANN401
-        """Context manager exit: clean shutdown."""
+        """Context manager exit: :meth:`close`."""
         self.close()
 
 
@@ -1279,10 +1624,10 @@ class ModelServerManager:
 # ---------------------------------------------------------------------------
 
 def create_server_manager(
-    backend: ServerBackend = ServerBackend.MPLTX,
+    backend: ServerBackend | str = ServerBackend.OLLAMA,
     **kwargs: Any,
 ) -> ModelServerManager:
-    """Create a ModelServerManager with default settings.
+    """Create a ModelServerManager (Ollama by default).
 
     Args:
         backend: Serving backend.
@@ -1296,10 +1641,10 @@ def create_server_manager(
 
 def create_server_manager_from_config(
     config: Any,  # noqa: ANN401
-    backend: ServerBackend = ServerBackend.MPLTX,
+    backend: ServerBackend | str = ServerBackend.OLLAMA,
     **kwargs: Any,
 ) -> ModelServerManager:
-    """Create a ModelServerManager from a Config object.
+    """Create a ModelServerManager from a Config object (Ollama by default).
 
     Args:
         config: Config object.

@@ -5,15 +5,20 @@ fallback chains, tracks usage, and provides runtime model resolution.
 
 Pipeline stages and their recommended models (from research.md):
 
-    Stage                          | Primary Model       | Fallback
-    --------------------------------|---------------------|------------------
-    1. OCR / Text Extraction        | Tesseract-OCR       | qwen2-vl:7b
-    2. Vision Model Analysis        | qwen3-vl:32b        | qwen2-vl:7b
-    3. Image Grouping (Similarity)  | ORB (OpenCV)        | filename heuristics
-    4. Quantity Detection            | Hash-based          | Visual analysis
-    5. Metadata Generation (Text)   | gpt-oss:120b        | qwen3-vl:32b
-    6. Web Research (Vendor Cache)  | DuckDuckGo API      | Skip (non-blocking)
-    7. Error Classification          | Rule-based          | N/A
+    Stage                          | Primary Model          | Fallback
+    --------------------------------|------------------------|------------------
+    1. OCR / Text Extraction        | Tesseract-OCR          | qwen2-vl:7b
+    2. Vision Model Analysis        | DEFAULT_VISION_MODEL   | qwen2-vl:7b
+    3. Image Grouping (Similarity)  | ORB (OpenCV)           | filename heuristics
+    4. Quantity Detection            | Hash-based             | Visual analysis
+    5. Metadata Generation (Text)   | gpt-oss:120b           | qwen3-vl:32b
+    6. Web Research (Vendor Cache)  | DuckDuckGo API         | Skip (non-blocking)
+    7. Error Classification          | Rule-based             | N/A
+
+Only the vision-analysis primary model is called by the pipeline
+(:data:`IMPLEMENTED_MODEL_STAGES`); there is no automatic fallback, so the
+fallback entries and the other stages' models are descriptive only and are
+reported as "not used" by :meth:`ModelSelector.print_stage_report`.
 
 Usage::
 
@@ -35,10 +40,13 @@ Usage::
 """
 
 import logging
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
 from typing import Any, Callable, Optional
+
+from lib.config import DEFAULT_VISION_MODEL
 
 logger = logging.getLogger(__name__)
 
@@ -288,11 +296,11 @@ _DEFAULT_MODELS: dict[ModelStage, list[ModelSpec]] = {
     ],
     ModelStage.VISION_ANALYSIS: [
         ModelSpec(
-            name="qwen3-vl:32b",
+            name=DEFAULT_VISION_MODEL,
             stage=ModelStage.VISION_ANALYSIS,
             role="primary",
             priority=0,
-            description="Qwen3-VL 32B primary vision model for metadata extraction",
+            description="Ollama vision model for label metadata extraction",
         ),
         ModelSpec(
             name="qwen2-vl:7b",
@@ -380,6 +388,12 @@ _DEFAULT_MODELS: dict[ModelStage, list[ModelSpec]] = {
 }
 
 
+#: Stages whose models the pipeline actually calls. Pre-flight requires (and
+#: may pull) only these stages' primary models; add a stage here only once
+#: code really invokes its model.
+IMPLEMENTED_MODEL_STAGES: frozenset[ModelStage] = frozenset({ModelStage.VISION_ANALYSIS})
+
+
 # ---------------------------------------------------------------------------
 # Model selector
 # ---------------------------------------------------------------------------
@@ -399,7 +413,7 @@ class ModelSelector:
     def __init__(
         self,
         models: dict[ModelStage, list[ModelSpec]] | None = None,
-        default_model: str = "qwen3-vl:32b",
+        default_model: str = DEFAULT_VISION_MODEL,
         allow_fallback: bool = True,
         log_usage: bool = True,
     ):
@@ -422,26 +436,46 @@ class ModelSelector:
     def from_config(cls, config: Any) -> "ModelSelector":  # noqa: ANN401
         """Create a ModelSelector from a Config object.
 
+        ``config.model`` (the CLI ``--model``) becomes the primary model of
+        the vision-analysis stage and the selector's default model. A
+        per-stage ``config.<stage>_model`` attribute (e.g.
+        ``vision_analysis_model``) overrides that stage's primary model only;
+        fallback chains are kept. Only non-empty strings count, so unset or
+        mocked attributes leave the defaults in place.
+
         Args:
             config: Config object with 'model' and optional per-stage overrides.
 
         Returns:
             Configured ModelSelector instance.
         """
-        default_model = getattr(config, "model", "qwen3-vl:32b")
 
-        # Check for per-stage model overrides in config (future extension)
+        def _str_attr(name: str) -> Optional[str]:
+            value = getattr(config, name, None)
+            return value.strip() if isinstance(value, str) and value.strip() else None
+
+        global_model = _str_attr("model")
+        default_model = global_model or DEFAULT_VISION_MODEL
+
         custom_models: dict[ModelStage, list[ModelSpec]] = {}
         for stage, specs in _DEFAULT_MODELS.items():
+            override = _str_attr(f"{stage.name.lower()}_model")
+            if override is None and stage is ModelStage.VISION_ANALYSIS:
+                override = global_model
             custom_models[stage] = [
                 ModelSpec(
-                    name=getattr(config, f"{stage.name.lower()}_model", spec.name),
+                    name=override if (override and spec.role == "primary") else spec.name,
                     stage=stage,
                     role=spec.role,
                     priority=spec.priority,
                     max_tokens=spec.max_tokens,
                     temperature=spec.temperature,
-                    description=spec.description,
+                    # A replaced model must not keep the old model's wording.
+                    description=(
+                        f"{override} ({stage.name.lower().replace('_', ' ')} override)"
+                        if (override and spec.role == "primary" and override != spec.name)
+                        else spec.description
+                    ),
                 )
                 for spec in specs
             ]
@@ -467,6 +501,30 @@ class ModelSelector:
         if not specs:
             return self.default_model
         return specs[0].name
+
+    def required_models(
+        self, stages: Iterable[ModelStage] = IMPLEMENTED_MODEL_STAGES
+    ) -> list[str]:
+        """Models that must be installed before the pipeline runs.
+
+        Only the primary model of each given stage counts; fallbacks are
+        never required (or pulled). Names are deduplicated, keeping the
+        order of ``ModelStage``.
+
+        Args:
+            stages: Stages to include (default: the implemented ones).
+
+        Returns:
+            Primary model names, e.g. ``['qwen3.6:35b-a3b']``.
+        """
+        wanted = set(stages)
+        names: list[str] = []
+        for stage in ModelStage:
+            if stage in wanted:
+                name = self.get_model(stage)
+                if name not in names:
+                    names.append(name)
+        return names
 
     def get_fallback_chain(self, stage: ModelStage) -> list[str]:
         """Get all models for a stage in priority order (primary + fallbacks).
@@ -555,25 +613,29 @@ class ModelSelector:
         return model_name == self.default_model
 
     def print_stage_report(self) -> None:
-        """Print a human-readable report of all stage configurations.
+        """Log the model configuration of every stage.
 
-        Logs the primary model, fallback chain, and description for each stage.
+        Only stages in :data:`IMPLEMENTED_MODEL_STAGES` call a model; the
+        others are marked "not used". Fallbacks are listed as unused because
+        the pipeline never switches models automatically.
         """
         logger.info("=" * 70)
         logger.info("MODEL SELECTOR STAGE REPORT")
         logger.info("=" * 70)
         for stage, specs in self.models.items():
             primary = specs[0].name if specs else "N/A"
+            used = stage in IMPLEMENTED_MODEL_STAGES
             fallbacks = ", ".join(spec.name for spec in specs[1:])
             logger.info(
-                "  %s\n    Primary: %s\n    Fallbacks: %s\n    %s",
+                "  %s%s\n    Primary: %s\n    Fallbacks: %s\n    %s",
                 stage.name,
+                "" if used else " (not used by the pipeline)",
                 primary,
-                fallbacks if fallbacks else "(none)",
+                f"{fallbacks} (not used: no automatic fallback)" if fallbacks else "(none)",
                 specs[0].description if specs else "No models registered",
             )
         logger.info("-" * 70)
-        logger.info("Default fallback model: %s", self.default_model)
+        logger.info("Vision model: %s", self.get_model(ModelStage.VISION_ANALYSIS))
         logger.info("=" * 70)
 
 

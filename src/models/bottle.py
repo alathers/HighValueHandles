@@ -1,13 +1,76 @@
 """Bottle and metadata models for bourbon inventory."""
 
+import dataclasses
 import json
+import re
 from dataclasses import dataclass, field
-from datetime import datetime
-from decimal import Decimal
+from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from .image import Image
+
+_MONEY_PATTERN = re.compile(r"-?\d+(?:\.\d+)?")
+_CENTS = Decimal("0.01")
+
+
+def parse_money(value: Any) -> Optional[Decimal]:
+    """Parse a price as produced by OCR or a vision model.
+
+    Accepts numbers and strings such as ``'59.99'``, ``'$1,299.00'`` or
+    ``'MSRP $45'``; the first number in a string is used.
+
+    Args:
+        value: int, float, Decimal or str (anything else is str()'d).
+
+    Returns:
+        The amount quantized to cents, or None for None, booleans, text
+        without a number and negative amounts.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        if isinstance(value, (int, float, Decimal)):
+            amount = Decimal(str(value))
+        else:
+            match = _MONEY_PATTERN.search(str(value).replace(",", ""))
+            if not match:
+                return None
+            amount = Decimal(match.group(0))
+        if not amount.is_finite() or amount < 0:
+            return None
+        return amount.quantize(_CENTS)
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def format_money(amount: Optional[Decimal]) -> str:
+    """'$12.34', or 'Unknown' for a price that was not visible."""
+    return "Unknown" if amount is None else f"${amount:.2f}"
+
+
+def utc_now() -> datetime:
+    """Current time as a timezone-aware UTC datetime (isoformat has '+00:00')."""
+    return datetime.now(UTC)
+
+
+def parse_timestamp(value: Any) -> datetime:
+    """Parse an ISO timestamp written by any version of this tool.
+
+    Older files hold naive UTC values; they are read as UTC so every loaded
+    timestamp is timezone-aware.
+    """
+    parsed = value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
+    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed
+
+
+def _clean_str(value: Any) -> Optional[str]:
+    """Return ``str(value).strip()``, or None for None or blank text."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 @dataclass
@@ -20,12 +83,20 @@ class ExtractedMetadata:
         msrp: MSRP price extracted.
         specific_release: Specific release information.
         proof: Proof statement.
+        abv: Alcohol by volume as printed, e.g. '55.2%'.
         age: Age statement.
         batch_number: Batch/statement number.
         tasting_notes: Tasting notes extracted.
         full_text: Concatenated OCR text from all bottle images.
         selected_text: Text selected for LLM analysis.
         source_images: List of image paths used for extraction.
+        vision_model: Vision model that produced the field values.
+        vision_confidence: Model-reported confidence ('high'/'medium'/'low').
+        warnings: Non-fatal problems found during extraction (e.g. the photos
+            appear to show different products).
+        same_bottle: The vision model's verdict on whether all photos sent
+            together show one product (False = mixed); None when unknown or
+            when only one photo was sent.
     """
 
     name: Optional[str] = None
@@ -37,8 +108,14 @@ class ExtractedMetadata:
     batch_number: Optional[str] = None
     tasting_notes: Optional[str] = None
     full_text: str = ""
+    # Declared after the original fields so positional construction keeps working.
+    abv: Optional[str] = None
     selected_text: str = ""
     source_images: List[Path] = field(default_factory=list)
+    vision_model: Optional[str] = None
+    vision_confidence: Optional[str] = None
+    warnings: List[str] = field(default_factory=list)
+    same_bottle: Optional[bool] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization.
@@ -52,17 +129,25 @@ class ExtractedMetadata:
             "msrp": self.msrp,
             "specific_release": self.specific_release,
             "proof": self.proof,
+            "abv": self.abv,
             "age": self.age,
             "batch_number": self.batch_number,
             "tasting_notes": self.tasting_notes,
             "full_text": self.full_text,
             "selected_text": self.selected_text,
             "source_images": [str(p) for p in self.source_images],
+            "vision_model": self.vision_model,
+            "vision_confidence": self.vision_confidence,
+            "warnings": list(self.warnings),
+            "same_bottle": self.same_bottle,
         }
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ExtractedMetadata":
         """Create ExtractedMetadata from dictionary.
+
+        Keys added later (abv, vision_model, vision_confidence, warnings,
+        same_bottle) are optional, so metadata saved by older versions still loads.
 
         Args:
             data: Dictionary representation of metadata.
@@ -76,12 +161,17 @@ class ExtractedMetadata:
             msrp=data.get("msrp"),
             specific_release=data.get("specific_release"),
             proof=data.get("proof"),
+            abv=data.get("abv"),
             age=data.get("age"),
             batch_number=data.get("batch_number"),
             tasting_notes=data.get("tasting_notes"),
             full_text=data.get("full_text", ""),
             selected_text=data.get("selected_text", ""),
             source_images=[Path(p) for p in data.get("source_images", [])],
+            vision_model=data.get("vision_model"),
+            vision_confidence=data.get("vision_confidence"),
+            warnings=list(data.get("warnings") or []),
+            same_bottle=data.get("same_bottle"),
         )
 
 
@@ -124,16 +214,17 @@ class Quantity:
 
     Scenarios:
     - Single bottle crawled image: quantity=1, price=msrp, source="extracted"
+    - Price not visible on the label: price=None (unknown, not $0)
     - User purchased case: quantity=12, price=0, source="manual"
 
     Attributes:
         count: Number of bottles.
-        price: Price per bottle (Decimal for precision).
+        price: Price per bottle (Decimal for precision), or None if unknown.
         source: Source ("extracted" or "manual").
     """
 
     count: int = 1
-    price: Decimal = Decimal("0.00")
+    price: Optional[Decimal] = Decimal("0.00")
     source: str = "extracted"
 
     def to_dict(self) -> Dict[str, Any]:
@@ -144,7 +235,7 @@ class Quantity:
         """
         return {
             "count": self.count,
-            "price": str(self.price),
+            "price": str(self.price) if self.price is not None else None,
             "source": self.source,
         }
 
@@ -158,9 +249,10 @@ class Quantity:
         Returns:
             Quantity instance.
         """
+        price = data.get("price", "0.00")
         return cls(
             count=data.get("count", 1),
-            price=Decimal(data.get("price", "0.00")),
+            price=Decimal(str(price)) if price not in (None, "") else None,
             source=data.get("source", "extracted"),
         )
 
@@ -172,25 +264,25 @@ class Bottle:
     Core fields (required):
     - name: Bottle name from user/naming tool.
     - distillery: Distillery name.
-    - msrp: Recommended MSRP price.
+    - msrp: Recommended MSRP price; None when no price is visible (unknown).
     - specific_release: Specific release information/style.
 
     Optional fields:
     - proof: Proof statement.
-    -年份: Age statement.
+    - age: Age statement.
     - tasting_notes: Tasting notes from review/vendor.
 
     Derived fields:
     - quantity: Quantity and valuation info (extracted or manual).
     - ohr: Estimated cost history value (decaying over time).
-    - total_value: quantity * price (if price != 0, else ohr).
+    - total_value: quantity * price (if price > 0, else ohr); None if unknown.
     - metadata: OCR-extracted text from images.
 
     Attributes:
         name: Bottle name (required).
         distillery: Distillery name (required).
         specific_release: Specific release info/style (required).
-        msrp: Recommended MSRP price (required).
+        msrp: Recommended MSRP price (required argument; None = unknown).
         proof: Proof statement.
         age: Age statement (e.g., "9 years").
         tasting_notes: Tasting notes.
@@ -199,13 +291,14 @@ class Bottle:
         ohr: Estimated cost history value (decays over time).
         reference_links: List of vendor links (optional, non-blocking).
         corrections: List of user corrections.
-        extracted_at: Timestamp of data extraction.
+        extracted_at: Timestamp of data extraction (timezone-aware UTC).
+        abv: Alcohol by volume as printed, e.g. '55.2%'.
     """
 
     name: str
     distillery: str
     specific_release: str
-    msrp: Decimal
+    msrp: Optional[Decimal]
     proof: Optional[str] = None
     age: Optional[str] = None
     tasting_notes: Optional[str] = None
@@ -214,14 +307,86 @@ class Bottle:
     ohr: Optional[Decimal] = None
     reference_links: List[ReferenceLink] = field(default_factory=list)
     corrections: List["Correction"] = field(default_factory=list)
-    extracted_at: datetime = field(default_factory=datetime.utcnow)
+    extracted_at: datetime = field(default_factory=utc_now)
+    abv: Optional[str] = None
+
+    @classmethod
+    def from_analysis(
+        cls,
+        bottle_dict: Dict[str, Any],
+        metadata: Optional[ExtractedMetadata] = None,
+        quantity: Union[int, "Quantity", None] = None,
+        corrections: Optional[List[Union["Correction", Dict[str, Any]]]] = None,
+    ) -> "Bottle":
+        """Build a Bottle from analyzer output.
+
+        This is the one supported way to turn a ``bottle_dict`` (from
+        ``BottleAnalyzer.process_single_bottle`` or a batch JSON) into a
+        Bottle. It parses the MSRP, prices the quantity at the MSRP, always
+        attaches metadata and lists every source image of the bottle.
+
+        Args:
+            bottle_dict: Bottle fields: name, distillery, specific_release,
+                msrp (any '$1,299.00' style, number or None; unparseable or
+                missing means unknown), proof, abv, age, tasting_notes,
+                batch_number, images (all photo paths, primary first) and
+                quantity.
+            metadata: Extracted metadata; copied, never modified.
+            quantity: Bottle count or a ready Quantity (used as-is). Default:
+                ``bottle_dict['quantity']``, else 1.
+            corrections: Corrections as Correction objects or dicts.
+
+        Returns:
+            Bottle with ``metadata.source_images`` = metadata's images followed
+            by any other ``bottle_dict['images']`` (order kept, no duplicates).
+        """
+        msrp = parse_money(bottle_dict.get("msrp"))  # None = unknown, never $0
+
+        if isinstance(quantity, Quantity):
+            bottle_quantity = quantity
+        else:
+            raw_count = quantity if quantity is not None else bottle_dict.get("quantity", 1)
+            try:
+                count = max(1, int(raw_count))
+            except (TypeError, ValueError):
+                count = 1
+            bottle_quantity = Quantity(count=count, price=msrp, source="extracted")
+
+        bottle_metadata = dataclasses.replace(metadata) if metadata is not None else ExtractedMetadata()
+        seen: set = set()
+        source_images: List[Path] = []
+        for image_path in [*bottle_metadata.source_images, *(bottle_dict.get("images") or [])]:
+            if str(image_path) not in seen:
+                seen.add(str(image_path))
+                source_images.append(Path(image_path))
+        bottle_metadata.source_images = source_images
+        bottle_metadata.warnings = list(bottle_metadata.warnings)
+        if not bottle_metadata.batch_number:
+            bottle_metadata.batch_number = _clean_str(bottle_dict.get("batch_number"))
+
+        return cls(
+            name=_clean_str(bottle_dict.get("name")) or "Unknown Bottle",
+            distillery=_clean_str(bottle_dict.get("distillery")) or "Unknown Distillery",
+            specific_release=_clean_str(bottle_dict.get("specific_release")) or "",
+            msrp=msrp,
+            proof=_clean_str(bottle_dict.get("proof")),
+            abv=_clean_str(bottle_dict.get("abv")) or bottle_metadata.abv,
+            age=_clean_str(bottle_dict.get("age")),
+            tasting_notes=_clean_str(bottle_dict.get("tasting_notes")),
+            metadata=bottle_metadata,
+            quantity=bottle_quantity,
+            corrections=[
+                Correction.from_dict(c) if isinstance(c, dict) else c for c in (corrections or [])
+            ],
+        )
 
     @property
-    def total_value(self) -> Decimal:
+    def total_value(self) -> Optional[Decimal]:
         """Calculate total bottle value based on quantity/price.
 
         Returns:
-            Total value = quantity * price (or ohr if price = 0).
+            Total value = quantity * price (or ohr if price = 0), or None
+            when the price is unknown and there is no ohr estimate.
 
         Scenario 1: Single bottle from crawled images
         - quantity.count = 1
@@ -234,12 +399,14 @@ class Bottle:
         - ohr = decaying estimated value
         - Total = 12 * ohr
         """
-        if self.quantity.price > 0:
-            return Decimal(self.quantity.count) * self.quantity.price
-        elif self.ohr:
+        price = self.quantity.price
+        if price is not None and price > 0:
+            return Decimal(self.quantity.count) * price
+        if self.ohr:
             return Decimal(self.quantity.count) * self.ohr
-        else:
-            return Decimal("0.00")
+        if price is None:
+            return None
+        return Decimal("0.00")
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization.
@@ -251,8 +418,9 @@ class Bottle:
             "name": self.name,
             "distillery": self.distillery,
             "specific_release": self.specific_release,
-            "msrp": str(self.msrp),
+            "msrp": str(self.msrp) if self.msrp is not None else None,
             "proof": self.proof,
+            "abv": self.abv,
             "age": self.age,
             "tasting_notes": self.tasting_notes,
             "quantity": self.quantity.to_dict(),
@@ -295,16 +463,17 @@ class Bottle:
         if "corrections" in data:
             corrections = [Correction.from_dict(item) for item in data["corrections"]]
 
-        extracted_at = datetime.utcnow()
-        if "extracted_at" in data:
-            extracted_at = datetime.fromisoformat(data["extracted_at"])
+        extracted_at = utc_now()
+        if data.get("extracted_at"):
+            extracted_at = parse_timestamp(data["extracted_at"])
 
         return cls(
             name=data["name"],
             distillery=data["distillery"],
             specific_release=data["specific_release"],
-            msrp=Decimal(data["msrp"]),
+            msrp=Decimal(str(data["msrp"])) if data.get("msrp") not in (None, "") else None,
             proof=data.get("proof"),
+            abv=data.get("abv"),
             age=data.get("age"),
             tasting_notes=data.get("tasting_notes"),
             metadata=metadata,
@@ -351,10 +520,13 @@ class Bottle:
         lines = [f"# {self.name}", ""]
         lines.append(f"**Distillery:** {self.distillery}")
         lines.append("")
-        lines.append(f"**MSRP:** ${self.msrp}")
+        lines.append(f"**MSRP:** {format_money(self.msrp)}")
 
         if self.proof:
             lines.append(f"**Proof:** {self.proof}")
+
+        if self.abv:
+            lines.append(f"**ABV:** {self.abv}")
 
         if self.age:
             lines.append(f"**Age:** {self.age}")
@@ -372,9 +544,9 @@ class Bottle:
         if self.quantity.count > 1 or self.quantity.source == "manual":
             lines.append("## Quantity")
             lines.append(f"**Count:** {self.quantity.count}")
-            if self.quantity.price > 0:
+            if self.quantity.price is not None and self.quantity.price > 0:
                 lines.append(f"**Price:** ${self.quantity.price}/bottle")
-            lines.append(f"**Total Value:** ${self.total_value}")
+            lines.append(f"**Total Value:** {format_money(self.total_value)}")
             lines.append("")
             lines.append(f"*Source: {self.quantity.source}*")
             lines.append("")
@@ -404,7 +576,7 @@ class Correction:
     field_name: str
     original_value: str
     corrected_value: str
-    corrected_at: datetime = field(default_factory=datetime.utcnow)
+    corrected_at: datetime = field(default_factory=utc_now)
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization.
@@ -429,9 +601,9 @@ class Correction:
         Returns:
             Correction instance.
         """
-        corrected_at = datetime.utcnow()
-        if "corrected_at" in data:
-            corrected_at = datetime.fromisoformat(data["corrected_at"])
+        corrected_at = utc_now()
+        if data.get("corrected_at"):
+            corrected_at = parse_timestamp(data["corrected_at"])
 
         return cls(
             field_name=data["field_name"],
@@ -458,7 +630,7 @@ class BatchPreviewReport:
 
     report_id: str
     batch_id: str
-    generated_timestamp: datetime = field(default_factory=datetime.utcnow)
+    generated_timestamp: datetime = field(default_factory=utc_now)
     markdown_content: str = ""
     report_path: Optional[Path] = None
 
@@ -486,9 +658,9 @@ class BatchPreviewReport:
         Returns:
             BatchPreviewReport instance.
         """
-        generated_timestamp = datetime.utcnow()
-        if "generated_timestamp" in data:
-            generated_timestamp = datetime.fromisoformat(data["generated_timestamp"])
+        generated_timestamp = utc_now()
+        if data.get("generated_timestamp"):
+            generated_timestamp = parse_timestamp(data["generated_timestamp"])
 
         report_path = None
         if "report_path" in data and data["report_path"]:

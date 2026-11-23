@@ -8,7 +8,19 @@ import time
 from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
+
+from lib.exceptions import (
+    AIModelError,
+    ConfigurationError,
+    FileSystemError,
+    ImageProcessingError,
+    OCRError,
+    ValidationError,
+    VisionModelUnavailableError,
+    VisionResponseError,
+    VisionTimeoutError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +121,53 @@ class ErrorReport:
         return result
 
 
+def _classify_bourbon_exception(error: Exception) -> Optional[Tuple[ErrorType, str]]:
+    """Classify this package's own exceptions by type, subclasses included.
+
+    Uses ``isinstance`` so subclasses (for example the ``Vision*`` errors and
+    ``ModelServerError`` under ``AIModelError``, or ``DuplicateImageError``
+    under ``FileSystemError``) get their parent's category instead of UNKNOWN.
+
+    Args:
+        error: Exception to classify.
+
+    Returns:
+        ``(error_type, default_hint)``, or None if ``error`` is not one of the
+        package's exception types.
+    """
+    if isinstance(error, OCRError):
+        return ErrorType.OCR_FAILURE, "Ensure Tesseract OCR is installed and in PATH. Check image clarity."
+    if isinstance(error, VisionModelUnavailableError):
+        return (
+            ErrorType.AI_MODEL_FAILURE,
+            (
+                "Check the model is installed and supports images ('ollama show <model>'), "
+                "or choose another vision model with -m."
+            ),
+        )
+    if isinstance(error, VisionTimeoutError):
+        return (
+            ErrorType.AI_MODEL_FAILURE,
+            "The vision model was too slow; raise --request-timeout or use a smaller model.",
+        )
+    if isinstance(error, VisionResponseError):
+        return (
+            ErrorType.AI_MODEL_FAILURE,
+            "The vision model returned no usable data; check the photos show a readable label.",
+        )
+    if isinstance(error, AIModelError):
+        return ErrorType.AI_MODEL_FAILURE, "Ensure Ollama server is running and the model is available."
+    if isinstance(error, ImageProcessingError):
+        return ErrorType.IMAGE_PROCESSING, "Check if the image file is corrupted or in an unsupported format."
+    if isinstance(error, ConfigurationError):
+        return ErrorType.CONFIGURATION_ERROR, "Check configuration values and ensure config file is valid."
+    if isinstance(error, FileSystemError):
+        return ErrorType.FILESYSTEM_ERROR, "Verify file path exists and you have read/write permissions."
+    if isinstance(error, ValidationError):
+        return ErrorType.VALIDATION_ERROR, "Check the input data format or model response schema."
+    return None
+
+
 class RetryException(Exception):
     """Exception thrown when retry fails after all attempts.
 
@@ -191,21 +250,10 @@ class RetryManager:
         Returns:
             Classified ErrorType.
         """
-        # Check for custom bourbon processor exceptions first
-        error_class_name = error.__class__.__name__
-
-        if error_class_name == "OCRError":
-            return ErrorType.OCR_FAILURE
-        elif error_class_name in ("AIModelError", "OllamaConnectionError"):
-            return ErrorType.AI_MODEL_FAILURE
-        elif error_class_name == "ImageProcessingError":
-            return ErrorType.IMAGE_PROCESSING
-        elif error_class_name == "ConfigurationError":
-            return ErrorType.CONFIGURATION_ERROR
-        elif error_class_name in ("FileSystemError", "DuplicateImageError"):
-            return ErrorType.FILESYSTEM_ERROR
-        elif error_class_name == "ValidationError":
-            return ErrorType.VALIDATION_ERROR
+        # The package's own exceptions first (subclasses included)
+        classified = _classify_bourbon_exception(error)
+        if classified is not None:
+            return classified[0]
         # Check for common exception types
         error_name = type(error).__name__
 
@@ -303,31 +351,15 @@ def create_error_report(
     Returns:
         ErrorReport instance.
     """
-    from datetime import datetime
+    from datetime import UTC, datetime
 
-    # Classify error type
+    # Classify error type: the package's own exceptions first (subclasses included)
     error_name = type(error).__name__
-    error_class_name = error.__class__.__name__
+    classified = _classify_bourbon_exception(error)
 
-    # Check for custom bourbon processor exceptions first
-    if error_class_name == "OCRError":
-        error_type = ErrorType.OCR_FAILURE
-        hint = hint or "Ensure Tesseract OCR is installed and in PATH. Check image clarity."
-    elif error_class_name == "AIModelError" or error_class_name == "OllamaConnectionError":
-        error_type = ErrorType.AI_MODEL_FAILURE
-        hint = hint or "Ensure Ollama server is running and the model is available."
-    elif error_class_name == "ImageProcessingError":
-        error_type = ErrorType.IMAGE_PROCESSING
-        hint = hint or "Check if the image file is corrupted or in an unsupported format."
-    elif error_class_name == "ConfigurationError":
-        error_type = ErrorType.CONFIGURATION_ERROR
-        hint = hint or "Check configuration values and ensure config file is valid."
-    elif error_class_name == "FileSystemError" or error_class_name == "DuplicateImageError":
-        error_type = ErrorType.FILESYSTEM_ERROR
-        hint = hint or "Verify file path exists and you have read/write permissions."
-    elif error_class_name == "ValidationError":
-        error_type = ErrorType.VALIDATION_ERROR
-        hint = hint or "Check the input data format or model response schema."
+    if classified is not None:
+        error_type = classified[0]
+        hint = hint or classified[1]
     # Check for standard Python exceptions
     elif error_name in ("UnidentifiedImageError", "PIL.UnidentifiedImageError", "cv2.error"):
         error_type = ErrorType.IMAGE_PROCESSING
@@ -365,7 +397,7 @@ def create_error_report(
         file_path=file_path,
         message=message,
         details=details,
-        timestamp=datetime.utcnow().isoformat(),
+        timestamp=datetime.now(UTC).isoformat(),
         hint=hint,
     )
 

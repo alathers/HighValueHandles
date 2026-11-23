@@ -1,7 +1,7 @@
 """Integration tests for batch processing workflow.
 
-Tests verify batch processing with lookahead, preview reports,
-and feedback loop using test fixture images.
+Tests verify that groups pass through batching intact, preview reports,
+and the feedback loop using test fixture images.
 """
 
 import tempfile
@@ -25,102 +25,74 @@ has_ollama = pytest.mark.skipif(
 )
 
 
-class TestBatchProcessingWithLookahead:
-    """Test batch processing with lookahead functionality."""
+class TestBatchingKeepsGroupsIntact:
+    """Groups from ImageOrganizer pass through batching whole and are analyzed once.
 
-    @has_ollama
-    def test_lookahead_groups_related_images(self, tmp_path):
-        """Test that lookahead groups multi-angle photos of same bottle.
+    (Replaces the old lookahead tests: lookahead is deprecated and does
+    nothing, because capture-time grouping already keeps every bottle's
+    photos together.)
+    """
 
-        Covers: lookahead operation → image grouping → single bottle per group
-        """
-        # Create test images simulating multi-angle photos of 2 bottles
-        # Bottle 1: front, back, label angles
-        bottle1_front = tmp_path / "IMG_0001.jpg"
-        bottle1_back = tmp_path / "IMG_0002.jpg"
-        bottle1_label = tmp_path / "IMG_0003.jpg"
-        # Bottle 2: front, back, label angles
-        bottle2_front = tmp_path / "IMG_0004.jpg"
-        bottle2_back = tmp_path / "IMG_0005.jpg"
+    @staticmethod
+    def _timed_photos(tmp_path, seconds):
+        import datetime as dt
 
-        _create_test_image(bottle1_front)
-        _create_test_image(bottle1_back)
-        _create_test_image(bottle1_label)
-        _create_test_image(bottle2_front)
-        _create_test_image(bottle2_back)
+        from PIL import ImageDraw
 
-        # All images as Image objects
-        all_images = [
-            Image(path=str(bottle1_front), category="BOTTLE", is_primary=True),
-            Image(path=str(bottle1_back), category="BOTTLE", is_primary=False),
-            Image(path=str(bottle1_label), category="BOTTLE", is_primary=False),
-            Image(path=str(bottle2_front), category="BOTTLE", is_primary=True),
-            Image(path=str(bottle2_back), category="BOTTLE", is_primary=False),
-        ]
-
-        # Setup processor with lookahead=2
-        batch_processor = BatchProcessor(batch_size=2, lookahead=2)
-
-        # Mock bottle analyzer to return simulated results
-        with patch.object(batch_processor.bottle_analyzer, 'process_single_bottle') as mock_process:
-            mock_process.side_effect = [
-                ({"name": "Bottle 1", "distillery": "Test 1", "msrp": "50"}, Mock()),
-                ({"name": "Bottle 2", "distillery": "Test 2", "msrp": "75"}, Mock()),
-            ]
-
-            # Apply lookahead to group images - organize as image groups
-            # Each inner list represents a bottle's multi-angle photos
-            current_batch = [[all_images[0]]]  # First image as a group
-            remaining_groups = [[all_images[1]], [all_images[2]], [all_images[3]], [all_images[4]]]
-
-            # (In real implementation, this would use visual similarity)
-            grouped_batch, updated_remaining = batch_processor.apply_lookahead(current_batch, remaining_groups)
-
-            # Verify grouping - batch should include original + lookahead images
-            assert len(grouped_batch) >= 1
-
-    @has_ollama
-    def test_batch_processing_with_lookahead_limit(self, tmp_path):
-        """Test that lookahead respects the maximum limit.
-
-        Covers: lookahead limit (0-10) → bounded group size
-        """
-        # Create test images
         images = []
-        for i in range(15):
-            img_path = tmp_path / f"IMG_{i:04d}.jpg"
-            _create_test_image(img_path)
-            images.append(Image(path=str(img_path), category="BOTTLE", is_primary=(i == 0)))
+        for k, s in enumerate(seconds):
+            path = tmp_path / f"IMG_{k:04d}.jpg"
+            exif = PILImage.Exif()
+            taken = dt.datetime(2026, 11, 7, 16, 0, 0) + dt.timedelta(seconds=s)
+            exif.get_ifd(0x8769)[0x9003] = taken.strftime("%Y:%m:%d %H:%M:%S")
+            img = PILImage.new("RGB", (64, 64), (230, 230, 230))
+            ImageDraw.Draw(img).rectangle([k * 5 % 50, 0, k * 5 % 50 + 8, 63], fill=(0, 0, 0))
+            img.save(path, "JPEG", exif=exif.tobytes())
+            images.append(Image(path=str(path), category="BOTTLE"))
+        return images
 
-        # Setup processor with lookahead=5
-        batch_processor = BatchProcessor(batch_size=3, lookahead=5)
+    def test_groups_pass_through_batches_intact_and_once(self, tmp_path):
+        from image_processor.image_organizer import ImageOrganizer
 
-        # Apply lookahead - should respect max limit
-        with patch.object(batch_processor.bottle_analyzer, 'process_single_bottle') as mock_process:
-            mock_process.return_value = ({"name": "Test Bottle", "distillery": "Test", "msrp": "50"}, Mock())
+        # Five bottles: pairs 3 s apart, bottles a minute apart.
+        seconds = [0, 3, 60, 63, 120, 123, 180, 183, 240, 243]
+        images = self._timed_photos(tmp_path, seconds)
+        groups = ImageOrganizer().group_by_bottle(images)
+        assert [len(g) for g in groups] == [2] * 5
 
-            result = batch_processor.process_batch([[img] for img in images[:3]])
+        processor = BatchProcessor(batch_size=2, lookahead=5)  # lookahead ignored
+        seen: list[list[str]] = []
 
-            # Verify lookahead was applied but bounded
-            assert len(result.bottle_dicts) >= 1
+        def analyze(group, vision_model=None):
+            seen.append([Path(img.path).name for img in group])
+            return {"name": f"Bottle {len(seen)}", "images": [str(img.path) for img in group]}, ExtractedMetadata()
 
-    @has_ollama
-    def test_lookahead_value_zero_processes_independently(self, tmp_path):
-        """Test that lookahead=0 processes images independently.
+        with patch.object(processor.bottle_analyzer, "process_single_bottle", side_effect=analyze):
+            processor.start_run(groups)
+            batches = processor.slice_into_batches(groups)
+            results = [processor.process_batch(batch) for batch in batches]
 
-        Covers: lookahead=0 → no grouping → each image separate bottle
-        """
-        # Create test images
+        assert [len(b) for b in batches] == [2, 2, 1]
+        assert seen == [[Path(img.path).name for img in g] for g in groups]  # each group once, whole
+        assert sum(len(r.bottle_dicts) for r in results) == 5
+
+    def test_lookahead_argument_changes_nothing(self, tmp_path):
+        images = self._timed_photos(tmp_path, [0, 3, 60])
+        groups = [[images[0], images[1]], [images[2]]]
+        for lookahead in (0, 3, 10):
+            processor = BatchProcessor(batch_size=1, lookahead=lookahead)
+            assert processor.slice_into_batches(groups) == [[groups[0]], [groups[1]]]
+            assert processor.apply_lookahead([groups[0]], [groups[1]]) == ([groups[0]], [groups[1]])
+
+    def test_single_photo_groups_processed_independently(self, tmp_path):
         images = []
         for i in range(3):
             img_path = tmp_path / f"IMG_{i:04d}.jpg"
             _create_test_image(img_path)
             images.append(Image(path=str(img_path), category="BOTTLE", is_primary=True))
 
-        # Setup processor with lookahead=0
-        batch_processor = BatchProcessor(batch_size=3, lookahead=0)
+        batch_processor = BatchProcessor(batch_size=3)
 
-        # Process
         with patch.object(batch_processor.bottle_analyzer, 'process_single_bottle') as mock_process:
             mock_process.side_effect = [
                 ({"name": "Bottle 1", "distillery": "Test", "msrp": "50"}, Mock()),
@@ -130,7 +102,6 @@ class TestBatchProcessingWithLookahead:
 
             result = batch_processor.process_batch([[img] for img in images])
 
-            # Each image processed independently
             assert mock_process.call_count == 3
             assert len(result.bottle_dicts) == 3
 
@@ -279,7 +250,7 @@ class TestBatchWorkflowEndToEnd:
     def test_full_batch_workflow_from_images_to_report(self, tmp_path):
         """Test complete workflow: images → batch processing → preview report.
 
-        Covers: Full pipeline with lookahead and preview report
+        Covers: Full pipeline with batching and preview report
         """
         # Create test images
         images = []
@@ -289,7 +260,7 @@ class TestBatchWorkflowEndToEnd:
             images.append(Image(path=str(img_path), category="BOTTLE", is_primary=True))
 
         # Setup batch processor
-        batch_processor = BatchProcessor(batch_size=2, lookahead=2)
+        batch_processor = BatchProcessor(batch_size=2)
 
         # Mock bottle analyzer
         with patch.object(batch_processor.bottle_analyzer, 'process_single_bottle') as mock_process:
@@ -349,7 +320,7 @@ class TestBatchWorkflowEndToEnd:
             images.append(Image(path=str(img_path), category="BOTTLE", is_primary=True))
 
         # Setup batch processor
-        batch_processor = BatchProcessor(batch_size=3, lookahead=0)
+        batch_processor = BatchProcessor(batch_size=3)
 
         # Mock bottle analyzer with partial success
         with patch.object(batch_processor.bottle_analyzer, 'process_single_bottle') as mock_process:

@@ -4,24 +4,85 @@ Creates markdown output, saves images, generates error reports,
 and provides preview for user review.
 """
 
+import json
 import logging
-from datetime import datetime
+import os
+import re
+import shutil
+import traceback
+import unicodedata
+import uuid
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
-from lib.error_handling import ErrorType, ErrorReport, create_error_report, save_error_reports
+from image_processor.image_organizer import OUTPUT_MARKER
+from lib.error_handling import ErrorReport, ErrorType, create_error_report, save_error_reports
 from lib.exceptions import (
-    BourbonException,
-    OCRError,
     AIModelError,
-    ImageProcessingError,
+    BourbonException,
     ConfigurationError,
     FileSystemError,
+    ImageProcessingError,
+    OCRError,
     ValidationError,
 )
-from models.bottle import Bottle, ExtractedMetadata
+from models.bottle import Bottle, ExtractedMetadata, format_money, parse_money
 
 logger = logging.getLogger(__name__)
+
+#: Version of the per-bottle JSON and failure-report layouts.
+OUTPUT_SCHEMA_VERSION = 1
+
+#: Highest numeric suffix tried before giving up on a unique output name.
+_MAX_NAME_SUFFIX = 10_000
+
+_PLACEHOLDER_NAMES = {"", "unknown", "unknown bottle", "n/a", "none"}
+
+
+def slugify(text: Optional[str], fallback: str = "bottle", max_len: int = 60) -> str:
+    """Turn text into a safe lowercase file/folder name.
+
+    Only ``[a-z0-9_]`` survive, so the result can never contain a path
+    separator, ``..`` or characters that some filesystems reject, and two
+    names differing only in case map to the same slug (safe on
+    case-insensitive filesystems).
+
+    Examples: ``"Blanton's: Gold/Edition? <1>"`` -> ``'blantons_gold_edition_1'``,
+    ``'../../etc'`` -> ``'etc'``.
+
+    Args:
+        text: Text to convert (None is treated as empty).
+        fallback: Returned when nothing usable is left.
+        max_len: Maximum length of the slug.
+
+    Returns:
+        The slug, or ``fallback``.
+    """
+    ascii_text = unicodedata.normalize("NFKD", text or "").encode("ascii", "ignore").decode("ascii")
+    ascii_text = re.sub(r"['`\u2019]", "", ascii_text).lower()
+    slug = re.sub(r"[^a-z0-9]+", "_", ascii_text).strip("_")
+    slug = slug[:max_len].rstrip("_")
+    return slug or fallback
+
+
+def _is_placeholder_name(name: Optional[str]) -> bool:
+    """True for empty names and 'Unknown ...' placeholders from the analyzer."""
+    normalized = (name or "").strip().lower()
+    return normalized in _PLACEHOLDER_NAMES or normalized.startswith("unknown")
+
+
+def _unique_path(directory: Path, stem: str, suffix: str = "") -> Path:
+    """First of ``stem``, ``stem_2``, ``stem_3``... (plus suffix) not in ``directory``.
+
+    Raises:
+        FileExistsError: If every candidate up to ``_MAX_NAME_SUFFIX`` exists.
+    """
+    for n in range(1, _MAX_NAME_SUFFIX + 1):
+        candidate = directory / (f"{stem}{suffix}" if n == 1 else f"{stem}_{n}{suffix}")
+        if not candidate.exists():
+            return candidate
+    raise FileExistsError(f"No free name for '{stem}{suffix}' in {directory}")
 
 
 class PreviewGenerator:
@@ -33,33 +94,49 @@ class PreviewGenerator:
         output_dir: Base output directory for processed bottles.
     """
 
-    def __init__(self, output_dir: Optional[Path] = None):
+    def __init__(self, output_dir: Optional[Path] = None, mark_output_dir: bool = True):
         """Initialize preview generator.
 
         Args:
             output_dir: Base output directory (default: "processed").
+            mark_output_dir: Write the output marker into ``output_dir`` so
+                later scans skip it. Off when ``output_dir`` contains the
+                photos being processed (each bottle folder is still marked).
         """
         self.output_dir = Path(output_dir) if output_dir else Path("processed")
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.mark_output_dir = mark_output_dir
 
-    def generate_bottle_markdown(self, bottle: Bottle) -> str:
+    def generate_bottle_markdown(
+        self,
+        bottle: Bottle,
+        image_links: Optional[List[str]] = None,
+        model_used: Optional[str] = None,
+        confidence: Optional[str] = None,
+    ) -> str:
         """Generate markdown content for bottle.
 
         Args:
-            bottle: Bottle model instance.
+            bottle: Bottle model instance (metadata may be None).
+            image_links: Relative paths of the copied images (e.g.
+                ``'images/IMG_1.jpg'``); rendered as links, the first marked
+                primary. Default: the names of ``bottle.metadata.source_images``.
+            model_used: Vision model that extracted the data.
+            confidence: Extraction confidence ('HIGH'/'MEDIUM'/'LOW').
 
         Returns:
             Markdown formatted string.
         """
-        lines = [f"# {bottle.name}\n", "\n"]
+        metadata = bottle.metadata
+        lines = [f"# {bottle.name}", ""]
 
         # Distillery
         lines.append("## Distillery")
-        lines.append(f"{bottle.distillery}\n")
+        lines.append(f"{bottle.distillery}")
 
         # MSRP
         lines.append("\n## MSRP")
-        lines.append(f"${bottle.msrp}\n")
+        lines.append(format_money(bottle.msrp))
 
         # Release Information section
         lines.append("\n## Release Information")
@@ -67,11 +144,17 @@ class PreviewGenerator:
         if bottle.proof:
             lines.append(f"- **Proof:** {bottle.proof}")
 
+        if bottle.abv:
+            lines.append(f"- **ABV:** {bottle.abv}")
+
         if bottle.age:
             lines.append(f"- **Age:** {bottle.age}")
 
         if bottle.specific_release:
             lines.append(f"- **Release:** {bottle.specific_release}")
+
+        if metadata is not None and metadata.batch_number:
+            lines.append(f"- **Batch:** {metadata.batch_number}")
 
         # Tasting Notes
         if bottle.tasting_notes:
@@ -87,16 +170,24 @@ class PreviewGenerator:
         # Quantity section
         lines.append("\n## Quantity")
         lines.append(f"Total quantity: {bottle.quantity.count}")
-        if bottle.quantity.count > 1:
-            unit_value = bottle.total_value / bottle.quantity.count
-            lines.append(f"Value per bottle: ${unit_value:.2f}")
-        lines.append(f"Total value: ${bottle.total_value:.2f}")
+        total_value = bottle.total_value
+        if bottle.quantity.count > 1 and total_value is not None:
+            unit_value = total_value / bottle.quantity.count
+            lines.append(f"Value per bottle: {format_money(unit_value)}")
+        lines.append(f"Total value: {format_money(total_value)}")
 
         # Images
         lines.append("\n## Images")
-        for i, img in enumerate(bottle.metadata.source_images, 1):
-            img_name = Path(img).name
-            lines.append(f"{i}. {img_name}")
+        if image_links is not None:
+            for i, link in enumerate(image_links, 1):
+                primary = " (primary)" if i == 1 else ""
+                lines.append(f"{i}. [{Path(link).name}]({link}){primary}")
+            image_count = len(image_links)
+        else:
+            source_images = list(metadata.source_images) if metadata is not None else []
+            for i, img in enumerate(source_images, 1):
+                lines.append(f"{i}. {Path(img).name}")
+            image_count = len(source_images)
 
         # Processing Notes
         if bottle.corrections:
@@ -104,64 +195,237 @@ class PreviewGenerator:
             for correction in bottle.corrections:
                 lines.append(f"- **{correction.field_name}**: `{correction.original_value}` → `{correction.corrected_value}`")
 
-        return "\n".join(lines)
+        # Processing Details
+        lines.append("\n## Processing Details")
+        lines.append(f"- **Images Processed**: {image_count}")
+        lines.append(f"- **Model**: {model_used or 'unknown'}")
+        if confidence:
+            lines.append(f"- **Extraction Confidence**: {confidence}")
+        extracted_at = bottle.extracted_at
+        if extracted_at.tzinfo is None:  # naive values are UTC (older files)
+            extracted_at = extracted_at.replace(tzinfo=UTC)
+        # Local time with its UTC offset, e.g. 2026-11-22T21:38:09-06:00.
+        lines.append(f"- **Extracted**: {extracted_at.astimezone().isoformat(timespec='seconds')}")
+        warnings = list(metadata.warnings) if metadata is not None else []
+        for warning in warnings:
+            lines.append(f"- **Warning**: {warning}")
+
+        return "\n".join(lines) + "\n"
+
+    @staticmethod
+    def bottle_id_for(
+        bottle_dict: Optional[Dict[str, Any]],
+        metadata: Optional[ExtractedMetadata],
+    ) -> str:
+        """Identify a bottle: its run-assigned ``bottle_id``, else its primary image's stem.
+
+        Matches the IDs ``BatchProcessor`` uses for failed bottles and that
+        ``interactive_prompt`` shows, so rejects and reports line up. A
+        ``process`` run assigns unique IDs (``bottle_dict['bottle_id']``), so
+        photos with the same name in different folders never collide.
+
+        Args:
+            bottle_dict: Analyzer output (its ``bottle_id`` / ``images``), or None.
+            metadata: Extracted metadata (its ``source_images``), or None.
+
+        Returns:
+            The bottle ID, or 'unknown'.
+        """
+        assigned = (bottle_dict or {}).get("bottle_id")
+        if isinstance(assigned, str) and assigned:
+            return assigned
+        if metadata is not None and metadata.source_images:
+            return Path(metadata.source_images[0]).stem
+        images = (bottle_dict or {}).get("images") or []
+        if images:
+            return Path(images[0]).stem
+        return "unknown"
 
     def save_bottle_files(
         self,
         bottle: Bottle,
-        metadata: ExtractedMetadata,
+        metadata: Optional[ExtractedMetadata] = None,
         prefix: Optional[str] = None,
+        *,
+        model_used: Optional[str] = None,
+        confidence: Optional[str] = None,
+        extra: Optional[Dict[str, Any]] = None,
     ) -> Path:
-        """Save output files for processed bottle.
+        """Save a bottle's output folder atomically, never overwriting.
 
-        Creates sub-folder, copies images, writes markdown and OCR text.
+        Writes ``<output_dir>/<stem>/`` containing ``<stem>.md``,
+        ``<stem>.json`` (``Bottle.to_dict()`` plus extra keys), ``<stem>.txt``
+        (OCR text) and ``images/`` with a copy of every source image. The stem
+        is the slugified bottle name (``unknown_<primary image>`` for
+        placeholder names); if that folder exists, ``_2``, ``_3``... is used.
+
+        The folder is built in a hidden ``.<stem>.*.partial`` directory inside
+        ``output_dir`` and renamed into place, so readers never see a
+        half-written folder and a failure leaves nothing behind. Originals
+        are only read. A missing source image is logged and listed in the
+        JSON's ``missing_images``; it is not an error.
 
         Args:
-            bottle: Bottle model instance.
-            metadata: ExtractedMetadata from analysis.
-            prefix: Optional prefix for folder name (default: auto-generated from name).
+            bottle: Bottle to save (build it with ``Bottle.from_analysis``).
+            metadata: Extracted metadata; its images are added to the
+                bottle's and its ``full_text`` is written to ``<stem>.txt``.
+            prefix: Folder name to use instead of the bottle name (slugified).
+            model_used: Vision model that extracted the data.
+            confidence: Extraction confidence ('HIGH'/'MEDIUM'/'LOW').
+            extra: Additional top-level keys for the JSON file.
 
         Returns:
-            Path to created output folder.
+            Path to the created output folder.
+
+        Raises:
+            FileSystemError: If the folder could not be written; nothing is
+                left in ``output_dir`` in that case.
         """
-        # Generate folder name
+        meta = bottle.metadata or metadata or ExtractedMetadata()
+        sources: List[Path] = []
+        seen: set = set()
+        for image_path in [*meta.source_images, *(metadata.source_images if metadata else [])]:
+            if str(image_path) not in seen:
+                seen.add(str(image_path))
+                sources.append(Path(image_path))
+        ocr_text = (metadata or meta).full_text or ""
+        bottle_id = Path(sources[0]).stem if sources else "unknown"
+
         if prefix:
-            folder_name = prefix
+            stem = slugify(prefix)
+        elif _is_placeholder_name(bottle.name):
+            stem = f"unknown_{slugify(bottle_id, fallback='bottle')}"
         else:
-            # Use bottle name, sanitize for filesystem
-            safe_name = bottle.name.replace(" ", "_").replace("/", "_").replace("\\", "_")
-            import datetime
+            stem = slugify(bottle.name)
 
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            folder_name = f"{safe_name}_{timestamp}"
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        if self.mark_output_dir:
+            try:
+                (self.output_dir / OUTPUT_MARKER).touch()
+            except OSError:
+                logger.debug("Could not write output marker in %s", self.output_dir, exc_info=True)
 
-        output_folder = self.output_dir / folder_name
-        output_folder.mkdir(parents=True, exist_ok=True)
+        staging: Optional[Path] = None
+        try:
+            staging = self._make_staging_dir(stem)
+            # Marks the bottle folder itself as output, so it stays out of
+            # later scans even when its parent is used as the scan root.
+            (staging / OUTPUT_MARKER).touch()
+            image_dir = staging / "images"
+            image_dir.mkdir()
 
-        # Copy images
-        for img_path in bottle.metadata.source_images:
-            src = Path(img_path)
-            if src.exists():
-                dst = output_folder / src.name
-                import shutil
+            copied: List[str] = []
+            missing: List[str] = []
+            used_names: set = set()
+            for src in sources:
+                if not src.is_file():
+                    logger.warning("Source image not found, not copied: %s", src)
+                    missing.append(str(src))
+                    continue
+                name, n = src.name, 2
+                while name.lower() in used_names:
+                    name = f"{src.stem}_{n}{src.suffix}"
+                    n += 1
+                used_names.add(name.lower())
+                shutil.copy2(src, image_dir / name)
+                copied.append(f"images/{name}")
+                logger.debug("Copied image %s to %s", src, image_dir / name)
 
-                shutil.copy2(src, dst)
-                logger.debug(f"Copied image to {dst}")
+            final = _unique_path(self.output_dir, stem)
+            data = {
+                **bottle.to_dict(),
+                "schema_version": OUTPUT_SCHEMA_VERSION,
+                "bottle_id": bottle_id,
+                "batch_number": meta.batch_number,
+                "model_used": model_used,
+                "confidence": confidence,
+                "source_images": [str(p) for p in sources],
+                "images": copied,
+                "missing_images": missing,
+                "total_value": str(bottle.total_value) if bottle.total_value is not None else None,
+                **(extra or {}),
+            }
+            self._write_bottle_files(
+                staging,
+                final.name,
+                markdown=self.generate_bottle_markdown(
+                    bottle, image_links=copied, model_used=model_used, confidence=confidence
+                ),
+                json_text=json.dumps(data, indent=2, ensure_ascii=False, default=str),
+                ocr_text=ocr_text,
+            )
+            final = self._move_into_place(staging, final, stem)
+            staging = None
+        except Exception as e:
+            if staging is not None:
+                shutil.rmtree(staging, ignore_errors=True)
+            raise FileSystemError(
+                f"Failed to save output for bottle '{bottle.name}' in {self.output_dir}: "
+                f"{type(e).__name__}: {e}"
+            ) from e
 
-        # Write markdown
-        markdown_content = self.generate_bottle_markdown(bottle)
-        markdown_path = output_folder / "bottle.md"
-        with open(markdown_path, "w", encoding="utf-8") as f:
-            f.write(markdown_content)
-        logger.info(f"Wrote markdown to {markdown_path}")
+        logger.info("Saved bottle '%s' to %s (%d image(s))", bottle.name, final, len(copied))
+        return final
 
-        # Write OCR text
-        ocr_path = output_folder / "extracted_text.txt"
-        with open(ocr_path, "w", encoding="utf-8") as f:
-            f.write(metadata.full_text or "")
-        logger.info(f"Wrote OCR text to {ocr_path}")
+    def _make_staging_dir(self, stem: str) -> Path:
+        """Create a hidden ``.<stem>.<random>.partial`` directory in ``output_dir``.
 
-        return output_folder
+        Uses a plain ``mkdir`` (not ``tempfile.mkdtemp``, which forces mode
+        0700) so the folder renamed into place gets the same umask-derived
+        permissions as any other directory the user creates.
+        """
+        for _ in range(100):
+            staging = self.output_dir / f".{stem}.{uuid.uuid4().hex}.partial"
+            try:
+                staging.mkdir()
+            except FileExistsError:
+                continue
+            return staging
+        raise FileExistsError(f"Could not create a staging directory in {self.output_dir}")
+
+    @staticmethod
+    def _write_bottle_files(
+        folder: Path,
+        stem: str,
+        *,
+        markdown: str,
+        json_text: str,
+        ocr_text: str,
+    ) -> None:
+        """Write ``<stem>.md``, ``<stem>.json`` and ``<stem>.txt`` into ``folder``."""
+        (folder / f"{stem}.md").write_text(markdown, encoding="utf-8")
+        (folder / f"{stem}.json").write_text(json_text + "\n", encoding="utf-8")
+        (folder / f"{stem}.txt").write_text(ocr_text, encoding="utf-8")
+
+    @staticmethod
+    def _move_into_place(staging: Path, final: Path, stem: str) -> Path:
+        """Rename the staging folder to ``final`` or the next free ``stem_N``.
+
+        If another process claimed ``final`` after it was chosen, the rename
+        fails (the target is not empty) and the next free name is tried; the
+        files inside are renamed to match. An existing folder is never
+        replaced.
+
+        Returns:
+            The folder's final path.
+        """
+        for _ in range(_MAX_NAME_SUFFIX):
+            try:
+                if final.exists():
+                    raise FileExistsError(final)
+                staging.rename(final)
+                return final
+            except (FileExistsError, IsADirectoryError, NotADirectoryError):
+                pass
+            except OSError as e:
+                if not final.exists():
+                    raise
+                logger.debug("Output name %s was taken: %s", final.name, e)
+            new_final = _unique_path(final.parent, stem)
+            for ext in (".md", ".json", ".txt"):
+                (staging / f"{final.name}{ext}").rename(staging / f"{new_final.name}{ext}")
+            final = new_final
+        raise FileExistsError(f"No free output name for '{stem}' in {final.parent}")
 
     def generate_error_report(
         self,
@@ -211,7 +475,7 @@ class PreviewGenerator:
             file_path=Path(images[0]) if images else None,
             message=str(error),
             details=f"Bottle ID: {bottle_id}\nImages: {images}",
-            timestamp=datetime.utcnow().isoformat(),
+            timestamp=datetime.now(UTC).isoformat(),
             retry_count=retry_attempts,
             hint=suggested_fix,
         )
@@ -325,7 +589,7 @@ class PreviewGenerator:
             lines.append(f"### Bottle {i}\n")
             lines.append(f"**Name:** {bottle_dict.get('name', 'Unknown')}\n")
             lines.append(f"**Distillery:** {bottle_dict.get('distillery', 'Unknown')}\n")
-            lines.append(f"**MSRP:** ${bottle_dict.get('msrp', '0.00')}\n")
+            lines.append(f"**MSRP:** {format_money(parse_money(bottle_dict.get('msrp')))}\n")
 
             if bottle_dict.get("proof"):
                 lines.append(f"**Proof:** {bottle_dict['proof']}\n")
@@ -337,6 +601,10 @@ class PreviewGenerator:
                 lines.append(f"**Release:** {bottle_dict['specific_release']}\n")
 
             lines.append(f"**Quantity:** {bottle_dict.get('quantity', 1)}\n")
+
+            # Review hints (e.g. a group split by the same-bottle check)
+            warnings = getattr(metadata, "warnings", None)
+            lines.extend(f"**Review:** {w}\n" for w in (warnings if isinstance(warnings, list) else []))
 
             # Images section
             lines.append(f"**Images:** {len(metadata.source_images)}\n")
@@ -386,37 +654,173 @@ class PreviewGenerator:
         self,
         bottle_dicts: List[Dict],
         metadata_list: List[ExtractedMetadata],
-        batch_id: int = 1,
+        batch_id: Union[int, str] = 1,
         output_path: Optional[Path] = None,
+        rejected_bottles: Optional[List[str]] = None,
     ) -> Path:
         """Save batch preview report to file with batch-specific naming.
 
-        Writes markdown preview to processed/batch_{N}_preview.md with per-batch
-        naming to support multi-batch processing without file conflicts.
+        Writes the markdown preview to ``batch_{batch_id}_preview.md`` and the
+        batch data (bottles, metadata, rejected IDs) to a sibling
+        ``batch_{batch_id}.json``, which the ``feedback`` command loads.
 
         Args:
             bottle_dicts: List of bottle dictionaries.
             metadata_list: List of ExtractedMetadata.
             batch_id: Batch identifier for filename generation.
-            output_path: Optional output path (default: output_dir/batch_{batch_id}_preview.md).
+            output_path: Markdown file path, or a directory to write
+                ``batch_{batch_id}_preview.md`` into (default: output_dir).
+            rejected_bottles: IDs of bottles rejected or failed in this batch.
 
         Returns:
             Path to saved preview report.
         """
         if output_path is None:
             output_path = self.output_dir / f"batch_{batch_id}_preview.md"
+        else:
+            output_path = Path(output_path)
+            if output_path.is_dir():
+                output_path = output_path / f"batch_{batch_id}_preview.md"
 
+        rejected = list(rejected_bottles or [])
         markdown = self.generate_batch_preview_report(
             bottle_dicts,
             metadata_list,
+            rejected_bottles=rejected,
             batch_id=batch_id,
         )
 
         with open(output_path, "w", encoding="utf-8") as f:
             f.write(markdown)
+        logger.info("Saved batch preview to %s", output_path)
 
-        logger.info(f"Saved batch preview to {output_path}")
+        if output_path.name.endswith("_preview.md"):
+            json_path = output_path.with_name(output_path.name[: -len("_preview.md")] + ".json")
+        else:
+            json_path = output_path.with_suffix(".json")
+        batch_data = {
+            "batch_id": str(batch_id),
+            "generated_at": datetime.now(UTC).isoformat(),
+            "bottles": bottle_dicts,
+            "metadata": [m.to_dict() for m in metadata_list],
+            "rejected": rejected,
+        }
+        with open(json_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps(batch_data, indent=2, ensure_ascii=False, default=str))
+        logger.info("Saved batch data to %s", json_path)
+
         return output_path
+
+    def save_failure_report(
+        self,
+        bottle_id: str,
+        images: List[str],
+        error: Union[BaseException, str],
+        stage: str,
+        retry_count: int = 0,
+    ) -> Path:
+        """Write a per-bottle failure report that ``retry --report`` can read.
+
+        The report is ``<output_dir>/error_report_<bottle_id>[_N].json`` (an
+        existing report is never overwritten) and holds ``bottle_id``,
+        ``images`` (absolute paths) and ``error_message``, plus error type,
+        stage, hint, details and timestamp.
+
+        Args:
+            bottle_id: Bottle identifier (primary image stem).
+            images: All image paths of the bottle.
+            error: The exception, or a description of the failure.
+            stage: Where it failed: 'analysis', 'save' or 'rejected'.
+            retry_count: Retries already attempted.
+
+        Returns:
+            Path to the written report.
+        """
+        if isinstance(error, BaseException):
+            error_message = f"{type(error).__name__}: {error}"
+            info = create_error_report(error)
+            error_type, hint = info.error_type.name, info.hint
+            details = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+        else:
+            error_message = str(error)
+            error_type, hint, details = "UNKNOWN", None, None
+
+        absolute_images = []
+        for image in images:
+            try:
+                absolute_images.append(str(Path(image).absolute()))
+            except (TypeError, ValueError):
+                absolute_images.append(str(image))
+
+        report = {
+            "schema_version": OUTPUT_SCHEMA_VERSION,
+            "bottle_id": bottle_id,
+            "images": absolute_images,
+            "error_message": error_message,
+            "error_type": error_type,
+            "stage": stage,
+            "hint": hint,
+            "details": details,
+            "timestamp": datetime.now(UTC).isoformat(),
+            "retry_count": retry_count,
+            "suggested_fix": {},
+        }
+
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        stem = f"error_report_{slugify(bottle_id, fallback='unknown')}"
+        text = json.dumps(report, indent=2, ensure_ascii=False, default=str) + "\n"
+        report_path = self._publish_new_file(stem, ".json", text)
+        logger.info("Saved %s failure report for %s to %s", stage, bottle_id, report_path)
+        return report_path
+
+    def _publish_new_file(self, stem: str, suffix: str, text: str) -> Path:
+        """Write ``text`` to the first free ``<stem>[_N]<suffix>`` in ``output_dir``.
+
+        The content is written to a hidden temporary file first (created with
+        ``open(..., 'x')`` so it gets umask-derived permissions) and then
+        hard-linked to the final name. ``os.link`` fails instead of replacing
+        an existing file, so a report written concurrently by another run is
+        never overwritten: the next suffix is tried. On a filesystem without
+        hard links the final name is created directly with mode ``'x'``.
+
+        Returns:
+            Path of the published file.
+        """
+        tmp: Optional[Path] = None
+        for _ in range(100):
+            candidate = self.output_dir / f".{stem}.{uuid.uuid4().hex}.tmp"
+            try:
+                with candidate.open("x", encoding="utf-8") as f:
+                    f.write(text)
+            except FileExistsError:
+                continue
+            tmp = candidate
+            break
+        if tmp is None:
+            raise FileExistsError(f"Could not create a temporary file in {self.output_dir}")
+
+        try:
+            target = _unique_path(self.output_dir, stem, suffix)
+            for _ in range(_MAX_NAME_SUFFIX):
+                try:
+                    os.link(tmp, target)
+                    return target
+                except FileExistsError:
+                    target = _unique_path(self.output_dir, stem, suffix)
+                except OSError:
+                    # No hard links here (e.g. some network/FAT filesystems):
+                    # create the final file exclusively instead.
+                    logger.debug("Hard link not supported in %s", self.output_dir, exc_info=True)
+                    break
+            while True:
+                try:
+                    with target.open("x", encoding="utf-8") as f:
+                        f.write(text)
+                    return target
+                except FileExistsError:
+                    target = _unique_path(self.output_dir, stem, suffix)
+        finally:
+            tmp.unlink(missing_ok=True)
 
     def save_batch_preview_report(
         self,
@@ -471,7 +875,7 @@ class PreviewGenerator:
 
         for i, (bottle_dict, metadata) in enumerate(zip(bottle_dicts, metadata_list), 1):
             # Display bottle identifier
-            bottle_id = Path(metadata.source_images[0]).stem if metadata.source_images else f"bottle_{i}"
+            bottle_id = self.bottle_id_for(bottle_dict, metadata)
             print("-" * 70)
             print(f"Bottle {i}/{len(bottle_dicts)} - ID: {bottle_id}")
             print("-" * 70)
@@ -479,7 +883,7 @@ class PreviewGenerator:
             # Display key bottle information
             print(f"\nName:        {bottle_dict.get('name', 'Unknown')}")
             print(f"Distillery:  {bottle_dict.get('distillery', 'Unknown')}")
-            print(f"MSRP:        ${bottle_dict.get('msrp', '0.00')}")
+            print(f"MSRP:        {format_money(parse_money(bottle_dict.get('msrp')))}")
 
             # Display optional fields if present
             proof = bottle_dict.get("proof")
@@ -563,7 +967,7 @@ class PreviewGenerator:
                                 "original_value": str(current),
                                 "corrected_value": new_value,
                                 "bottle_id": bottle_id,
-                                "corrected_at": datetime.utcnow().isoformat(),
+                                "corrected_at": datetime.now(UTC).isoformat(),
                             }
                         )
                         # Update bottle dict for display
@@ -618,7 +1022,7 @@ class PreviewGenerator:
                 "original_value": "accepted",
                 "corrected_value": "rejected",
                 "bottle_id": bottle_id,
-                "corrected_at": datetime.utcnow().isoformat(),
+                "corrected_at": datetime.now(UTC).isoformat(),
             }
         elif action == "M":
             # Merge with previous bottle
@@ -629,7 +1033,7 @@ class PreviewGenerator:
                     "original_value": f"separate_{bottle_index}",
                     "corrected_value": f"merge_with_{prev_id}",
                     "bottle_id": bottle_id,
-                    "corrected_at": datetime.utcnow().isoformat(),
+                    "corrected_at": datetime.now(UTC).isoformat(),
                 }
             else:
                 logger.warning("Cannot merge first bottle (no previous bottle to merge with)")
@@ -641,7 +1045,7 @@ class PreviewGenerator:
                 "original_value": f"grouped_{bottle_index}",
                 "corrected_value": "split",
                 "bottle_id": bottle_id,
-                "corrected_at": datetime.utcnow().isoformat(),
+                "corrected_at": datetime.now(UTC).isoformat(),
             }
         elif action == "E":
             # Edit - requires additional context (field-specific)
@@ -651,7 +1055,7 @@ class PreviewGenerator:
                 "original_value": "",
                 "corrected_value": "enter_edit_mode",
                 "bottle_id": bottle_id,
-                "corrected_at": datetime.utcnow().isoformat(),
+                "corrected_at": datetime.now(UTC).isoformat(),
             }
         else:
             logger.warning("Unknown choice '%s', treating as Accept", choice)

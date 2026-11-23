@@ -1,17 +1,27 @@
 """Unit tests for BatchProcessor class.
 
-Tests batch slicing, lookahead algorithm, vision similarity scoring,
-batch processing, and user feedback integration.
+Tests batch slicing, the deprecated lookahead no-op, the same-bottle split
+check (backstop), batch processing, and user feedback integration.
 """
 
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-import numpy as np
 import pytest
 
-from image_processor.batch_processor import BatchProcessor, BatchResult
+from image_processor.batch_processor import (
+    ADJACENT_SAME_HINT,
+    FALSE_ALARM_HINT,
+    MIN_SPLIT_BUDGET_CALLS,
+    SPLIT_BUDGET_WARNING,
+    BatchProcessor,
+    BatchResult,
+    photo_units,
+    split_budget_for,
+    split_group_at_largest_gap,
+)
+from image_processor.bottle_analyzer import MIXED_GROUP_WARNING
 from models.bottle import Correction, ExtractedMetadata
 from models.image import Image
 
@@ -163,332 +173,394 @@ class TestBatchProcessorSliceIntoBatches:
 
 
 class TestBatchProcessorApplyLookahead:
-    """Test lookahead algorithm for multi-angle grouping."""
+    """Lookahead is deprecated: grouping by capture time keeps bottles inside one batch."""
 
-    def setup_method(self):
-        """Set up test fixtures."""
-        self.processor = BatchProcessor(batch_size=2, lookahead=3)
-
-    def test_lookahead_empty_current_batch(self):
-        """Test lookahead with empty current batch."""
-        current_batch = []
-        remaining_groups = [[Image(path=Path("/test/image1.jpg"))]]
-
-        new_batch, new_remaining = self.processor.apply_lookahead(
-            current_batch, remaining_groups
-        )
-
-        assert new_batch == []
-        assert new_remaining == remaining_groups
-
-    def test_lookahead_empty_remaining(self):
-        """Test lookahead with no remaining groups."""
+    def test_apply_lookahead_is_a_noop(self):
+        processor = BatchProcessor(batch_size=2, lookahead=3)
         current_batch = [[Image(path=Path("/test/image1.jpg"))]]
-        remaining_groups = []
+        remaining_groups = [[Image(path=Path(f"/test/image{i}.jpg"))] for i in range(2, 6)]
 
-        new_batch, new_remaining = self.processor.apply_lookahead(
-            current_batch, remaining_groups
+        new_batch, new_remaining = processor.apply_lookahead(current_batch, remaining_groups)
+
+        assert new_batch is current_batch
+        assert new_remaining is remaining_groups
+
+    def test_orb_similarity_removed(self):
+        assert not hasattr(BatchProcessor, "vision_similarity_score")
+
+
+# --- same-bottle split check ("backstop") ----------------------------------
+
+STAGG = {"name": "George T. Stagg", "distillery": "Buffalo Trace", "proof": "135.4 Proof"}
+
+
+def _photos(times, prefix="IMG_", bottle_ref=None):
+    """Images named IMG_0..IMG_n with the given capture times (None = untimed)."""
+    return [
+        Image(path=Path(f"/shoot/{prefix}{k}.jpg"), capture_time=t, bottle_ref=bottle_ref)
+        for k, t in enumerate(times)
+    ]
+
+
+class FakeAnalyzer:
+    """Stands in for BottleAnalyzer.process_single_bottle.
+
+    ``label_of`` maps a photo name to the label fields it shows. A call with
+    photos of more than one label reports ``same_bottle=False`` and the
+    majority label (as the real model is asked to); ``mixed_always`` makes
+    every multi-photo call report False (an over-eager model).
+    """
+
+    def __init__(self, label_of, mixed_always=False, fail_on=None):
+        self.label_of = label_of
+        self.mixed_always = mixed_always
+        self.fail_on = fail_on or {}
+        self.calls: list[list[str]] = []
+
+    def process_single_bottle(self, images, vision_model=None):
+        names = [Path(img.path).name for img in images]
+        self.calls.append(names)
+        error = self.fail_on.get(tuple(names))
+        if error is not None:
+            raise error
+        sent = [n for img, n in zip(images, names) if not img.is_duplicate and not img.near_duplicate_of]
+        labels = [self.label_of[n] for n in sent]
+        keys = [tuple(sorted(lbl.items())) for lbl in labels]
+        majority = dict(max(set(keys), key=keys.count))
+        mixed = len(sent) > 1 and (self.mixed_always or len(set(keys)) > 1)
+        metadata = ExtractedMetadata(
+            **majority,
+            source_images=[str(img.path) for img in images],
+            same_bottle=(not mixed) if len(sent) > 1 else None,
+            warnings=[MIXED_GROUP_WARNING] if mixed else [],
+        )
+        bottle_dict = {"name": majority.get("name", "Unknown"), "images": [str(img.path) for img in images]}
+        return bottle_dict, metadata
+
+
+def _names(result):
+    return [[Path(p).name for p in d["images"]] for d in result.bottle_dicts]
+
+
+class TestSplitBudget:
+    def test_budget_formula(self):
+        assert split_budget_for(0, 0.35) == 0
+        assert split_budget_for(10, 0) == 0
+        assert split_budget_for(1, 0.35) == MIN_SPLIT_BUDGET_CALLS
+        assert split_budget_for(20, 0.35) == 7  # not 8 from float noise
+        assert split_budget_for(52, 0.35) == 19
+        assert split_budget_for(52, 0.5) == 26
+
+    @pytest.mark.parametrize("ratio", [-0.1, 2.5])
+    def test_ratio_out_of_range_rejected(self, ratio):
+        with pytest.raises(ValueError, match="split_budget_ratio"):
+            BatchProcessor(bottle_analyzer=Mock(), split_budget_ratio=ratio)
+
+    def test_budget_shared_across_batches_and_exhausted_warns(self):
+        """One budget for the run: 10 groups -> 4 calls -> two splits, the third mixed group is kept."""
+        groups = []
+        labels = {}
+        for g in range(10):
+            imgs = _photos([0.0, 2.0], prefix=f"G{g}_", bottle_ref=f"G{g}_0")
+            groups.append(imgs)
+            mixed = g in (0, 4, 8)  # one mixed group in each of three batches
+            labels[f"G{g}_0.jpg"] = {**STAGG, "batch_number": "23A"}
+            labels[f"G{g}_1.jpg"] = {**STAGG, "batch_number": "23C" if mixed else "23A"}
+        analyzer = FakeAnalyzer(labels)
+        processor = BatchProcessor(batch_size=4, bottle_analyzer=analyzer, split_budget_ratio=0.35)
+
+        assert processor.start_run(groups) == 4
+        results = [processor.process_batch(batch) for batch in processor.slice_into_batches(groups)]
+
+        assert [len(r.bottle_dicts) for r in results] == [5, 5, 2]  # groups 0 and 4 split, 8 not
+        assert len(analyzer.calls) == 10 + 4
+        assert processor.split_calls_used == 4
+        assert processor.split_calls_remaining == 0
+        kept = results[2].metadata_list[0]
+        assert SPLIT_BUDGET_WARNING in kept.warnings
+        assert MIXED_GROUP_WARNING in kept.warnings
+        assert processor.split_stats["over_budget"] == 1
+        assert "2 split" in processor.split_summary()
+
+    def test_process_batch_without_start_run_still_bounded(self):
+        labels = {"IMG_0.jpg": {**STAGG, "batch_number": "23A"}, "IMG_1.jpg": {**STAGG, "batch_number": "23C"}}
+        analyzer = FakeAnalyzer(labels)
+        processor = BatchProcessor(bottle_analyzer=analyzer)
+
+        processor.process_batch([_photos([0.0, 4.0])])
+        first_budget = processor.split_budget
+        processor.process_batch([_photos([0.0, 4.0])])
+
+        assert first_budget == MIN_SPLIT_BUDGET_CALLS
+        assert processor.split_calls_used == 4  # second batch drew from the same budget
+        assert len(analyzer.calls) == 6
+
+    def test_ratio_zero_disables_split_check(self):
+        labels = {"IMG_0.jpg": {**STAGG, "batch_number": "23A"}, "IMG_1.jpg": {**STAGG, "batch_number": "23C"}}
+        analyzer = FakeAnalyzer(labels)
+        processor = BatchProcessor(bottle_analyzer=analyzer, split_budget_ratio=0)
+
+        result = processor.process_batch([_photos([0.0, 4.0])])
+
+        assert len(analyzer.calls) == 1
+        assert len(result.bottle_dicts) == 1
+        assert SPLIT_BUDGET_WARNING not in result.metadata_list[0].warnings
+
+
+class TestSameBottleSplitCheck:
+    def test_same_bottle_true_costs_one_call(self):
+        labels = {f"IMG_{k}.jpg": STAGG for k in range(3)}
+        analyzer = FakeAnalyzer(labels)
+
+        result = BatchProcessor(bottle_analyzer=analyzer).process_batch([_photos([0.0, 3.0, 6.0])])
+
+        assert len(analyzer.calls) == 1
+        assert _names(result) == [["IMG_0.jpg", "IMG_1.jpg", "IMG_2.jpg"]]
+
+    def test_split_at_largest_gap_into_distinct_bottles(self):
+        """Gaps [2, 9, 2]: split between photos 1 and 2; Stagg 23A vs 23C stays split."""
+        labels = {
+            "IMG_0.jpg": {**STAGG, "batch_number": "23A"},
+            "IMG_1.jpg": {**STAGG, "batch_number": "23A"},
+            "IMG_2.jpg": {**STAGG, "batch_number": "23C"},
+            "IMG_3.jpg": {**STAGG, "batch_number": "23C"},
+        }
+        analyzer = FakeAnalyzer(labels)
+        group = _photos([0.0, 2.0, 11.0, 13.0], bottle_ref="IMG_0")
+        processor = BatchProcessor(bottle_analyzer=analyzer)
+        processor.start_run([group])
+
+        result = processor.process_batch([group])
+
+        assert len(analyzer.calls) == 3
+        assert _names(result) == [["IMG_0.jpg", "IMG_1.jpg"], ["IMG_2.jpg", "IMG_3.jpg"]]
+        assert [m.batch_number for m in result.metadata_list] == ["23A", "23C"]
+        assert [d["bottle_id"] for d in result.bottle_dicts] == ["IMG_0", "IMG_2"]
+        assert [img.bottle_ref for img in group] == ["IMG_0", "IMG_0", "IMG_2", "IMG_2"]
+        for metadata in result.metadata_list:
+            assert any(w.startswith("Split from a group of 4 photos") for w in metadata.warnings)
+            assert "batch_number differ" in metadata.warnings[-1]
+        assert result.failed_bottles == []
+
+    def test_split_part_id_never_collides_with_another_group(self):
+        labels = {"IMG_0.jpg": {**STAGG, "batch_number": "23A"}, "IMG_1.jpg": {**STAGG, "batch_number": "23C"}}
+        group = _photos([0.0, 5.0], bottle_ref="IMG_0")
+        other = [Image(path=Path("/elsewhere/IMG_1.jpg"), bottle_ref="IMG_1")]
+        processor = BatchProcessor(bottle_analyzer=FakeAnalyzer({**labels}))
+        processor.start_run([group, other])
+
+        result = processor.process_batch([group])
+
+        new_id = result.bottle_dicts[1]["bottle_id"]
+        assert new_id.startswith("IMG_1_") and new_id != "IMG_1"
+
+    def test_false_alarm_keeps_one_bottle_with_review_hint(self):
+        """Front shows no batch, back shows 23A: wildcard, same bottle -> merged result kept."""
+        labels = {
+            "IMG_0.jpg": {**STAGG},
+            "IMG_1.jpg": {**STAGG, "batch_number": "23A"},
+        }
+        analyzer = FakeAnalyzer(labels)  # different label dicts -> the group call says mixed
+
+        result = BatchProcessor(bottle_analyzer=analyzer).process_batch([_photos([0.0, 7.0])])
+
+        assert len(analyzer.calls) == 3
+        assert _names(result) == [["IMG_0.jpg", "IMG_1.jpg"]]
+        warnings = result.metadata_list[0].warnings
+        assert FALSE_ALARM_HINT in warnings
+        assert MIXED_GROUP_WARNING not in warnings
+        # Persisted data must not still claim the photos are mixed.
+        assert result.metadata_list[0].same_bottle is None
+        assert result.metadata_list[0].to_dict()["same_bottle"] is None
+
+    def test_over_eager_model_does_not_tear_one_bottle_apart(self):
+        """Every multi-photo call says mixed, but all photos read the same: one bottle."""
+        labels = {f"IMG_{k}.jpg": STAGG for k in range(3)}
+        analyzer = FakeAnalyzer(labels, mixed_always=True)
+        processor = BatchProcessor(bottle_analyzer=analyzer)
+
+        result = processor.process_batch([_photos([0.0, 2.0, 9.0])])
+
+        # [0,1,2] -> [0,1] | [2]; [0,1] still "mixed" -> [0] | [1] agree, so [0,1]
+        # is one bottle; it agrees with [2] too, so the whole group is one bottle.
+        assert _names(result) == [["IMG_0.jpg", "IMG_1.jpg", "IMG_2.jpg"]]
+        assert len(analyzer.calls) == 5
+        metadata = result.metadata_list[0]
+        assert FALSE_ALARM_HINT in metadata.warnings
+        assert metadata.same_bottle is None
+        assert not any(w.startswith("Split from") for w in metadata.warnings)
+        assert (processor.split_stats["flagged"], processor.split_stats["false_alarm"]) == (1, 1)
+        assert processor.split_stats["split"] == 0
+
+    def test_half_still_mixed_and_really_mixed_keeps_split(self):
+        """Left half [0,1] mixes 23A/23C (no conflict with the right half's majority): split kept."""
+        labels = {
+            "IMG_0.jpg": {**STAGG, "batch_number": "23A"},
+            "IMG_1.jpg": {**STAGG, "batch_number": "23C"},
+            "IMG_2.jpg": {**STAGG, "batch_number": "23C"},
+        }
+        analyzer = FakeAnalyzer(labels, mixed_always=True)
+        processor = BatchProcessor(bottle_analyzer=analyzer)
+
+        result = processor.process_batch([_photos([0.0, 2.0, 9.0])])
+
+        # [0,1] reads 23A or 23C as majority; either way [0] vs [1] conflict on batch.
+        assert _names(result) == [["IMG_0.jpg"], ["IMG_1.jpg"], ["IMG_2.jpg"]]
+        assert processor.split_stats["flagged"] == 1  # nested checks do not count as groups
+        assert processor.split_stats["split"] == 1
+
+    def test_recursion_stops_at_single_photos(self):
+        """Worst case for n photos is 1 + 2(n-1) calls; no single photo is analyzed twice."""
+        n = 6
+        labels = {f"IMG_{k}.jpg": {**STAGG, "batch_number": f"B{k}"} for k in range(n)}
+        analyzer = FakeAnalyzer(labels)
+        group = _photos([3.0 * k for k in range(n)])
+        processor = BatchProcessor(bottle_analyzer=analyzer, split_budget_ratio=2.0)
+        processor.start_run([group] * 10)  # budget 20, enough for everything
+
+        result = processor.process_batch([group])
+
+        assert sorted(_names(result)) == [[f"IMG_{k}.jpg"] for k in range(n)]
+        assert len(analyzer.calls) == 1 + 2 * (n - 1)
+        assert (processor.split_stats["flagged"], processor.split_stats["split"]) == (1, 1)
+        assert "1 group(s) flagged as mixed, 1 split" in processor.split_summary()
+        singles = [tuple(c) for c in analyzer.calls if len(c) == 1]
+        assert len(singles) == len(set(singles)) == n
+
+    def test_single_photo_never_re_asked(self):
+        analyzer = Mock()
+        analyzer.process_single_bottle.return_value = (
+            {"name": "X"},
+            ExtractedMetadata(name="X", same_bottle=False),  # meaningless for one photo
         )
 
-        assert new_batch == current_batch
-        assert new_remaining == []
+        result = BatchProcessor(bottle_analyzer=analyzer).process_batch([_photos([0.0])])
 
-    def test_lookahead_no_similar_images(self):
-        """Test lookahead with no similar images in peek window."""
-        current_batch = [[Image(path=Path("/test/image1.jpg"))]]
-        remaining_groups = [
-            [Image(path=Path(f"/test/image{i}.jpg"))] for i in range(2, 6)
-        ]
+        assert analyzer.process_single_bottle.call_count == 1
+        assert len(result.bottle_dicts) == 1
 
-        # Mock vision_similarity_score to return 0 (no similarity)
-        with patch.object(
-            self.processor, "vision_similarity_score", return_value=0.0
-        ):
-            new_batch, new_remaining = self.processor.apply_lookahead(
-                current_batch, remaining_groups
-            )
+    def test_duplicates_and_burst_retakes_stay_with_their_original(self):
+        group = _photos([0.0, None, 1.0, 9.0])
+        group[1].is_duplicate = True  # exact copy of IMG_0, placed right after it
+        group[2].near_duplicate_of = str(group[0].path)
 
-        assert new_batch == current_batch
-        assert new_remaining == remaining_groups
+        left, right = split_group_at_largest_gap(group)
 
-    def test_lookahead_moves_similar_group(self):
-        """Test lookahead moves similar group to current batch."""
-        current_batch = [[Image(path=Path("/test/image1.jpg"))]]
-        remaining_groups = [
-            [Image(path=Path("/test/image2.jpg"))],  # Similar
-            [Image(path=Path("/test/image3.jpg"))],
-        ]
+        assert [Path(i.path).name for i in left] == ["IMG_0.jpg", "IMG_1.jpg", "IMG_2.jpg"]
+        assert [Path(i.path).name for i in right] == ["IMG_3.jpg"]
+        assert len(photo_units(group)) == 2
 
-        # Mock vision_similarity_score: first remaining group similar
-        with patch.object(
-            self.processor, "vision_similarity_score", side_effect=[0.85, 0.0]
-        ):
-            new_batch, new_remaining = self.processor.apply_lookahead(
-                current_batch, remaining_groups
-            )
+    def test_untimed_group_splits_in_the_middle(self):
+        left, right = split_group_at_largest_gap(_photos([None, None, None, None]))
+        assert len(left) == 2 and len(right) == 2
 
-        assert len(new_batch) == 2
-        assert len(new_remaining) == 1
-        assert new_batch[1] == remaining_groups[0]
+    def test_failed_split_check_keeps_group_with_warning(self):
+        from lib.exceptions import VisionResponseError
 
-    def test_lookahead_multiple_similar_groups(self):
-        """Test lookahead moves multiple similar groups."""
-        current_batch = [[Image(path=Path("/test/image1.jpg"))]]
-        remaining_groups = [
-            [Image(path=Path("/test/image2.jpg"))],  # Similar
-            [Image(path=Path("/test/image3.jpg"))],  # Similar
-            [Image(path=Path("/test/image4.jpg"))],
-        ]
+        labels = {"IMG_0.jpg": {**STAGG, "batch_number": "23A"}, "IMG_1.jpg": {**STAGG, "batch_number": "23C"}}
+        analyzer = FakeAnalyzer(labels, fail_on={("IMG_1.jpg",): VisionResponseError("no content")})
 
-        # Mock: first two groups similar
-        with patch.object(
-            self.processor,
-            "vision_similarity_score",
-            side_effect=[0.85, 0.9, 0.0],
-        ):
-            new_batch, new_remaining = self.processor.apply_lookahead(
-                current_batch, remaining_groups
-            )
+        result = BatchProcessor(bottle_analyzer=analyzer).process_batch([_photos([0.0, 5.0])])
 
-        assert len(new_batch) == 3
-        assert len(new_remaining) == 1
+        assert len(result.bottle_dicts) == 1
+        assert result.failed_bottles == []
+        assert any("split check failed (VisionResponseError: no content)" in w for w in result.metadata_list[0].warnings)
 
-    def test_lookahead_respects_lookahead_window(self):
-        """Test lookahead only checks within lookahead window."""
-        processor = BatchProcessor(batch_size=2, lookahead=2)
-        current_batch = [[Image(path=Path("/test/image1.jpg"))]]
-        remaining_groups = [
-            [Image(path=Path(f"/test/image{i}.jpg"))] for i in range(2, 7)
-        ]  # 5 groups
+    def test_fatal_error_in_split_check_propagates(self):
+        from lib.exceptions import OllamaConnectionError
 
-        # Mock: all check similar, but only first 2 in window
-        with patch.object(
-            processor, "vision_similarity_score", return_value=0.85
-        ):
-            new_batch, new_remaining = processor.apply_lookahead(
-                current_batch, remaining_groups
-            )
+        labels = {"IMG_0.jpg": {**STAGG, "batch_number": "23A"}, "IMG_1.jpg": {**STAGG, "batch_number": "23C"}}
+        analyzer = FakeAnalyzer(labels, fail_on={("IMG_0.jpg",): OllamaConnectionError("gone")})
 
-        # Should only move 2 groups (lookahead window)
-        assert len(new_batch) == 3
-        assert len(new_remaining) == 3
+        with pytest.raises(OllamaConnectionError):
+            BatchProcessor(bottle_analyzer=analyzer).process_batch([_photos([0.0, 5.0])])
 
-    def test_lookahead_lookahead_zero(self):
-        """Test lookahead=0 returns unchanged batches."""
-        processor = BatchProcessor(batch_size=2, lookahead=0)
-        current_batch = [[Image(path=Path("/test/image1.jpg"))]]
-        remaining_groups = [
-            [Image(path=Path(f"/test/image{i}.jpg"))] for i in range(2, 4)
-        ]
 
-        new_batch, new_remaining = processor.apply_lookahead(
-            current_batch, remaining_groups
+class TestAdjacentSameBottleHint:
+    """Report-only 'possibly the same bottle' hints and the --group-max-size nudge."""
+
+    def _run(self, groups, labels, batch_size=5, max_group_size=3, **kwargs):
+        processor = BatchProcessor(
+            batch_size=batch_size,
+            bottle_analyzer=FakeAnalyzer(labels, **kwargs),
+            max_group_size=max_group_size,
         )
+        processor.start_run(groups)
+        results = [processor.process_batch(batch) for batch in processor.slice_into_batches(groups)]
+        return processor, results
 
-        assert new_batch == current_batch
-        assert new_remaining == remaining_groups
+    @staticmethod
+    def _group(prefix, times):
+        return _photos(times, prefix=prefix, bottle_ref=f"{prefix}0")
 
-    def test_lookahead_edge_case_empty_candidate_group(self):
-        """Test lookahead handles empty candidate groups gracefully."""
-        current_batch = [[Image(path=Path("/test/image1.jpg"))]]
-        remaining_groups = [[], [Image(path=Path("/test/image2.jpg"))]]
+    def test_adjacent_identical_label_gets_hint_across_batches_never_merged(self):
+        """Blanton's box+bottle split 3+2 by the cap, and by the batch boundary too."""
+        first = self._group("A_", [0.0, 4.0, 8.0])
+        second = self._group("B_", [40.0, 44.0])
+        labels = {f"{p}{k}.jpg": {"name": "Blanton's", "proof": "93"} for p in ("A_", "B_") for k in range(3)}
 
-        new_batch, new_remaining = self.processor.apply_lookahead(
-            current_batch, remaining_groups
-        )
+        processor, results = self._run([first, second], labels, batch_size=1)
 
-        assert len(new_batch) == 1
-        assert len(new_remaining) == 2
+        assert [len(r.bottle_dicts) for r in results] == [1, 1]  # not merged
+        expected = ADJACENT_SAME_HINT.format(bottle_id="A_0")
+        assert expected in results[1].metadata_list[0].warnings
+        assert expected.startswith("Possibly the same bottle as A_0 (adjacent photos, identical label)")
+        assert results[0].metadata_list[0].warnings == []
+        assert processor.split_stats["adjacent_hint"] == 1
+        assert processor.split_stats["adjacent_hint_at_cap"] == 1
+        nudge = processor.group_size_nudge()
+        assert nudge is not None and "--group-max-size 4" in nudge
 
+    @pytest.mark.parametrize(
+        ("second_times", "second_label"),
+        [
+            ([75.0, 79.0], {"name": "Blanton's", "proof": "93"}),  # 67 s after: too far
+            ([40.0, 44.0], {"name": "Blanton's", "proof": "103"}),  # proof read on both differs
+            ([40.0, 44.0], {"name": "Eagle Rare"}),  # different name
+            ([None, None], {"name": "Blanton's", "proof": "93"}),  # untimed
+            ([40.0, 44.0], {"proof": "93"}),  # no name read: would match anything
+        ],
+    )
+    def test_no_hint(self, second_times, second_label):
+        first = self._group("A_", [0.0, 4.0, 8.0])
+        second = self._group("B_", second_times)
+        labels = {f"A_{k}.jpg": {"name": "Blanton's", "proof": "93"} for k in range(3)}
+        labels.update({f"B_{k}.jpg": second_label for k in range(2)})
 
-class TestBatchProcessorVisionSimilarityScore:
-    """Test ORB feature matching similarity scoring."""
+        processor, results = self._run([first, second], labels)
 
-    def setup_method(self):
-        """Set up test fixtures."""
-        self.processor = BatchProcessor()
+        assert not any(w.startswith("Possibly the same bottle") for m in results[0].metadata_list for w in m.warnings)
+        assert processor.split_stats["adjacent_hint"] == 0
+        assert processor.group_size_nudge() is None
 
-    @patch("cv2.imread")
-    @patch("cv2.cvtColor")
-    @patch("cv2.ORB_create")
-    @patch("cv2.BFMatcher")
-    def test_similarity_score_identical_images(
-        self, mock_bf, mock_orb, mock_cvtcolor, mock_imread
-    ):
-        """Test identical images return high similarity."""
-        # Mock image loading
-        mock_img = np.zeros((100, 100, 3), dtype=np.uint8)
-        mock_imread.return_value = mock_img
+    def test_failed_bottle_breaks_adjacency(self):
+        from lib.exceptions import VisionResponseError
 
-        # Mock grayscale conversion
-        mock_gray = np.zeros((100, 100), dtype=np.uint8)
-        mock_cvtcolor.return_value = mock_gray
+        groups = [self._group("A_", [0.0]), self._group("F_", [10.0]), self._group("B_", [20.0])]
+        labels = {"A_0.jpg": {"name": "Weller"}, "F_0.jpg": {"name": "Weller"}, "B_0.jpg": {"name": "Weller"}}
+        processor, results = self._run(groups, labels, fail_on={("F_0.jpg",): VisionResponseError("x")})
 
-        # Mock ORB detector
-        mock_orb_instance = Mock()
-        mock_orb.return_value = mock_orb_instance
+        assert results[0].failed_bottles == ["F_0"]
+        assert processor.split_stats["adjacent_hint"] == 0
 
-        # Mock descriptor detection: 10 descriptors, all zeros (identical)
-        num_descriptors = 10
-        descriptor_size = 32
-        mock_descriptors = np.zeros((num_descriptors, descriptor_size), dtype=np.uint8)
-        mock_orb_instance.detectAndCompute.return_value = ([], mock_descriptors)
+    def test_nudge_needs_a_quarter_of_hints_at_cap(self):
+        # Four singles 10 s apart with the same label: 3 hints, none at cap 3.
+        groups = [self._group(f"S{g}_", [10.0 * g]) for g in range(4)]
+        labels = {f"S{g}_0.jpg": {"name": "Elmer T. Lee"} for g in range(4)}
+        processor, _ = self._run(groups, labels)
+        assert processor.split_stats["adjacent_hint"] == 3
+        assert processor.group_size_nudge() is None
 
-        # Mock matcher: matches with zero distance (identical)
-        mock_matcher = Mock()
-        mock_matches = [Mock(distance=0.0) for _ in range(num_descriptors)]
-        mock_matcher.match.return_value = mock_matches
-        mock_bf.return_value = mock_matcher
+        # Same, but one group is a full triple: 2 of 3 hints touch it (>= 25%).
+        groups[1] = self._group("S1_", [10.0, 12.0, 14.0])
+        labels.update({f"S1_{k}.jpg": {"name": "Elmer T. Lee"} for k in range(3)})
+        processor, _ = self._run(groups, labels)
+        assert (processor.split_stats["adjacent_hint"], processor.split_stats["adjacent_hint_at_cap"]) == (3, 2)
+        assert "consider --group-max-size 4" in processor.group_size_nudge()
 
-        similarity = self.processor.vision_similarity_score(
-            "/test/image1.jpg", "/test/image2.jpg"
-        )
-
-        assert similarity == 1.0
-
-    @patch("cv2.imread")
-    @patch("cv2.cvtColor")
-    @patch("cv2.ORB_create")
-    @patch("cv2.BFMatcher")
-    def test_similarity_score_different_images(
-        self, mock_bf, mock_orb, mock_cvtcolor, mock_imread
-    ):
-        """Test different images return low similarity."""
-        mock_img = np.zeros((100, 100, 3), dtype=np.uint8)
-        mock_imread.return_value = mock_img
-
-        mock_gray = np.zeros((100, 100), dtype=np.uint8)
-        mock_cvtcolor.return_value = mock_gray
-
-        mock_orb_instance = Mock()
-        mock_orb.return_value = mock_orb_instance
-
-        # Mock descriptors with maximum distance (all bits different)
-        num_descriptors = 10
-        descriptor_size = 32
-        mock_descriptors1 = np.zeros((num_descriptors, descriptor_size), dtype=np.uint8)
-        mock_descriptors2 = np.ones((num_descriptors, descriptor_size), dtype=np.uint8)
-
-        # First call returns des1, second returns des2
-        mock_orb_instance.detectAndCompute.side_effect = [
-            ([], mock_descriptors1),
-            ([], mock_descriptors2),
-        ]
-
-        mock_matcher = Mock()
-        # Maximum Hamming distance for 32-byte descriptors
-        mock_matches = [Mock(distance=256.0) for _ in range(num_descriptors)]
-        mock_matcher.match.return_value = mock_matches
-        mock_bf.return_value = mock_matcher
-
-        similarity = self.processor.vision_similarity_score(
-            "/test/image1.jpg", "/test/image2.jpg"
-        )
-
-        assert similarity == pytest.approx(0.0, abs=0.01)
-
-    @patch("cv2.imread")
-    def test_similarity_score_load_failure(self, mock_imread):
-        """Test image load failure returns zero similarity."""
-        mock_imread.return_value = None
-
-        similarity = self.processor.vision_similarity_score(
-            "/test/image1.jpg", "/test/image2.jpg"
-        )
-
-        assert similarity == 0.0
-
-    @patch("cv2.imread")
-    @patch("cv2.cvtColor")
-    @patch("cv2.ORB_create")
-    def test_similarity_score_insufficient_descriptors(
-        self, mock_orb, mock_cvtcolor, mock_imread
-    ):
-        """Test insufficient descriptors return zero similarity."""
-        mock_img = np.zeros((100, 100, 3), dtype=np.uint8)
-        mock_imread.return_value = mock_img
-
-        mock_gray = np.zeros((100, 100), dtype=np.uint8)
-        mock_cvtcolor.return_value = mock_gray
-
-        mock_orb_instance = Mock()
-        mock_orb.return_value = mock_orb_instance
-
-        # Only 3 descriptors (below threshold of 5)
-        mock_descriptors = np.zeros((3, 32), dtype=np.uint8)
-        mock_orb_instance.detectAndCompute.return_value = ([], mock_descriptors)
-
-        similarity = self.processor.vision_similarity_score(
-            "/test/image1.jpg", "/test/image2.jpg"
-        )
-
-        assert similarity == 0.0
-
-    @patch("cv2.imread")
-    @patch("cv2.cvtColor")
-    @patch("cv2.ORB_create")
-    def test_similarity_score_no_descriptors(
-        self, mock_orb, mock_cvtcolor, mock_imread
-    ):
-        """Test no descriptors detected return zero similarity."""
-        mock_img = np.zeros((100, 100, 3), dtype=np.uint8)
-        mock_imread.return_value = mock_img
-
-        mock_gray = np.zeros((100, 100), dtype=np.uint8)
-        mock_cvtcolor.return_value = mock_gray
-
-        mock_orb_instance = Mock()
-        mock_orb.return_value = mock_orb_instance
-
-        # No descriptors (None)
-        mock_orb_instance.detectAndCompute.return_value = ([], None)
-
-        similarity = self.processor.vision_similarity_score(
-            "/test/image1.jpg", "/test/image2.jpg"
-        )
-
-        assert similarity == 0.0
-
-    @patch("cv2.imread")
-    @patch("cv2.cvtColor")
-    @patch("cv2.ORB_create")
-    @patch("cv2.BFMatcher")
-    def test_similarity_score_no_matches(
-        self, mock_bf, mock_orb, mock_cvtcolor, mock_imread
-    ):
-        """Test no feature matches return zero similarity."""
-        mock_img = np.zeros((100, 100, 3), dtype=np.uint8)
-        mock_imread.return_value = mock_img
-
-        mock_gray = np.zeros((100, 100), dtype=np.uint8)
-        mock_cvtcolor.return_value = mock_gray
-
-        mock_orb_instance = Mock()
-        mock_orb.return_value = mock_orb_instance
-
-        mock_descriptors = np.zeros((10, 32), dtype=np.uint8)
-        mock_orb_instance.detectAndCompute.return_value = ([], mock_descriptors)
-
-        mock_matcher = Mock()
-        mock_matcher.match.return_value = []  # No matches
-        mock_bf.return_value = mock_matcher
-
-        similarity = self.processor.vision_similarity_score(
-            "/test/image1.jpg", "/test/image2.jpg"
-        )
-
-        assert similarity == 0.0
-
-    @patch("cv2.imread")
-    def test_similarity_score_exception_handling(self, mock_imread):
-        """Test exception handling on similarity computation."""
-        mock_imread.side_effect = Exception("OpenCV error")
-
-        similarity = self.processor.vision_similarity_score(
-            "/test/image1.jpg", "/test/image2.jpg"
-        )
-
-        assert similarity == 0.0
+        # No cap: never nudges.
+        processor, _ = self._run(groups, labels, max_group_size=0)
+        assert processor.group_size_nudge() is None
 
 
 class TestBatchProcessorProcessBatch:
@@ -617,6 +689,53 @@ class TestBatchProcessorProcessBatch:
         mock_analyzer.process_single_bottle.assert_called_once()
         call_kwargs = mock_analyzer.process_single_bottle.call_args.kwargs
         assert call_kwargs["vision_model"] == "custom-model"
+
+
+class TestBatchProcessorVisionFailures:
+    """Per-bottle failures are recorded with reasons; fatal model errors abort the batch."""
+
+    def test_process_batch_default_vision_model_is_none(self):
+        analyzer = Mock()
+        analyzer.process_single_bottle.return_value = ({"name": "X"}, ExtractedMetadata())
+        BatchProcessor(bottle_analyzer=analyzer).process_batch([[Image(path=Path("/a.jpg"))]])
+        assert analyzer.process_single_bottle.call_args.kwargs["vision_model"] is None
+
+    def test_failure_reason_recorded(self):
+        from lib.exceptions import VisionResponseError
+
+        analyzer = Mock()
+        analyzer.process_single_bottle.side_effect = [
+            VisionResponseError("returned no content"),
+            ({"name": "X"}, ExtractedMetadata()),
+            RuntimeError("disk full"),
+        ]
+        batch = [[Image(path=Path(f"/test/IMG_{i}.jpg"))] for i in range(1, 4)]
+
+        result = BatchProcessor(bottle_analyzer=analyzer).process_batch(batch)
+
+        assert result.failed_bottles == ["IMG_1", "IMG_3"]
+        assert result.errors == {
+            "IMG_1": "VisionResponseError: returned no content",
+            "IMG_3": "RuntimeError: disk full",
+        }
+        assert len(result.bottle_dicts) == 1
+
+    @pytest.mark.parametrize(
+        "error_name", ["VisionModelUnavailableError", "OllamaConnectionError", "ModelServerError"]
+    )
+    def test_fatal_errors_reraised(self, error_name):
+        import lib.exceptions as exceptions
+
+        error = getattr(exceptions, error_name)("gone")
+        analyzer = Mock()
+        analyzer.process_single_bottle.side_effect = error
+        batch = [[Image(path=Path("/a.jpg"))], [Image(path=Path("/b.jpg"))]]
+
+        with pytest.raises(type(error)) as exc_info:
+            BatchProcessor(bottle_analyzer=analyzer).process_batch(batch)
+
+        assert exc_info.value is error
+        analyzer.process_single_bottle.assert_called_once()  # stops at the first bottle
 
 
 class TestBatchProcessorLearnFromFeedback:
