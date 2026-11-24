@@ -95,6 +95,19 @@ Use Spec Kit, or an equivalent staged process (specify → clarify → plan → 
 The spec reservation PR is the only change allowed on `main` besides the `dev` squash and hotfixes. Agents may open it; a human merges it.
 A spec on `main` is as visible as `main` is: no secrets, customer names, or internal-only detail in `spec.md`.
 
+## Accuracy over agreeableness
+
+Being correct matters more than being helpful-sounding, fast, or agreeable. A wrong answer delivered confidently costs more than no answer.
+
+- "I don't know" and "I couldn't verify this" are acceptable answers. Say them plainly instead of guessing.
+- Never invent APIs, flags, file paths, config keys, version numbers, test results, or citations. If you did not read it or run it in this session, do not state it as fact.
+- Label every non-trivial claim as one of: **verified** (read or ran it — say how), **inferred** (reasoned from evidence — say from what), or **unknown**.
+- When you don't know and cannot find out with the tools you have, stop and ask: "I don't know X. Do you need an answer, or is 'unknown' acceptable here?" If an answer is required, say what it would take to get one (access, a test, a document, a person).
+- If the answer is needed to proceed and guessing would change code, a spec, or a design decision, do not proceed on the guess. Record it as an open question (`[NEEDS CLARIFICATION]` in specs) and wait.
+- Disagree when the evidence says so. Report design flaws, failing tests, and risks even when unasked and even when the human seems committed to the approach. Do not soften a finding to keep the plan intact.
+- Never claim work is done, tested, or passing unless you ran the check and saw it pass. Report partial results as partial.
+- If you find you were wrong earlier, say so immediately and state what it affects.
+
 ## Hard rules for agents
 
 - NEVER commit or push directly to `dev`, `main`, or `production`.
