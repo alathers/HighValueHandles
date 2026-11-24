@@ -1,8 +1,7 @@
 """Unit tests for lib.model_server: OllamaServer and ModelServerManager.
 
 Tests cover:
-  - ServerBackend enum (Ollama only; removed backends get an explanation),
-    ServerState defaults
+  - ModelServerManager always manages an OllamaServer; ServerState defaults
   - The shared start() template: adopt external, refuse to spawn (remote,
     disabled, missing binary, port taken), spawn + readiness, failure cleanup
   - Ownership: external servers are never stopped; owned ones are terminated
@@ -31,17 +30,13 @@ import requests
 from lib.exceptions import ModelServerError
 from lib.model_availability import GB, GiB, PullEstimate
 from lib.model_server import (
-    DEFAULT_OLLAMA_URL,
     DEFAULT_REQUEST_TIMEOUT,
     BaseModelServer,
     ModelServerManager,
     OllamaServer,
     Ownership,
-    ServerBackend,
     ServerStartError,
     ServerState,
-    create_server_manager,
-    create_server_manager_from_config,
 )
 from lib.ollama_client import OllamaClient
 from lib.process_supervisor import ProbeResult
@@ -135,55 +130,33 @@ def _fake_proc(alive=True, pid=4321):
 
 
 # ---------------------------------------------------------------------------
-# ServerBackend / ServerState
+# Manager server / ServerState
 # ---------------------------------------------------------------------------
 
 
-class TestServerBackend:
-    """Verify ServerBackend enum and parsing."""
+class TestManagerServer:
+    """The manager always manages an Ollama server."""
 
-    def test_ollama_is_the_only_backend(self):
-        assert list(ServerBackend) == [ServerBackend.OLLAMA]
-        assert ServerBackend.OLLAMA.value == "ollama"
+    def test_manager_server_is_ollama(self):
+        assert isinstance(ModelServerManager().server, OllamaServer)
 
-    @pytest.mark.parametrize(
-        "value", ["ollama", "OLLAMA", " Ollama ", ServerBackend.OLLAMA]
-    )
-    def test_parse_accepts_strings_and_members(self, value):
-        assert ServerBackend.parse(value) is ServerBackend.OLLAMA
-
-    @pytest.mark.parametrize("value", ["", "llama", "bogus", None, 1])
-    def test_parse_rejects_unknown(self, value):
-        with pytest.raises(ValueError, match="Unknown backend"):
-            ServerBackend.parse(value)
-
-    @pytest.mark.parametrize("value", ["mtplx", "mpltx", " MTPLX "])
-    def test_parse_explains_removed_backend(self, value):
-        with pytest.raises(ValueError, match="MTPLX support was removed") as excinfo:
-            ServerBackend.parse(value)
-        assert "Use 'ollama'" in str(excinfo.value)
-
-    def test_manager_accepts_cli_string(self):
-        """Regression: the CLI passes plain strings; they must select the right server."""
-        manager = ModelServerManager(backend="ollama")
-        assert isinstance(manager.server, OllamaServer)
-
-    def test_manager_rejects_removed_backend(self):
-        with pytest.raises(ValueError, match="removed"):
-            ModelServerManager(backend="mtplx")
+    def test_manager_passes_kwargs_to_ollama_server(self):
+        manager = ModelServerManager(base_url="http://127.0.0.1:11500", model="m", timeout=42)
+        assert manager.server.base_url == "http://127.0.0.1:11500"
+        assert manager.server.model == "m"
+        assert manager.server.timeout == 42
 
 
 class TestServerState:
     """Test ServerState dataclass defaults."""
 
     def test_defaults(self):
-        state = ServerState(backend=ServerBackend.OLLAMA)
+        state = ServerState()
         assert state.is_running is False
         assert state.base_url == ""
         assert state.pid == 0
         assert state.models_loaded == []
         assert state.memory_usage_mb == 0
-        assert state.gpu_usage_percent == 0.0
         assert state.cold_start_seconds == 0.0
         assert state.uptime_seconds == 0.0
         assert state.error_message is None
@@ -202,10 +175,6 @@ class TestOllamaServer:
 
     def _make_server(self, **kwargs) -> OllamaServer:
         return OllamaServer(**kwargs)
-
-    def test_backend_property(self):
-        server = self._make_server()
-        assert server.backend == ServerBackend.OLLAMA
 
     def test_default_base_url(self):
         server = self._make_server()
@@ -605,23 +574,6 @@ class TestOllamaServer:
         with patch("lib.model_server.requests.get", return_value=_resp(200, payload)):
             assert server.list_models() == ["qwen3-vl:32b"]
 
-    def test_get_resource_usage_returns_zeros(self):
-        server = self._make_server()
-        # Unreachable server -> zeros
-        assert server.get_resource_usage() == {
-            "memory_mb": 0.0,
-            "gpu_percent": 0.0,
-            "cpu_percent": 0.0,
-        }
-
-    def test_get_resource_usage_from_api_ps(self):
-        server = self._make_server()
-        payload = {"models": [{"name": "a", "size_vram": 2 * 2**30}, {"name": "b", "size_vram": 2**30}]}
-        with patch("lib.model_server.requests.get", return_value=_resp(200, payload)) as get:
-            usage = server.get_resource_usage()
-        assert get.call_args.args[0].endswith("/api/ps")
-        assert usage["memory_mb"] == 3072.0
-
     def test_get_state_models_loaded_from_api_ps(self):
         server = self._make_server()
 
@@ -661,6 +613,19 @@ class TestOllamaServer:
         assert post.call_args.args[0].endswith("/api/generate")
         assert post.call_args.kwargs["json"]["keep_alive"] == 0
 
+    def test_installed_model_size_from_tags(self):
+        server = self._make_server()
+        tags = {"models": [
+            {"name": "gpt-oss:120b", "model": "gpt-oss:120b", "size": 65_290_000_000},
+            {"name": "nosize:1b", "model": "nosize:1b"},
+        ]}
+        with patch("lib.model_server.requests.get", return_value=_resp(200, tags)):
+            assert server.installed_model_size("gpt-oss:120b") == 65_290_000_000
+            assert server.installed_model_size("nosize:1b") is None
+            assert server.installed_model_size("missing:1b") is None
+        with patch("lib.model_server.requests.get", return_value=_resp(500, text="boom")):
+            assert server.installed_model_size("gpt-oss:120b") is None
+
     def test_get_client(self):
         server = self._make_server(model="qwen3.6:35b-a3b", timeout=123)
         client = server.get_client()
@@ -686,17 +651,8 @@ class TestOllamaServer:
 class TestModelServerManager:
     """Test ModelServerManager facade."""
 
-    def _make_manager(self, backend=ServerBackend.OLLAMA, **kwargs) -> ModelServerManager:
-        return ModelServerManager(backend=backend, **kwargs)
-
-    def test_default_backend_is_ollama(self):
-        assert ModelServerManager()._backend is ServerBackend.OLLAMA
-        assert create_server_manager()._backend is ServerBackend.OLLAMA
-
-    def test_init_ollama(self):
-        manager = self._make_manager()
-        assert manager._backend == ServerBackend.OLLAMA
-        assert isinstance(manager.server, OllamaServer)
+    def _make_manager(self, **kwargs) -> ModelServerManager:
+        return ModelServerManager(**kwargs)
 
     def test_server_property(self):
         manager = self._make_manager()
@@ -706,10 +662,9 @@ class TestModelServerManager:
         manager = self._make_manager()
         state = manager.state
         assert isinstance(state, ServerState)
-        assert state.backend == ServerBackend.OLLAMA
 
     def test_probe_never_starts(self):
-        manager = self._make_manager(backend=ServerBackend.OLLAMA)
+        manager = self._make_manager()
         with patch.object(manager.server, "start") as start:
             state = manager.probe()
         start.assert_not_called()
@@ -1026,12 +981,182 @@ class TestModelServerManager:
         assert manager.ensure_models([]) is True
         manager.ensure_running.assert_not_called()
 
+    def test_ensure_models_per_item_capability_overrides_keyword(self):
+        manager = self._make_manager()
+        manager.ensure_running = MagicMock(return_value=True)
+        manager._ensure_one = MagicMock(return_value=True)
+        assert manager.ensure_models(
+            [("qwen3.6:35b-a3b", "vision"), ("gpt-oss:120b", "completion"), "plain", ("dflt", None)],
+            capability="tools",
+        ) is True
+        caps = {c.args[0]: c.kwargs["capability"] for c in manager._ensure_one.call_args_list}
+        assert caps == {
+            "qwen3.6:35b-a3b": "vision",
+            "gpt-oss:120b": "completion",
+            "plain": "tools",
+            "dflt": "tools",
+        }
+
+    def test_ensure_models_capability_checked_per_model(self, caplog):
+        manager = self._make_manager()
+        m = self._ready(manager, installed=True)
+        m["get_capabilities"].side_effect = lambda name: {
+            "qwen3.6:35b-a3b": {"completion", "vision", "thinking"},
+            "gpt-oss:120b": {"completion", "tools", "thinking"},
+        }[name]
+        assert manager.ensure_models(
+            [("qwen3.6:35b-a3b", "vision"), ("gpt-oss:120b", "completion")]
+        ) is True
+        # gpt-oss is not a vision model, but it is only asked for completion.
+        assert manager.ensure_models([("gpt-oss:120b", "vision")]) is False
+        assert "does not support vision input" in caplog.text
+
+    def test_ensure_models_missing_completion_is_reported(self, caplog):
+        manager = self._make_manager()
+        m = self._ready(manager, installed=True)
+        m["get_capabilities"].return_value = {"embedding"}
+        assert manager.ensure_models([("nomic-embed-text", "completion")]) is False
+        assert "does not support text completion" in caplog.text
+
+    def test_ensure_models_hints_built_per_capability(self):
+        manager = self._make_manager()
+        m = self._ready(manager, installed=False, vision=["gemma4:26b"])
+        assert manager.ensure_models([("x", "vision"), ("y", "completion")]) is False
+        m["list_vision_models"].assert_called_once()
+        m["list_models"].assert_called_once()
+
+    def test_ensure_models_duplicate_keeps_vision_capability(self):
+        manager = self._make_manager()
+        manager.ensure_running = MagicMock(return_value=True)
+        manager._ensure_one = MagicMock(return_value=True)
+        manager.ensure_models([("m:latest", "completion"), ("M", "vision")])
+        assert manager._ensure_one.call_count == 1
+        assert manager._ensure_one.call_args.args[0] == "m:latest"
+        assert manager._ensure_one.call_args.kwargs["capability"] == "vision"
+
+    def test_ensure_models_warm_models_restricts_warming(self):
+        manager = self._make_manager()
+        m = self._ready(manager, installed=True)
+        assert manager.ensure_models(
+            [("qwen3.6:35b-a3b", "vision"), ("gpt-oss:120b", "completion")],
+            warm=True,
+            warm_models=["QWEN3.6:35b-a3b"],
+        ) is True
+        m["load_model"].assert_called_once_with("qwen3.6:35b-a3b")
+
+    def test_ensure_models_warms_all_by_default(self):
+        manager = self._make_manager()
+        m = self._ready(manager, installed=True)
+        assert manager.ensure_models(["a", "b"], warm=True) is True
+        assert [c.args[0] for c in m["load_model"].call_args_list] == ["a", "b"]
+
+    def test_ensure_models_warm_models_ignored_without_warm(self):
+        manager = self._make_manager()
+        m = self._ready(manager, installed=True)
+        assert manager.ensure_models(["a", "b"], warm=False, warm_models=["a"]) is True
+        m["load_model"].assert_not_called()
+
+    def test_combined_disk_check_refuses_before_any_pull(self, tmp_path, caplog):
+        manager = self._make_manager()
+        estimates = {
+            "qwen3.6:35b-a3b": PullEstimate("qwen3.6:35b-a3b", 23 * GB, 23 * GB, source="u1"),
+            "gpt-oss:120b": PullEstimate("gpt-oss:120b", 65 * GB, 65 * GB, source="u2"),
+        }
+        m = self._ready(manager, installed=False, store=tmp_path)
+        m["estimate_pull"].side_effect = lambda name: estimates[name]
+        # Each model fits on its own (70 GB free), but not both together.
+        with self._disk(80 * GB):
+            ok = manager.ensure_models(
+                [("qwen3.6:35b-a3b", "vision"), ("gpt-oss:120b", "completion")],
+                allow_pull=True, warm=True,
+            )
+        assert ok is False
+        m["pull_model"].assert_not_called()
+        m["load_model"].assert_not_called()
+        text = caplog.text
+        assert "Not enough disk space to pull all missing models" in text
+        assert "Nothing was pulled" in text
+        assert "qwen3.6:35b-a3b: 23.0 GB" in text
+        assert "gpt-oss:120b: 65.0 GB" in text
+        assert "88.0 GB download" in text
+        assert m["estimate_pull"].call_count == 2  # one estimate per model
+
+    def test_combined_disk_check_dry_run_also_refuses(self, tmp_path, caplog):
+        manager = self._make_manager()
+        m = self._ready(manager, installed=False, store=tmp_path,
+                        estimate=PullEstimate("m", 40 * GB, 40 * GB))
+        with self._disk(60 * GB):
+            assert manager.ensure_models(["a", "b"], allow_pull=True, dry_run=True) is False
+        assert "Dry run: Not enough disk space to pull all missing models" in caplog.text
+        m["pull_model"].assert_not_called()
+
+    def test_combined_disk_check_passes_and_pulls_each_once(self, tmp_path):
+        manager = self._make_manager()
+        # a missing, b missing (combined check), then each listed after its pull.
+        m = self._ready(manager, installed=[False, False, True, True], store=tmp_path,
+                        estimate=PullEstimate("m", 10 * GB, 10 * GB))
+        with self._disk(100 * GB):
+            assert manager.ensure_models(["a", "b"], allow_pull=True) is True
+        assert [c.args[0] for c in m["pull_model"].call_args_list] == ["a", "b"]
+        assert m["estimate_pull"].call_count == 2  # reused, not fetched again
+
+    def test_combined_disk_check_reports_installed_capability_problems(self, tmp_path, caplog):
+        manager = self._make_manager()
+        m = self._ready(manager, installed=[True, False, False], store=tmp_path,
+                        caps={"completion"}, estimate=PullEstimate("m", 40 * GB, 40 * GB))
+        with self._disk(60 * GB):
+            assert manager.ensure_models(
+                [("have", "vision"), ("b", None), ("c", None)], allow_pull=True
+            ) is False
+        assert "'have' is installed but does not support vision input" in caplog.text
+        m["pull_model"].assert_not_called()
+
+    def test_single_missing_model_uses_per_model_check(self, tmp_path, caplog):
+        manager = self._make_manager()
+        m = self._ready(manager, installed=[True, False], store=tmp_path,
+                        estimate=PullEstimate("b", 40 * GB, 40 * GB))
+        with self._disk(30 * GB):
+            assert manager.ensure_models(["a", "b"], allow_pull=True) is False
+        assert "Not enough disk space to pull 'b'" in caplog.text
+        assert "all missing models" not in caplog.text
+        m["pull_model"].assert_not_called()
+
+    def test_unload_model_delegates(self):
+        manager = self._make_manager()
+        with patch.object(manager.server, "unload_model", return_value=True) as unload:
+            assert manager.unload_model("gpt-oss:120b") is True
+        unload.assert_called_once_with("gpt-oss:120b")
+
+    def test_unload_model_failure_is_reported_not_raised(self, caplog):
+        manager = self._make_manager()
+        with patch.object(manager.server, "unload_model", return_value=False):
+            assert manager.unload_model("m") is False
+        with patch.object(manager.server, "unload_model", side_effect=RuntimeError("boom")):
+            assert manager.unload_model("m") is False
+        assert "Could not unload model 'm'" in caplog.text
+
+    def test_unload_model_works_on_adopted_server(self):
+        manager = self._make_manager()
+        manager.server.ownership = Ownership.EXTERNAL
+        with patch("lib.model_server.requests.post", return_value=_resp(200)) as post:
+            assert manager.unload_model("qwen3.6:35b-a3b") is True
+        assert post.call_args.kwargs["json"] == {
+            "model": "qwen3.6:35b-a3b", "keep_alive": 0, "stream": False,
+        }
+
+    def test_installed_model_size_delegates(self):
+        manager = self._make_manager()
+        with patch.object(manager.server, "installed_model_size", return_value=123):
+            assert manager.installed_model_size("m") == 123
+        with patch.object(manager.server, "installed_model_size", side_effect=RuntimeError("x")):
+            assert manager.installed_model_size("m") is None
+
     def test_get_client(self):
         manager = self._make_manager()
         with patch.object(manager, "ensure_running", return_value=True):
             client = manager.get_client()
             assert isinstance(client, OllamaClient)
-            assert hasattr(client, "image_to_text")
+            assert hasattr(client, "chat_with_images")
             assert manager.get_client() is client  # cached
 
     def test_get_client_not_running_raises(self):
@@ -1047,11 +1172,6 @@ class TestModelServerManager:
         manager = self._make_manager()
         state = manager.get_state()
         assert isinstance(state, ServerState)
-
-    def test_get_resource_usage(self):
-        manager = self._make_manager()
-        usage = manager.get_resource_usage()
-        assert isinstance(usage, dict)
 
     def test_list_models(self):
         manager = self._make_manager()
@@ -1096,60 +1216,21 @@ class TestModelServerManager:
         stop.assert_called_once()
 
     def test_enter_raises_when_unavailable(self):
-        manager = self._make_manager(backend=ServerBackend.OLLAMA)
+        manager = self._make_manager()
         with patch("lib.model_server.shutil.which", return_value=None):
             with pytest.raises(ModelServerError, match="not running"):
                 with manager:
                     pass
 
-    def test_init_from_config_timeout(self):
-        config = MagicMock()
-        config.timeout = 42
-        manager = ModelServerManager(config=config)
-        assert manager.server.timeout == 42
-
-    def test_init_from_config_ollama(self):
-        config = MagicMock()
-        config.ollama_url = "http://remote:11434"
-        config.model = "qwen3-vl:32b"
-
-        manager = ModelServerManager(backend=ServerBackend.OLLAMA, config=config)
-        assert manager._server is not None
-        assert manager.server.base_url == "http://remote:11434"
-        assert manager.server.model == "qwen3-vl:32b"
-
-    def test_init_from_config_ignores_mock_attrs(self):
-        manager = ModelServerManager(backend=ServerBackend.OLLAMA, config=MagicMock())
-        assert manager.server.timeout == 600
-        assert manager.server.base_url == DEFAULT_OLLAMA_URL
 
 
 # ---------------------------------------------------------------------------
-# Convenience functions
+# Base class
 # ---------------------------------------------------------------------------
 
 
-class TestConvenienceFunctions:
-    """Test create_server_manager() and create_server_manager_from_config()."""
-
-    def test_create_server_manager(self):
-        manager = create_server_manager()
-        assert isinstance(manager, ModelServerManager)
-
-    def test_create_server_manager_custom_backend(self):
-        manager = create_server_manager(backend=ServerBackend.OLLAMA)
-        assert manager._backend == ServerBackend.OLLAMA
-
-    def test_create_server_manager_from_config(self):
-        config = MagicMock()
-        config.ollama_url = "http://127.0.0.1:11500"
-        config.model = "qwen3-vl:32b"
-
-        manager = create_server_manager_from_config(config)
-        assert isinstance(manager, ModelServerManager)
-        assert manager.backend is ServerBackend.OLLAMA
-        assert manager.server.base_url == "http://127.0.0.1:11500"
-        assert manager.server.model == "qwen3-vl:32b"
+class TestBaseModelServer:
+    """The lifecycle template's abstract hooks and "unknown" defaults."""
 
     def test_base_class_is_abstract(self):
         with pytest.raises(TypeError):
@@ -1158,7 +1239,7 @@ class TestConvenienceFunctions:
     def test_base_class_model_query_defaults(self):
         server = OllamaServer()
         # The non-abstract defaults report "unknown" (OllamaServer overrides
-        # them), so a future backend refuses automatic pulls.
+        # them), so a server that cannot answer refuses automatic pulls.
         assert BaseModelServer.model_store_path(server) is None
         assert BaseModelServer.get_capabilities(server, "m") is None
         assert BaseModelServer.list_vision_models(server) == []

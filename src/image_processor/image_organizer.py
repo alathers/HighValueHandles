@@ -214,7 +214,6 @@ class ImageOrganizer:
     def group_by_bottle(
         self,
         images: list[Image],
-        similarity_threshold: float | None = None,
         *,
         gap_seconds: float | None = None,
         max_group_size: int | None = None,
@@ -235,7 +234,6 @@ class ImageOrganizer:
 
         Args:
             images: Image objects to group.
-            similarity_threshold: Ignored; kept for API compatibility.
             gap_seconds: Override of the organizer's gap.
             max_group_size: Override of the organizer's cap.
 
@@ -245,8 +243,6 @@ class ImageOrganizer:
         """
         if not images:
             return []
-        if similarity_threshold is not None:
-            logger.debug("group_by_bottle: similarity_threshold is ignored (grouping is by capture time)")
         gap = self.gap_seconds if gap_seconds is None else gap_seconds
         cap = self.max_group_size if max_group_size is None else max_group_size
 
@@ -367,87 +363,3 @@ class ImageOrganizer:
                     duplicate_count += 1
 
         logger.info("Found %d duplicate images", duplicate_count)
-
-    def is_duplicate_image(
-        self,
-        img1: Image,
-        img2: Image,
-    ) -> bool:
-        """Check if two images are exact duplicates by comparing file content hash.
-
-        Args:
-            img1: First image.
-            img2: Second image.
-
-        Returns:
-            True if images are exact duplicates, False otherwise.
-        """
-        if not img1.md5_hash or not img2.md5_hash:
-            return False
-
-        return img1.md5_hash == img2.md5_hash
-
-    def _images_similar(
-        self,
-        img1: Image,
-        img2: Image,
-        threshold: float = 0.6,  # noqa: ARG002 - kept for API compatibility
-    ) -> bool:
-        """Whether two images are the same bottle by file evidence alone.
-
-        Deprecated helper: true for exact duplicates (same hash) and for
-        explicit angle-suffix pairs in one folder (``IMG_1_front`` /
-        ``IMG_1_back``). Name prefixes are not compared: consecutive camera
-        numbers say nothing about the bottle.
-
-        Args:
-            img1: First image.
-            img2: Second image.
-            threshold: Ignored.
-
-        Returns:
-            True if the images belong together.
-        """
-        if self.is_duplicate_image(img1, img2):
-            return True
-        base = angle_base(img1.path)
-        return base is not None and base == angle_base(img2.path)
-
-    def filter_duplicate_images(
-        self,
-        images: list[Image],
-        keep_original: bool = True,
-    ) -> list[Image]:
-        """Filter out duplicate images, keeping only one copy.
-
-        Args:
-            images: List of Image objects to filter.
-            keep_original: If True, keep the first occurrence as original.
-
-        Returns:
-            Filtered list of images with duplicates removed.
-        """
-        seen_hashes: set[str] = set()
-        filtered: list[Image] = []
-
-        for img in images:
-            if not img.md5_hash:
-                # No hash available, keep it
-                filtered.append(img)
-                continue
-
-            if img.md5_hash not in seen_hashes:
-                # First occurrence
-                seen_hashes.add(img.md5_hash)
-                filtered.append(img)
-            elif not keep_original:
-                # If we want to keep the "best" version, we could implement
-                # logic to keep highest resolution, etc.
-                # For now, just skip duplicates
-                pass
-
-        removed = len(images) - len(filtered)
-        if removed > 0:
-            logger.info("Filtered out %d duplicate images", removed)
-
-        return filtered

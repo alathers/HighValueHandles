@@ -1,10 +1,13 @@
 """Unit tests for BatchProcessor class.
 
-Tests batch slicing, the deprecated lookahead no-op, the same-bottle split
-check (backstop), batch processing, and user feedback integration.
+Tests batch slicing, the same-bottle split check (backstop) and batch
+processing. Corrections are tested in ``test_corrections.py``.
 """
 
-from datetime import datetime
+import inspect
+import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -15,14 +18,17 @@ from image_processor.batch_processor import (
     FALSE_ALARM_HINT,
     MIN_SPLIT_BUDGET_CALLS,
     SPLIT_BUDGET_WARNING,
+    BOTTLE_CONTEXT,
     BatchProcessor,
     BatchResult,
+    BottleLogFilter,
+    describe_error,
     photo_units,
     split_budget_for,
     split_group_at_largest_gap,
 )
 from image_processor.bottle_analyzer import MIXED_GROUP_WARNING
-from models.bottle import Correction, ExtractedMetadata
+from models.bottle import ExtractedMetadata
 from models.image import Image
 
 
@@ -34,23 +40,22 @@ class TestBatchProcessorInitialization:
         processor = BatchProcessor()
 
         assert processor.batch_size == 5
-        assert processor.lookahead == 3
-        assert processor.similarity_threshold == 0.7
         assert processor.bottle_analyzer is not None
 
     def test_processor_custom_values(self):
         """Test processor initializes with custom values."""
         with patch("image_processor.batch_processor.BottleAnalyzer") as mock_analyzer:
             mock_analyzer.return_value = Mock()
-            processor = BatchProcessor(
-                batch_size=10,
-                lookahead=5,
-                similarity_threshold=0.85,
-            )
+            processor = BatchProcessor(batch_size=10)
 
             assert processor.batch_size == 10
-            assert processor.lookahead == 5
-            assert processor.similarity_threshold == 0.85
+
+    def test_only_batch_size_is_positional(self):
+        params = inspect.signature(BatchProcessor.__init__).parameters
+        assert [n for n, p in params.items() if p.kind is p.POSITIONAL_OR_KEYWORD] == ["self", "batch_size"]
+        assert set(params) == {
+            "self", "batch_size", "bottle_analyzer", "split_budget_ratio", "max_group_size", "executor", "hints"
+        }
 
     def test_processor_batch_size_all(self):
         """Test processor accepts 'all' string for batch_size."""
@@ -172,21 +177,10 @@ class TestBatchProcessorSliceIntoBatches:
         assert len(batches[0][1]) == 2
 
 
-class TestBatchProcessorApplyLookahead:
-    """Lookahead is deprecated: grouping by capture time keeps bottles inside one batch."""
-
-    def test_apply_lookahead_is_a_noop(self):
-        processor = BatchProcessor(batch_size=2, lookahead=3)
-        current_batch = [[Image(path=Path("/test/image1.jpg"))]]
-        remaining_groups = [[Image(path=Path(f"/test/image{i}.jpg"))] for i in range(2, 6)]
-
-        new_batch, new_remaining = processor.apply_lookahead(current_batch, remaining_groups)
-
-        assert new_batch is current_batch
-        assert new_remaining is remaining_groups
-
+class TestRemovedGroupingLeftovers:
     def test_orb_similarity_removed(self):
         assert not hasattr(BatchProcessor, "vision_similarity_score")
+        assert not hasattr(BatchProcessor, "apply_corrections")
 
 
 # --- same-bottle split check ("backstop") ----------------------------------
@@ -216,10 +210,12 @@ class FakeAnalyzer:
         self.mixed_always = mixed_always
         self.fail_on = fail_on or {}
         self.calls: list[list[str]] = []
+        self.notes: dict[tuple[str, ...], str] = {}
 
-    def process_single_bottle(self, images, vision_model=None):
+    def process_single_bottle(self, images, vision_model=None, *, reviewer_note="", cancel=None):
         names = [Path(img.path).name for img in images]
         self.calls.append(names)
+        self.notes[tuple(names)] = reviewer_note
         error = self.fail_on.get(tuple(names))
         if error is not None:
             raise error
@@ -603,7 +599,7 @@ class TestBatchProcessorProcessBatch:
 
         # Mock process_single_bottle for multiple bottles
         call_count = 0
-        def mock_process(bottle_images, vision_model):
+        def mock_process(bottle_images, vision_model, **_kwargs):
             nonlocal call_count
             call_count += 1
             bottle_dict = {
@@ -683,7 +679,7 @@ class TestBatchProcessorProcessBatch:
         mock_analyzer.process_single_bottle.return_value = (bottle_dict, metadata)
 
         batch = [[Image(path=Path("/test/image1.jpg"))]]
-        result = processor.process_batch(batch, vision_model="custom-model")
+        processor.process_batch(batch, vision_model="custom-model")
 
         # Verify vision_model was passed
         mock_analyzer.process_single_bottle.assert_called_once()
@@ -714,10 +710,11 @@ class TestBatchProcessorVisionFailures:
         result = BatchProcessor(bottle_analyzer=analyzer).process_batch(batch)
 
         assert result.failed_bottles == ["IMG_1", "IMG_3"]
-        assert result.errors == {
+        assert {k: describe_error(v) for k, v in result.errors.items()} == {
             "IMG_1": "VisionResponseError: returned no content",
             "IMG_3": "RuntimeError: disk full",
         }
+        assert all(isinstance(e, Exception) for e in result.errors.values())  # the real exceptions
         assert len(result.bottle_dicts) == 1
 
     @pytest.mark.parametrize(
@@ -738,343 +735,6 @@ class TestBatchProcessorVisionFailures:
         analyzer.process_single_bottle.assert_called_once()  # stops at the first bottle
 
 
-class TestBatchProcessorLearnFromFeedback:
-    """Test adaptive threshold based on corrections."""
-
-    def setup_method(self):
-        """Set up test fixtures."""
-        self.processor = BatchProcessor(similarity_threshold=0.7)
-
-    def test_learn_from_empty_corrections(self):
-        """Test learning with no corrections does nothing."""
-        initial_threshold = self.processor.similarity_threshold
-        self.processor.learn_from_feedback([])
-
-        assert self.processor.similarity_threshold == initial_threshold
-
-    def test_learn_from_merge_corrections_tightens_threshold(self):
-        """Test merge corrections tighten threshold."""
-        corrections = [
-            Correction(
-                field_name="grouping",
-                original_value="separate",
-                corrected_value="merge",
-                corrected_at=datetime.now(),
-            )
-            for _ in range(2)
-        ]
-
-        self.processor.learn_from_feedback(corrections)
-
-        assert self.processor.similarity_threshold > 0.7
-
-    def test_learn_from_split_corrections_loosens_threshold(self):
-        """Test split corrections loosen threshold."""
-        corrections = [
-            Correction(
-                field_name="grouping",
-                original_value="grouped",
-                corrected_value="split",
-                corrected_at=datetime.now(),
-            )
-            for _ in range(2)
-        ]
-
-        self.processor.learn_from_feedback(corrections)
-
-        assert self.processor.similarity_threshold < 0.7
-
-    def test_learn_balanced_feedback(self):
-        """Test balanced merge/split feedback keeps threshold unchanged."""
-        corrections = [
-            Correction(
-                field_name="grouping",
-                original_value="separate",
-                corrected_value="merge",
-                corrected_at=datetime.now(),
-            ),
-            Correction(
-                field_name="grouping",
-                original_value="grouped",
-                corrected_value="split",
-                corrected_at=datetime.now(),
-            ),
-        ]
-
-        initial_threshold = self.processor.similarity_threshold
-        self.processor.learn_from_feedback(corrections)
-
-        assert self.processor.similarity_threshold == initial_threshold
-
-    def test_learn_threshold_caps_at_1_0(self):
-        """Test threshold caps at maximum value of 1.0."""
-        processor = BatchProcessor(similarity_threshold=0.95)
-        corrections = [
-            Correction(
-                field_name="grouping",
-                original_value="separate",
-                corrected_value="merge",
-                corrected_at=datetime.now(),
-            )
-            for _ in range(10)
-        ]
-
-        processor.learn_from_feedback(corrections)
-
-        assert processor.similarity_threshold == 1.0
-
-    def test_learn_threshold_caps_at_0_3(self):
-        """Test threshold caps at minimum value of 0.3."""
-        processor = BatchProcessor(similarity_threshold=0.35)
-        corrections = [
-            Correction(
-                field_name="grouping",
-                original_value="grouped",
-                corrected_value="split",
-                corrected_at=datetime.now(),
-            )
-            for _ in range(10)
-        ]
-
-        processor.learn_from_feedback(corrections)
-
-        assert processor.similarity_threshold == 0.3
-
-    def test_learn_from_non_grouping_corrections_ignored(self):
-        """Test non-grouping corrections are ignored."""
-        corrections = [
-            Correction(
-                field_name="name",
-                original_value="Wrong",
-                corrected_value="Correct",
-                corrected_at=datetime.now(),
-            ),
-            Correction(
-                field_name="distillery",
-                original_value="Wrong",
-                corrected_value="Correct",
-                corrected_at=datetime.now(),
-            ),
-        ]
-
-        initial_threshold = self.processor.similarity_threshold
-        self.processor.learn_from_feedback(corrections)
-
-        assert self.processor.similarity_threshold == initial_threshold
-
-    def test_learn_adjustment_capped(self):
-        """Test threshold adjustment is capped at 0.15."""
-        processor = BatchProcessor(similarity_threshold=0.5)
-        # More than 3 merges should still cap at 0.15 adjustment
-        corrections = [
-            Correction(
-                field_name="grouping",
-                original_value="separate",
-                corrected_value="merge",
-                corrected_at=datetime.now(),
-            )
-            for _ in range(5)
-        ]
-
-        processor.learn_from_feedback(corrections)
-
-        assert processor.similarity_threshold == pytest.approx(0.65, abs=0.01)
-
-
-class TestBatchProcessorApplyCorrections:
-    """Test applying user corrections to bottle dictionaries."""
-
-    def setup_method(self):
-        """Set up test fixtures."""
-        self.processor = BatchProcessor()
-
-    def test_apply_corrections_empty(self):
-        """Test applying empty corrections list."""
-        bottle_dicts = [{"name": "Test", "distillery": "Test"}]
-
-        result = self.processor.apply_corrections(bottle_dicts, [])
-
-        assert result == bottle_dicts
-
-    def test_apply_correction_updates_field(self):
-        """Test applying correction updates bottle field."""
-        bottle_dicts = [
-            {"name": "Wrong Name", "distillery": "Test Distillery"}
-        ]
-        corrections = [
-            Correction(
-                field_name="name",
-                original_value="Wrong Name",
-                corrected_value="Correct Name",
-                corrected_at=datetime.now(),
-            )
-        ]
-
-        result = self.processor.apply_corrections(bottle_dicts, corrections)
-
-        assert result[0]["name"] == "Correct Name"
-        assert result[0]["distillery"] == "Test Distillery"
-
-    def test_apply_correction_stores_history(self):
-        """Test applying correction stores history in bottle dict."""
-        bottle_dicts = [
-            {"name": "Wrong Name", "distillery": "Test Distillery"}
-        ]
-        correction_time = datetime.now()
-        corrections = [
-            Correction(
-                field_name="name",
-                original_value="Wrong Name",
-                corrected_value="Correct Name",
-                corrected_at=correction_time,
-            )
-        ]
-
-        result = self.processor.apply_corrections(bottle_dicts, corrections)
-
-        assert "corrections" in result[0]
-        assert len(result[0]["corrections"]) == 1
-        assert result[0]["corrections"][0]["field_name"] == "name"
-        assert result[0]["corrections"][0]["original_value"] == "Wrong Name"
-        assert result[0]["corrections"][0]["corrected_value"] == "Correct Name"
-
-    def test_apply_multiple_corrections(self):
-        """Test applying multiple corrections to multiple bottles."""
-        bottle_dicts = [
-            {"name": "Bottle 1", "distillery": "Dist 1"},
-            {"name": "Bottle 2", "distillery": "Dist 2"},
-        ]
-        corrections = [
-            Correction(
-                field_name="name",
-                original_value="Bottle 1",
-                corrected_value="Corrected 1",
-                corrected_at=datetime.now(),
-            ),
-            Correction(
-                field_name="distillery",
-                original_value="Dist 2",
-                corrected_value="Corrected 2",
-                corrected_at=datetime.now(),
-            ),
-        ]
-
-        result = self.processor.apply_corrections(bottle_dicts, corrections)
-
-        assert result[0]["name"] == "Corrected 1"
-        assert result[1]["distillery"] == "Corrected 2"
-
-    def test_apply_corrections_creates_history_list(self):
-        """Test applying multiple corrections creates history list."""
-        bottle_dicts = [
-            {"name": "Wrong", "distillery": "Test"}
-        ]
-        corrections = [
-            Correction(
-                field_name="name",
-                original_value="Wrong",
-                corrected_value="Correct 1",
-                corrected_at=datetime.now(),
-            ),
-            Correction(
-                field_name="name",
-                original_value="Correct 1",
-                corrected_value="Correct 2",
-                corrected_at=datetime.now(),
-            ),
-        ]
-
-        result = self.processor.apply_corrections(bottle_dicts, corrections)
-
-        assert len(result[0]["corrections"]) == 2
-        assert result[0]["corrections"][0]["original_value"] == "Wrong"
-        assert result[0]["corrections"][1]["original_value"] == "Correct 1"
-
-
-class TestBatchProcessorFindMatchingBottle:
-    """Test matching bottles for corrections."""
-
-    def setup_method(self):
-        """Set up test fixtures."""
-        self.processor = BatchProcessor()
-
-    def test_find_matching_bottle_by_path(self):
-        """Test finding bottle by path."""
-        bottle_dicts = [
-            {
-                "name": "Bottle 1",
-                "distillery": "Dist 1",
-                "images": ["/path/to/image1.jpg", "/path/to/image2.jpg"],
-            }
-        ]
-        correction = Correction(
-            field_name="name",
-            original_value="Bottle 1",
-            corrected_value="Corrected",
-            corrected_at=datetime.now(),
-        )
-        correction.bottle_path = "/path/to/image1.jpg"
-
-        result = self.processor._find_matching_bottle(bottle_dicts, correction)
-
-        assert result is not None
-        assert result["name"] == "Bottle 1"
-
-    def test_find_matching_bottle_by_name(self):
-        """Test finding bottle by name."""
-        bottle_dicts = [
-            {"name": "Test Bottle", "distillery": "Test"}
-        ]
-        correction = Correction(
-            field_name="distillery",
-            original_value="Test",
-            corrected_value="Corrected",
-            corrected_at=datetime.now(),
-        )
-        correction.bottle_name = "Test Bottle"
-
-        result = self.processor._find_matching_bottle(bottle_dicts, correction)
-
-        assert result is not None
-        assert result["name"] == "Test Bottle"
-
-    def test_find_matching_bottle_not_found(self):
-        """Test finding non-existent bottle returns None."""
-        bottle_dicts = [
-            {"name": "Bottle 1", "distillery": "Dist 1"},
-            {"name": "Bottle 2", "distillery": "Dist 2"},
-        ]
-        correction = Correction(
-            field_name="name",
-            original_value="Bottle 3",
-            corrected_value="Corrected",
-            corrected_at=datetime.now(),
-        )
-        correction.bottle_name = "Nonexistent"
-
-        result = self.processor._find_matching_bottle(bottle_dicts, correction)
-
-        assert result is None
-
-    def test_find_matching_bottle_no_matching_attrs(self):
-        """Test finding bottle by field value when path/name not specified."""
-        bottle_dicts = [
-            {"name": "Bottle 1", "distillery": "Dist 1"}
-        ]
-        correction = Correction(
-            field_name="name",
-            original_value="Bottle 1",
-            corrected_value="Corrected",
-            corrected_at=datetime.now(),
-        )
-
-        result = self.processor._find_matching_bottle(bottle_dicts, correction)
-
-        # Should match by field original_value when no explicit path/name
-        assert result is not None
-        assert result["name"] == "Bottle 1"
-
-
 class TestBatchResultDataclass:
     """Test BatchResult dataclass."""
 
@@ -1084,21 +744,12 @@ class TestBatchResultDataclass:
             batch_id=123,
             bottle_dicts=[{"name": "Test"}],
             metadata_list=[ExtractedMetadata(full_text="OCR", selected_text="Sel")],
-            corrections=[
-                Correction(
-                    field_name="name",
-                    original_value="Wrong",
-                    corrected_value="Right",
-                    corrected_at=datetime.now(),
-                )
-            ],
             failed_bottles=["bottle1", "bottle2"],
         )
 
         assert result.batch_id == 123
         assert len(result.bottle_dicts) == 1
         assert len(result.metadata_list) == 1
-        assert len(result.corrections) == 1
         assert len(result.failed_bottles) == 2
 
     def test_batch_result_defaults(self):
@@ -1107,7 +758,6 @@ class TestBatchResultDataclass:
 
         assert result.bottle_dicts == []
         assert result.metadata_list == []
-        assert result.corrections == []
         assert result.failed_bottles == []
 
     def test_batch_result_empty_lists_are_mutable(self):
@@ -1121,3 +771,226 @@ class TestBatchResultDataclass:
         assert len(result.bottle_dicts) == 1
         assert len(result.metadata_list) == 1
         assert len(result.failed_bottles) == 1
+
+
+# --- --concurrency: two phases, deterministic output ------------------------
+
+WAIT = 5  # seconds; a barrier or event that times out means the code did not run in parallel
+
+
+@pytest.fixture
+def pool():
+    executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="bottle")
+    yield executor
+    executor.shutdown(wait=True, cancel_futures=True)
+
+
+def _group(prefix, times=(0.0,), start=0.0):
+    return _photos([start + t for t in times], prefix=prefix, bottle_ref=f"{prefix}0")
+
+
+class OrderedAnalyzer:
+    """Group k (k < n-1) finishes only after group k+1: completion order is reversed."""
+
+    def __init__(self, names):
+        self.names = names
+        self.done = {n: threading.Event() for n in names}
+        self.completed: list[str] = []
+        self.lock = threading.Lock()
+
+    def process_single_bottle(self, images, vision_model=None, *, reviewer_note="", cancel=None):
+        name = Path(images[0].path).stem
+        k = self.names.index(name)
+        if k + 1 < len(self.names):
+            assert self.done[self.names[k + 1]].wait(WAIT), "groups did not run in parallel"
+        with self.lock:
+            self.completed.append(name)
+        self.done[name].set()
+        return {"name": name, "images": [str(i.path) for i in images]}, ExtractedMetadata(name=name)
+
+
+class TestConcurrency:
+    def test_results_in_input_order_when_completion_is_reversed(self, pool):
+        names = ["A_0", "B_0", "C_0"]
+        analyzer = OrderedAnalyzer(names)
+        batch = [_group("A_", start=0), _group("B_", start=1000), _group("C_", start=2000)]
+
+        result = BatchProcessor(bottle_analyzer=analyzer, executor=pool).process_batch(batch)
+
+        assert analyzer.completed == ["C_0", "B_0", "A_0"]
+        assert [d["name"] for d in result.bottle_dicts] == names
+        assert [m.name for m in result.metadata_list] == names
+
+    @staticmethod
+    def _scripted_run(executor):
+        """Mixed groups (split and false alarm), adjacent identical labels, a failure; 2 batches."""
+        labels = {}
+        groups = []
+        for g in range(8):
+            imgs = _group(f"G{g}_", times=(0.0, 3.0), start=g * 30.0)
+            groups.append(imgs)
+            mixed = g in (1, 5)
+            labels[f"G{g}_0.jpg"] = {**STAGG, "batch_number": "23A"}
+            labels[f"G{g}_1.jpg"] = {**STAGG, "batch_number": "23C" if mixed else "23A"}
+        from lib.exceptions import VisionResponseError
+
+        analyzer = FakeAnalyzer(labels, fail_on={("G3_0.jpg", "G3_1.jpg"): VisionResponseError("no content")})
+        processor = BatchProcessor(batch_size=4, bottle_analyzer=analyzer, executor=executor, max_group_size=2)
+        processor.start_run(groups)
+        results = [processor.process_batch(b) for b in processor.slice_into_batches(groups)]
+        return processor, results
+
+    def test_concurrency_1_and_4_give_identical_output(self, pool):
+        serial, serial_results = self._scripted_run(None)
+        parallel, parallel_results = self._scripted_run(pool)
+
+        def summary(results):
+            return [
+                (
+                    r.bottle_dicts,
+                    [m.to_dict() for m in r.metadata_list],
+                    r.failed_bottles,
+                    {k: describe_error(v) for k, v in r.errors.items()},
+                )
+                for r in results
+            ]
+
+        assert summary(parallel_results) == summary(serial_results)
+        assert [d["bottle_id"] for r in parallel_results for d in r.bottle_dicts] == [
+            d["bottle_id"] for r in serial_results for d in r.bottle_dicts
+        ]
+        assert parallel.split_stats == serial.split_stats
+        assert parallel.split_stats["split"] == 2
+        assert parallel.split_stats["adjacent_hint"] == serial.split_stats["adjacent_hint"] > 0
+        assert parallel.split_calls_used == serial.split_calls_used
+        assert parallel._progress_done == serial._progress_done == 8
+
+    def test_split_halves_run_concurrently(self, pool):
+        barrier = threading.Barrier(2, timeout=WAIT)
+        labels = {"IMG_0.jpg": {**STAGG, "batch_number": "23A"}, "IMG_1.jpg": {**STAGG, "batch_number": "23C"}}
+        fake = FakeAnalyzer(labels)
+
+        class HalvesMeet:
+            def process_single_bottle(self, images, vision_model=None, **kwargs):
+                if len(images) == 1:
+                    barrier.wait()  # both halves must be in flight at once
+                return fake.process_single_bottle(images, vision_model, **kwargs)
+
+        result = BatchProcessor(bottle_analyzer=HalvesMeet(), executor=pool).process_batch(
+            [_photos([0.0, 5.0], bottle_ref="IMG_0")]
+        )
+
+        assert _names(result) == [["IMG_0.jpg"], ["IMG_1.jpg"]]
+        assert [d["bottle_id"] for d in result.bottle_dicts] == ["IMG_0", "IMG_1"]
+
+    def test_fatal_error_cancels_pending_work_and_reraises(self):
+        from image_processor.bottle_analyzer import AnalysisCancelledError
+        from lib.exceptions import OllamaConnectionError
+
+        fatal = OllamaConnectionError("server gone")
+        started: list[str] = []
+        finished: list[str] = []
+        lock = threading.Lock()
+
+        class Analyzer:
+            def process_single_bottle(self, images, vision_model=None, *, reviewer_note="", cancel=None):
+                name = Path(images[0].path).stem
+                if cancel is not None and cancel.is_set():
+                    raise AnalysisCancelledError("run is aborting")
+                with lock:
+                    started.append(name)
+                if name == "G1_0":
+                    raise fatal
+                if name == "G0_0":
+                    assert cancel.wait(WAIT)  # still in flight when the fatal error arrives
+                with lock:
+                    finished.append(name)
+                return {"name": name, "images": [str(i.path) for i in images]}, ExtractedMetadata(name=name)
+
+        batch = [_group(f"G{g}_", start=g * 100.0) for g in range(6)]
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            processor = BatchProcessor(bottle_analyzer=Analyzer(), executor=executor)
+            with pytest.raises(OllamaConnectionError) as excinfo:
+                processor.process_batch(batch)
+
+        assert excinfo.value is fatal
+        assert sorted(started) == ["G0_0", "G1_0"]  # nothing new started after the fatal error
+        assert finished == ["G0_0"]  # the in-flight analysis was waited for
+        assert processor.cancel.is_set()
+
+    def test_first_fatal_error_in_input_order_wins(self, pool):
+        from lib.exceptions import ModelServerError, VisionModelUnavailableError
+
+        errors = {"A_0": VisionModelUnavailableError("model gone"), "B_0": ModelServerError("server gone")}
+        both_started = threading.Barrier(2, timeout=WAIT)
+
+        class Analyzer:
+            def process_single_bottle(self, images, vision_model=None, **_kwargs):
+                both_started.wait()
+                raise errors[Path(images[0].path).stem]
+
+        with pytest.raises(VisionModelUnavailableError):
+            BatchProcessor(bottle_analyzer=Analyzer(), executor=pool).process_batch(
+                [_group("A_"), _group("B_", start=500)]
+            )
+
+    def test_non_fatal_error_does_not_cancel_the_others(self, pool):
+        from lib.exceptions import VisionResponseError
+
+        class Analyzer:
+            def __init__(self):
+                self.cancel_seen = []
+
+            def process_single_bottle(self, images, vision_model=None, *, reviewer_note="", cancel=None):
+                name = Path(images[0].path).stem
+                self.cancel_seen.append(cancel.is_set())
+                if name == "B_0":
+                    raise VisionResponseError("no content")
+                return {"name": name, "images": [str(i.path) for i in images]}, ExtractedMetadata(name=name)
+
+        analyzer = Analyzer()
+        batch = [_group("A_"), _group("B_", start=500), _group("C_", start=1000), _group("D_", start=1500)]
+        result = BatchProcessor(bottle_analyzer=analyzer, executor=pool).process_batch(batch)
+
+        assert [d["name"] for d in result.bottle_dicts] == ["A_0", "C_0", "D_0"]
+        assert result.failed_bottles == ["B_0"]
+        assert isinstance(result.errors["B_0"], VisionResponseError)
+        assert analyzer.cancel_seen == [False] * 4
+
+    def test_hint_note_passed_to_first_pass_and_both_halves(self, pool):
+        labels = {"IMG_0.jpg": {**STAGG, "batch_number": "23A"}, "IMG_1.jpg": {**STAGG, "batch_number": "23C"}}
+        analyzer = FakeAnalyzer(labels)
+        hints = Mock()
+        hints.note_for.side_effect = lambda bottle_id: "neck label" if bottle_id == "IMG_0" else ""
+
+        BatchProcessor(bottle_analyzer=analyzer, executor=pool, hints=hints).process_batch(
+            [_photos([0.0, 5.0], bottle_ref="IMG_0")]
+        )
+
+        assert analyzer.notes == {
+            ("IMG_0.jpg", "IMG_1.jpg"): "neck label",
+            ("IMG_0.jpg",): "neck label",
+            ("IMG_1.jpg",): "neck label",
+        }
+
+
+class TestBottleLogFilter:
+    def test_bottle_defaults_to_dash_and_is_set_inside_a_task(self, pool, caplog):
+        handler_filter = BottleLogFilter()
+        record = logging.LogRecord("x", logging.INFO, __file__, 1, "msg", None, None)
+        assert handler_filter.filter(record) and record.bottle == "-"
+
+        seen = []
+
+        class Analyzer:
+            def process_single_bottle(self, images, vision_model=None, **_kwargs):
+                rec = logging.LogRecord("x", logging.INFO, __file__, 1, "msg", None, None)
+                handler_filter.filter(rec)
+                seen.append((Path(images[0].path).stem, rec.bottle, BOTTLE_CONTEXT.get()))
+                return {"name": "X", "images": [str(i.path) for i in images]}, ExtractedMetadata(name="X")
+
+        BatchProcessor(bottle_analyzer=Analyzer(), executor=pool).process_batch(
+            [_group("A_"), _group("B_", start=500)]
+        )
+        assert sorted(seen) == [("A_0", "A_0", "A_0"), ("B_0", "B_0", "B_0")]
+        assert BOTTLE_CONTEXT.get() == "-"

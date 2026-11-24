@@ -1,31 +1,34 @@
-"""Unit tests for ModelSelector — ModelStage enum, ModelSpec, UsageLog, ModelSelector.
+"""Unit tests for ModelSelector: ModelStage, ModelSpec, UsageLog, ModelSelector.
 
 Tests cover:
-  - 8 ModelStage enum values
-  - ModelSpec validation (role, temperature, max_tokens)
-  - Default specs match research.md decisions
-  - ModelSelector.get_model(), get_fallback_chain(), get_stage_description()
-  - UsageLog.record(), summary_by_stage(), summary_by_model(), to_dict()
-  - ModelSelector.record_usage(), get_usage_summary(), is_model_available(), print_stage_report()
+  - The two model stages (vision analysis, metadata generation)
+  - Default models; no fallback models anywhere
+  - ModelSelector.get_model() (KeyError for an unregistered stage), from_config(),
+    required_models(), required_model_specs(), active_stages(), STAGE_CAPABILITY
+  - UsageLog.record(), summary_by_stage(), summary_by_model(), to_dict(),
+    thread safety
+  - ModelSelector.record_usage(), get_usage_summary(), print_stage_report()
 """
 
 import json
 import logging
-from unittest.mock import MagicMock, patch
+import threading
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
-from lib.config import DEFAULT_VISION_MODEL
+from lib.constants import DEFAULT_VISION_MODEL
 from lib.model_selector import (
-    IMPLEMENTED_MODEL_STAGES,
+    _DEFAULT_MODELS,
+    DEFAULT_TEXT_MODEL,
+    STAGE_CAPABILITY,
     ModelSelector,
-    ModelStage,
     ModelSpec,
+    ModelStage,
     ModelUsage,
     UsageLog,
-    create_default_selector,
-    get_stage_models,
-    _DEFAULT_MODELS,
+    active_stages,
 )
 
 logger = logging.getLogger(__name__)
@@ -37,25 +40,10 @@ logger = logging.getLogger(__name__)
 
 
 class TestModelStage:
-    """Verify all 8 pipeline stages are defined."""
+    """Only stages that call a model exist."""
 
-    EXPECTED_STAGES = {
-        "OCR_EXTRACTION",
-        "VISION_ANALYSIS",
-        "IMAGE_GROUPING",
-        "QUANTITY_DETECTION",
-        "METADATA_GENERATION",
-        "WEB_RESEARCH",
-        "ERROR_CLASSIFICATION",
-        "PREVIEW_GENERATION",
-    }
-
-    def test_all_stages_present(self):
-        assert len(ModelStage) == 8
-
-    def test_expected_stage_names(self):
-        actual = {s.name for s in ModelStage}
-        assert actual == self.EXPECTED_STAGES
+    def test_stage_names(self):
+        assert {s.name for s in ModelStage} == {"VISION_ANALYSIS", "METADATA_GENERATION"}
 
     def test_no_duplicate_values(self):
         values = [s.value for s in ModelStage]
@@ -63,112 +51,44 @@ class TestModelStage:
 
 
 # ---------------------------------------------------------------------------
-# ModelSpec validation
+# ModelSpec
 # ---------------------------------------------------------------------------
 
 
 class TestModelSpec:
-    """Test ModelSpec dataclass validation."""
-
-    def test_valid_primary(self):
-        spec = ModelSpec(
-            name="qwen3-vl:32b",
-            stage=ModelStage.VISION_ANALYSIS,
-            role="primary",
-            priority=0,
-            max_tokens=4096,
-            temperature=0.1,
-            description="Test model",
+    def test_fields(self):
+        spec = ModelSpec(name="qwen3-vl:32b", stage=ModelStage.VISION_ANALYSIS, description="d")
+        assert (spec.name, spec.stage, spec.description) == (
+            "qwen3-vl:32b",
+            ModelStage.VISION_ANALYSIS,
+            "d",
         )
-        assert spec.name == "qwen3-vl:32b"
-        assert spec.role == "primary"
-        assert spec.priority == 0
 
-    def test_invalid_role_raises(self):
-        with pytest.raises(ValueError, match="role"):
-            ModelSpec(name="test", stage=ModelStage.VISION_ANALYSIS, role="invalid")
-
-    def test_temperature_bounds(self):
-        with pytest.raises(ValueError, match="temperature"):
-            ModelSpec(name="test", stage=ModelStage.VISION_ANALYSIS, temperature=-0.1)
-        with pytest.raises(ValueError, match="temperature"):
-            ModelSpec(name="test", stage=ModelStage.VISION_ANALYSIS, temperature=2.1)
-
-    def test_max_tokens_non_negative(self):
-        with pytest.raises(ValueError, match="max_tokens"):
-            ModelSpec(name="test", stage=ModelStage.VISION_ANALYSIS, max_tokens=-1)
-
-    def test_defaults(self):
-        spec = ModelSpec(name="test", stage=ModelStage.VISION_ANALYSIS)
-        assert spec.role == "primary"
-        assert spec.priority == 0
-        assert spec.max_tokens == 0
-        assert spec.temperature == 0.1
-        assert spec.description == ""
+    def test_description_defaults_empty(self):
+        assert ModelSpec(name="test", stage=ModelStage.VISION_ANALYSIS).description == ""
 
 
 # ---------------------------------------------------------------------------
-# Default specs match research.md
+# Default specs
 # ---------------------------------------------------------------------------
 
 
 class TestDefaultSpecs:
-    """Verify default model specs match research.md decisions."""
+    def test_one_model_per_stage(self):
+        assert set(_DEFAULT_MODELS) == set(ModelStage)
+        for stage, spec in _DEFAULT_MODELS.items():
+            assert isinstance(spec, ModelSpec)
+            assert spec.stage is stage
 
-    def test_ocr_primary_is_tesseract(self):
-        specs = _DEFAULT_MODELS[ModelStage.OCR_EXTRACTION]
-        assert specs[0].name == "tesseract"
-        assert specs[0].role == "primary"
+    def test_vision_default(self):
+        spec = _DEFAULT_MODELS[ModelStage.VISION_ANALYSIS]
+        assert spec.name == DEFAULT_VISION_MODEL
+        assert "qwen3-vl" not in spec.description.lower()
 
-    def test_ocr_fallback_is_qwen2_vl_7b(self):
-        specs = _DEFAULT_MODELS[ModelStage.OCR_EXTRACTION]
-        assert len(specs) == 2
-        assert specs[1].name == "qwen2-vl:7b"
-
-    def test_vision_primary_is_default_vision_model(self):
-        specs = _DEFAULT_MODELS[ModelStage.VISION_ANALYSIS]
-        assert specs[0].name == DEFAULT_VISION_MODEL
-        assert "qwen3-vl" not in specs[0].description.lower()
-
-    def test_vision_fallback_is_qwen2_vl_7b(self):
-        specs = _DEFAULT_MODELS[ModelStage.VISION_ANALYSIS]
-        assert specs[1].name == "qwen2-vl:7b"
-
-    def test_metadata_primary_is_gpt_oss_120b(self):
-        specs = _DEFAULT_MODELS[ModelStage.METADATA_GENERATION]
-        assert specs[0].name == "gpt-oss:120b"
-
-    def test_metadata_fallback_is_qwen3_vl_32b(self):
-        specs = _DEFAULT_MODELS[ModelStage.METADATA_GENERATION]
-        assert specs[1].name == "qwen3-vl:32b"
-
-    def test_grouping_primary_is_orb(self):
-        specs = _DEFAULT_MODELS[ModelStage.IMAGE_GROUPING]
-        assert specs[0].name == "orb-opencv"
-
-    def test_quantity_primary_is_md5_hash(self):
-        specs = _DEFAULT_MODELS[ModelStage.QUANTITY_DETECTION]
-        assert specs[0].name == "md5-hash"
-
-    def test_web_research_primary(self):
-        specs = _DEFAULT_MODELS[ModelStage.WEB_RESEARCH]
-        assert specs[0].name == "duckduckgo-api"
-
-    def test_error_classification_primary(self):
-        specs = _DEFAULT_MODELS[ModelStage.ERROR_CLASSIFICATION]
-        assert specs[0].name == "rule-based"
-
-    def test_preview_generation_primary(self):
-        specs = _DEFAULT_MODELS[ModelStage.PREVIEW_GENERATION]
-        assert specs[0].name == "template-markdown"
-
-    def test_all_stages_have_at_least_one_model(self):
-        for stage, specs in _DEFAULT_MODELS.items():
-            assert len(specs) >= 1, f"{stage.name} has no models"
-
-    def test_all_stages_have_primary(self):
-        for stage, specs in _DEFAULT_MODELS.items():
-            assert specs[0].role == "primary", f"{stage.name} missing primary"
+    def test_metadata_generation_default_is_gpt_oss(self):
+        spec = _DEFAULT_MODELS[ModelStage.METADATA_GENERATION]
+        assert spec.name == DEFAULT_TEXT_MODEL == "gpt-oss:120b"
+        assert "text-only" in spec.description
 
 
 # ---------------------------------------------------------------------------
@@ -177,8 +97,6 @@ class TestDefaultSpecs:
 
 
 class TestModelUsage:
-    """Test ModelUsage dataclass."""
-
     def test_defaults(self):
         usage = ModelUsage(stage=ModelStage.VISION_ANALYSIS, model="qwen3-vl:32b")
         assert usage.success is True
@@ -186,17 +104,14 @@ class TestModelUsage:
         assert usage.input_tokens == 0
         assert usage.output_tokens == 0
         assert usage.error is None
-        assert usage.fallback_used is False
+        assert not hasattr(usage, "fallback_used")
 
 
 class TestUsageLog:
-    """Test UsageLog class."""
-
     def test_empty_log(self):
         log = UsageLog()
         assert log.total_calls == 0
         assert log.successful_calls == 0
-        assert log.fallback_calls == 0
         assert log.total_duration == 0.0
 
     def test_record_single(self):
@@ -206,39 +121,29 @@ class TestUsageLog:
         assert log.successful_calls == 1
         assert log.total_duration == 1.5
 
-    def test_record_fallback(self):
-        log = UsageLog()
-        log.record(ModelStage.VISION_ANALYSIS, "qwen2-vl:7b", success=True, fallback_used=True)
-        assert log.fallback_calls == 1
-
     def test_record_failure(self):
         log = UsageLog()
-        log.record(
-            ModelStage.VISION_ANALYSIS,
-            "qwen3-vl:32b",
-            success=False,
-            error="Connection refused",
-        )
+        log.record(ModelStage.VISION_ANALYSIS, "qwen3-vl:32b", success=False, error="Connection refused")
         assert log.successful_calls == 0
+        assert log.records[0].error == "Connection refused"
 
     def test_summary_by_stage(self):
         log = UsageLog()
         log.record(ModelStage.VISION_ANALYSIS, "qwen3-vl:32b")
-        log.record(ModelStage.VISION_ANALYSIS, "qwen2-vl:7b", fallback_used=True)
-        log.record(ModelStage.OCR_EXTRACTION, "tesseract")
+        log.record(ModelStage.VISION_ANALYSIS, "qwen3-vl:32b", success=False)
+        log.record(ModelStage.METADATA_GENERATION, "gpt-oss:120b")
         summary = log.summary_by_stage()
-        assert summary["VISION_ANALYSIS"]["total"] == 2
-        assert summary["VISION_ANALYSIS"]["fallback"] == 1
-        assert summary["OCR_EXTRACTION"]["total"] == 1
+        assert summary["VISION_ANALYSIS"] == {"total": 2, "success": 1}
+        assert summary["METADATA_GENERATION"] == {"total": 1, "success": 1}
 
     def test_summary_by_model(self):
         log = UsageLog()
         log.record(ModelStage.VISION_ANALYSIS, "qwen3-vl:32b")
         log.record(ModelStage.VISION_ANALYSIS, "qwen3-vl:32b")
-        log.record(ModelStage.OCR_EXTRACTION, "tesseract")
+        log.record(ModelStage.METADATA_GENERATION, "gpt-oss:120b")
         summary = log.summary_by_model()
         assert summary["qwen3-vl:32b"]["total"] == 2
-        assert summary["tesseract"]["total"] == 1
+        assert summary["gpt-oss:120b"]["total"] == 1
 
     def test_to_dict(self):
         log = UsageLog()
@@ -250,8 +155,52 @@ class TestUsageLog:
         assert "by_stage" in d
         assert "by_model" in d
         assert len(d["records"]) == 1
-        # JSON-serializable (no custom objects)
-        json.dumps(d)
+        assert "fallback_calls" not in d
+        assert "fallback_used" not in d["records"][0]
+        json.dumps(d)  # JSON-serializable (no custom objects)
+
+    def test_records_think_level(self):
+        log = UsageLog()
+        log.record(ModelStage.METADATA_GENERATION, "gpt-oss:120b", think="high")
+        log.record(ModelStage.VISION_ANALYSIS, "qwen3-vl:32b")
+        records = log.to_dict()["records"]
+        assert records[0]["think"] == "high"
+        assert records[1]["think"] is None
+
+    def test_selector_record_usage_passes_think(self):
+        selector = ModelSelector()
+        selector.record_usage(ModelStage.METADATA_GENERATION, "gpt-oss:120b", think="medium")
+        assert selector.usage.records[0].think == "medium"
+
+    def test_thread_safe_under_parallel_records(self):
+        log = UsageLog()
+        threads_n, per_thread = 8, 100
+        start = threading.Barrier(threads_n)
+        errors: list[BaseException] = []
+
+        def worker(i: int) -> None:
+            try:
+                start.wait()
+                for j in range(per_thread):
+                    log.record(
+                        ModelStage.VISION_ANALYSIS, f"m{i}", success=j % 2 == 0, duration=0.5
+                    )
+                    log.to_dict()  # summaries run concurrently with appends
+            except BaseException as e:  # pragma: no cover - reported below
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(threads_n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert not errors
+        assert log.total_calls == threads_n * per_thread
+        assert log.successful_calls == threads_n * per_thread // 2
+        assert log.total_duration == pytest.approx(threads_n * per_thread * 0.5)
+        assert log.summary_by_stage()["VISION_ANALYSIS"]["total"] == threads_n * per_thread
+        assert all(v["total"] == per_thread for v in log.summary_by_model().values())
 
 
 # ---------------------------------------------------------------------------
@@ -260,109 +209,105 @@ class TestUsageLog:
 
 
 class TestModelSelector:
-    """Test ModelSelector class."""
-
     def test_default_selector(self):
         selector = ModelSelector()
-        assert len(selector.models) == 8
-        assert selector.default_model == DEFAULT_VISION_MODEL
-        assert selector.allow_fallback is True
+        assert set(selector.models) == set(ModelStage)
         assert selector.usage is not None
 
-    def test_get_model_vision(self):
+    def test_get_model_defaults(self):
         selector = ModelSelector()
         assert selector.get_model(ModelStage.VISION_ANALYSIS) == DEFAULT_VISION_MODEL
-
-    def test_get_model_ocr(self):
-        selector = ModelSelector()
-        assert selector.get_model(ModelStage.OCR_EXTRACTION) == "tesseract"
-
-    def test_get_model_metadata(self):
-        selector = ModelSelector()
         assert selector.get_model(ModelStage.METADATA_GENERATION) == "gpt-oss:120b"
 
-    def test_get_model_grouping(self):
-        selector = ModelSelector()
-        assert selector.get_model(ModelStage.IMAGE_GROUPING) == "orb-opencv"
-
-    def test_get_model_quantity(self):
-        selector = ModelSelector()
-        assert selector.get_model(ModelStage.QUANTITY_DETECTION) == "md5-hash"
-
-    def test_get_model_web_research(self):
-        selector = ModelSelector()
-        assert selector.get_model(ModelStage.WEB_RESEARCH) == "duckduckgo-api"
-
-    def test_get_model_error_classification(self):
-        selector = ModelSelector()
-        assert selector.get_model(ModelStage.ERROR_CLASSIFICATION) == "rule-based"
-
-    def test_get_model_preview(self):
-        selector = ModelSelector()
-        assert selector.get_model(ModelStage.PREVIEW_GENERATION) == "template-markdown"
-
-    def test_get_fallback_chain(self):
-        selector = ModelSelector()
-        chain = selector.get_fallback_chain(ModelStage.VISION_ANALYSIS)
-        assert chain == [DEFAULT_VISION_MODEL, "qwen2-vl:7b"]
-
-    def test_get_fallback_chain_single_model(self):
-        selector = ModelSelector()
-        chain = selector.get_fallback_chain(ModelStage.WEB_RESEARCH)
-        assert chain == ["duckduckgo-api"]
-
-    def test_get_stage_description(self):
-        selector = ModelSelector()
-        desc = selector.get_stage_description(ModelStage.VISION_ANALYSIS)
-        assert "Qwen3-VL" in desc or "vision" in desc.lower()
+    def test_get_model_unregistered_stage_raises_key_error(self):
+        """Never substitutes another stage's model (a vision model for a text stage)."""
+        selector = ModelSelector(
+            models={ModelStage.VISION_ANALYSIS: _DEFAULT_MODELS[ModelStage.VISION_ANALYSIS]}
+        )
+        with pytest.raises(KeyError, match="METADATA_GENERATION"):
+            selector.get_model(ModelStage.METADATA_GENERATION)
 
     def test_custom_models(self):
-        custom = {
-            ModelStage.VISION_ANALYSIS: [
-                ModelSpec(name="llama3.2", stage=ModelStage.VISION_ANALYSIS, role="primary"),
-                ModelSpec(name="qwen2-vl:7b", stage=ModelStage.VISION_ANALYSIS, role="fallback"),
-            ],
-        }
-        for stage, specs in _DEFAULT_MODELS.items():
-            if stage not in custom:
-                custom[stage] = specs
-        selector = ModelSelector(models=custom)
-        assert selector.get_model(ModelStage.VISION_ANALYSIS) == "llama3.2"
+        custom = dict(_DEFAULT_MODELS)
+        custom[ModelStage.VISION_ANALYSIS] = ModelSpec(name="llama3.2", stage=ModelStage.VISION_ANALYSIS)
+        assert ModelSelector(models=custom).get_model(ModelStage.VISION_ANALYSIS) == "llama3.2"
 
-    def test_from_config(self):
-        config = MagicMock()
-        config.model = "llama3.2"
-        config.vision_analysis_model = "llama3.2"
+    def test_from_config_model_sets_vision_only(self):
+        selector = ModelSelector.from_config(SimpleNamespace(model="llama3.2"))
+        assert selector.get_model(ModelStage.VISION_ANALYSIS) == "llama3.2"
+        assert selector.get_model(ModelStage.METADATA_GENERATION) == DEFAULT_TEXT_MODEL
+
+    def test_from_config_per_stage_override(self):
+        config = SimpleNamespace(
+            model="qwen3-vl:32b",
+            vision_analysis_model="llama3.2",
+            metadata_generation_model="gpt-oss:20b",
+        )
         selector = ModelSelector.from_config(config)
         assert selector.get_model(ModelStage.VISION_ANALYSIS) == "llama3.2"
+        assert selector.get_model(ModelStage.METADATA_GENERATION) == "gpt-oss:20b"
+        assert "override" in selector.models[ModelStage.METADATA_GENERATION].description
 
-    def test_from_config_no_overrides(self):
+    def test_from_config_ignores_mock_attributes(self):
         config = MagicMock()
         config.model = "qwen3-vl:32b"
-        # No per-stage override attributes
         selector = ModelSelector.from_config(config)
         assert selector.get_model(ModelStage.VISION_ANALYSIS) == "qwen3-vl:32b"
+        assert selector.get_model(ModelStage.METADATA_GENERATION) == DEFAULT_TEXT_MODEL
 
-    def test_implemented_stages_are_vision_only(self):
-        assert frozenset({ModelStage.VISION_ANALYSIS}) == IMPLEMENTED_MODEL_STAGES
+    def test_active_stages(self):
+        assert active_stages(False) == frozenset({ModelStage.VISION_ANALYSIS})
+        assert active_stages(True) == frozenset(
+            {ModelStage.VISION_ANALYSIS, ModelStage.METADATA_GENERATION}
+        )
+
+    def test_stage_capabilities(self):
+        assert STAGE_CAPABILITY == {
+            ModelStage.VISION_ANALYSIS: "vision",
+            ModelStage.METADATA_GENERATION: "completion",
+        }
 
     def test_required_models_only_vision(self):
-        from types import SimpleNamespace
-
         selector = ModelSelector.from_config(SimpleNamespace(model="gemma4:26b"))
         required = selector.required_models()
         assert required == ["gemma4:26b"]
-        assert "gpt-oss:120b" not in required  # unimplemented metadata stage
-        assert "qwen2-vl:7b" not in required  # fallbacks are never required
+        assert "gpt-oss:120b" not in required  # text stage inactive by default
+
+    @pytest.mark.parametrize("text_enabled", [False, True])
+    def test_gpt_oss_required_iff_text_stage_active(self, text_enabled):
+        selector = ModelSelector.from_config(SimpleNamespace(model="gemma4:26b"))
+        required = selector.required_models(active_stages(text_enabled))
+        assert ("gpt-oss:120b" in required) is text_enabled
+
+    def test_required_model_specs_capability_pairs(self):
+        selector = ModelSelector.from_config(SimpleNamespace(model="gemma4:26b"))
+        assert selector.required_model_specs(active_stages(False)) == [("gemma4:26b", "vision")]
+        assert selector.required_model_specs(active_stages(True)) == [
+            ("gemma4:26b", "vision"),
+            ("gpt-oss:120b", "completion"),
+        ]
+
+    def test_required_model_specs_same_model_keeps_vision(self):
+        config = SimpleNamespace(model="qwen3-vl:32b", metadata_generation_model="QWEN3-VL:32b")
+        selector = ModelSelector.from_config(config)
+        assert selector.required_model_specs(active_stages(True)) == [("qwen3-vl:32b", "vision")]
+
+    def test_required_model_specs_dedupes_normalized_names(self):
+        config = SimpleNamespace(
+            model="library/text-and-vision", metadata_generation_model="text-and-vision:latest"
+        )
+        selector = ModelSelector.from_config(config)
+        assert selector.required_model_specs(active_stages(True)) == [("library/text-and-vision", "vision")]
+
+    def test_required_model_specs_empty(self):
+        assert ModelSelector().required_model_specs([]) == []
 
     def test_required_models_custom_stages_dedupe_in_stage_order(self):
         selector = ModelSelector()
-        stages = [ModelStage.METADATA_GENERATION, ModelStage.VISION_ANALYSIS,
-                  ModelStage.VISION_ANALYSIS]
+        stages = [ModelStage.METADATA_GENERATION, ModelStage.VISION_ANALYSIS, ModelStage.VISION_ANALYSIS]
         assert selector.required_models(stages) == [DEFAULT_VISION_MODEL, "gpt-oss:120b"]
 
     def test_bare_selector_requires_default_vision_model(self):
-        # Not the 20 GB qwen3-vl:32b of the old table.
         assert ModelSelector().required_models() == [DEFAULT_VISION_MODEL]
 
     def test_required_models_empty(self):
@@ -370,75 +315,33 @@ class TestModelSelector:
 
     def test_record_usage(self):
         selector = ModelSelector()
-        selector.record_usage(
-            stage=ModelStage.VISION_ANALYSIS,
-            model="qwen3-vl:32b",
-            success=True,
-            duration=2.5,
-        )
+        selector.record_usage(stage=ModelStage.VISION_ANALYSIS, model="qwen3-vl:32b", success=True, duration=2.5)
         assert selector.usage.total_calls == 1
 
     def test_get_usage_summary(self):
         selector = ModelSelector()
-        selector.record_usage(
-            stage=ModelStage.VISION_ANALYSIS,
-            model="qwen3-vl:32b",
-            success=True,
-            duration=2.5,
-        )
+        selector.record_usage(stage=ModelStage.VISION_ANALYSIS, model="qwen3-vl:32b", success=True, duration=2.5)
         summary = selector.get_usage_summary()
         assert summary["total_calls"] == 1
         assert summary["successful_calls"] == 1
 
     def test_get_usage_summary_no_logging(self):
         selector = ModelSelector(log_usage=False)
-        summary = selector.get_usage_summary()
-        assert summary == {"error": "Usage logging not enabled"}
+        assert selector.get_usage_summary() == {"error": "Usage logging not enabled"}
 
-    def test_is_model_available(self):
-        selector = ModelSelector()
-        assert selector.is_model_available("qwen3-vl:32b") is True
-        assert selector.is_model_available("tesseract") is True
-        assert selector.is_model_available("nonexistent-model") is False
-
-    def test_print_stage_report(self, caplog):
-        selector = ModelSelector()
-        with caplog.at_level(logging.INFO):
+    def test_print_stage_report_one_line_per_stage(self, caplog):
+        selector = ModelSelector.from_config(SimpleNamespace(model="gemma4:26b"))
+        with caplog.at_level(logging.INFO, logger="lib.model_selector"):
             selector.print_stage_report()
         assert "MODEL SELECTOR STAGE REPORT" in caplog.text
-        assert DEFAULT_VISION_MODEL in caplog.text
-        assert "Tesseract" in caplog.text or "tesseract" in caplog.text
+        assert "VISION_ANALYSIS: gemma4:26b (active this run)" in caplog.text
+        assert "METADATA_GENERATION: gpt-oss:120b (inactive)" in caplog.text
+        assert "allback" not in caplog.text
 
-    def test_stage_report_describes_resolved_model(self, caplog):
-        from types import SimpleNamespace
-
+    def test_print_stage_report_marks_active_stages(self, caplog):
         selector = ModelSelector.from_config(SimpleNamespace(model="gemma4:26b"))
-        with caplog.at_level(logging.INFO):
-            selector.print_stage_report()
-        assert "Qwen3-VL" not in caplog.text
-        assert "gemma4:26b" in caplog.text
-        assert "METADATA_GENERATION (not used by the pipeline)" in caplog.text
-        assert "VISION_ANALYSIS (not used" not in caplog.text
-        assert "qwen2-vl:7b (not used: no automatic fallback)" in caplog.text
-
-
-# ---------------------------------------------------------------------------
-# Convenience functions
-# ---------------------------------------------------------------------------
-
-
-class TestConvenienceFunctions:
-    """Test create_default_selector() and get_stage_models()."""
-
-    def test_create_default_selector(self):
-        selector = create_default_selector()
-        assert isinstance(selector, ModelSelector)
-        assert selector.get_model(ModelStage.VISION_ANALYSIS) == DEFAULT_VISION_MODEL
-
-    def test_get_stage_models(self):
-        models = get_stage_models(ModelStage.VISION_ANALYSIS)
-        assert models == [DEFAULT_VISION_MODEL, "qwen2-vl:7b"]
-
-    def test_get_stage_models_single(self):
-        models = get_stage_models(ModelStage.WEB_RESEARCH)
-        assert models == ["duckduckgo-api"]
+        with caplog.at_level(logging.INFO, logger="lib.model_selector"):
+            selector.print_stage_report(active_stages(True))
+        assert "VISION_ANALYSIS: gemma4:26b (active this run)" in caplog.text
+        assert "METADATA_GENERATION: gpt-oss:120b (active this run)" in caplog.text
+        assert "inactive" not in caplog.text

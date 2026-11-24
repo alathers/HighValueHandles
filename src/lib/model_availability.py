@@ -13,6 +13,8 @@ whether a missing Ollama model may be pulled:
 - :func:`ollama_models_dir`, :func:`check_disk` and :func:`make_disk_guard`
   locate the model store and compare free space with the download plus a
   safety margin.
+- :func:`total_memory_bytes` and :func:`memory_verdict` give an advisory
+  check of a model's size against this machine's physical memory.
 
 Only POSIX-portable facilities are used (``shutil.disk_usage``,
 ``platform``), so this works on macOS and Linux.
@@ -68,9 +70,6 @@ MAX_VARIANT_FETCHES = 8
 #: Model store of the Linux systemd service created by Ollama's install script
 #: (the service runs as the ``ollama`` user whose home is ``/usr/share/ollama``).
 LINUX_SERVICE_MODELS_DIR = Path("/usr/share/ollama/.ollama/models")
-
-#: Suffix Ollama uses for blobs that are still downloading.
-PARTIAL_BLOB_SUFFIX = "-partial"
 
 _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0", ""})
 _USER_AGENT = "bourbon-image-processor"
@@ -660,6 +659,56 @@ def make_disk_guard(
         return None
 
     return guard
+
+
+# ---------------------------------------------------------------------------
+# Memory (advisory)
+# ---------------------------------------------------------------------------
+
+#: Share of physical memory above which a model triggers a warning.
+MEMORY_WARN_FRACTION = 0.75
+
+
+def total_memory_bytes() -> int | None:
+    """Physical memory of this machine in bytes, or None if unknown.
+
+    Uses ``os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES')``, which
+    works on Linux and macOS.
+    """
+    try:
+        page = int(os.sysconf("SC_PAGE_SIZE"))
+        pages = int(os.sysconf("SC_PHYS_PAGES"))
+    except (AttributeError, ValueError, OSError, TypeError):
+        return None
+    if page <= 0 or pages <= 0:
+        return None
+    return page * pages
+
+
+def memory_verdict(model_bytes: int, total: int | None) -> tuple[str, str]:
+    """Compare a model's size with physical memory.
+
+    The size is the model's weights as ``/api/tags`` reports them; the KV
+    cache and the OS need more, so this is advisory only.
+
+    Args:
+        model_bytes: Model size in bytes.
+        total: Physical memory in bytes (None if unknown).
+
+    Returns:
+        ``(verdict, message)`` where verdict is ``'error'`` (the model is
+        larger than memory), ``'warn'`` (more than 75 % of memory), ``'ok'``
+        or ``'unknown'`` (memory could not be measured).
+    """
+    if total is None or total <= 0:
+        return "unknown", f"model needs {format_gb(model_bytes)}; physical memory could not be measured"
+    share = model_bytes / total
+    detail = f"model needs {format_gb(model_bytes)} of {format_gb(total)} physical memory ({share:.0%})"
+    if model_bytes > total:
+        return "error", detail
+    if share > MEMORY_WARN_FRACTION:
+        return "warn", detail
+    return "ok", detail
 
 
 # ---------------------------------------------------------------------------

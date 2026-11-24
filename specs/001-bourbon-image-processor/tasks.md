@@ -1,5 +1,27 @@
 # Implementation Tasks: Bourbon Image Processor
 
+> **Superseded in part (2026-11-23).** This document describes the original
+> design. The code has since changed; [README.md](../../README.md) describes what it
+> does now. In particular:
+>
+> - Lookahead and ORB/visual-similarity grouping were replaced by EXIF
+>   capture-time grouping plus the vision model's same-bottle split.
+>   `--lookahead` was removed (it now fails with exit code 2).
+> - Interactive merge and split (`[M]`/`[S]`) were removed. Review actions are
+>   `[A]ccept`, `[R]eject`, `[E]dit`, `[C]onflicts`, `[N]ext` and `[Q]uit`.
+> - `ServerBackend` and MTPLX were removed; Ollama is the only backend, and
+>   `--server-backend` / `BOURBON_SERVER_BACKEND` no longer exist.
+> - T100-T109 (vendor cache) are superseded by the web-lookup design: search
+>   providers (DuckDuckGo by default, or Brave, Ollama web search, SearXNG),
+>   verbatim quotes verified by code, a vendor image verified by the vision
+>   model (`-v`), and no OpenCV image matching.
+> - FR-018 ("retry up to 3 times") now means up to `retry.max_attempts`
+>   (`--retry-attempts`, default 3) attempts per model request, not per bottle.
+> - Configuration is the sectioned `bourbon.toml` (plus a user file, `BOURBON_*`
+>   variables and flags), shown by `bourbon-process config show`.
+> - MSRP is never taken from a price tag; the gpt-oss fact check and a publish
+>   gate with human approval decide what is publishable.
+
 **Feature**: Bourbon Image Processor
 **Branch**: `001-bourbon-image-processor`
 **Generated**: 2026-11-09
@@ -191,16 +213,16 @@
 
 ### Implementation Tasks
 
-- [ ] T100 [P] Create src/image_processor/vendor_cache.py module with VendorCache class
-- [ ] T101 [P] Implement VendorCache.search_vendor_images() method in src/image_processor/vendor_cache.py that uses extracted Bottle metadata (name, distillery, proof, batch) as search query, queries web search API (DuckDuckGo or direct distillery site scraping)
-- [ ] T102 [P] Implement VendorCache.verify_vendor_image_match() method in src/image_processor/vendor_cache.py that compares candidate vendor image to original Bottle.images using OpenCV feature matching, returns similarity score 0-1
-- [ ] T103 [P] Implement VendorCache.download_and_cache_image() method in src/image_processor/vendor_cache.py that downloads verified vendor image (>85% similarity) to bottle sub-folder as vendor_ref.jpg
-- [ ] T104 [P] Implement VendorCache.extract_reference_links() method in src/image_processor/vendor_cache.py that parses search results and extracts URLs pointing to product pages (distillery site, authorized retailers, bourbon databases)
-- [ ] T105 [P] Implement VendorCache.validate_reference_link() method in src/image_processor/vendor_cache.py that checks HTTP status code, avoids broken URLs, assigns confidence score based on source type (DISTILLERY_SITE > AUTHORIZED_RETAILER > BOURBON_DATABASE > RETAIL_AGGREGATOR)
-- [ ] T106 [P] Add VendorCache.handle_search_failure() method in src/image_processor/vendor_cache.py that logs failure gracefully, continues processing without vendor images/links (feature is non-blocking per FR-035)
-- [ ] T107 [P] Update BottleAnalyzer.process_single_bottle() in src/image_processor/bottle_analyzer.py to call VendorCache.search_vendor_images() and VendorCache.extract_reference_links() if --include-vendor-images flag enabled
-- [ ] T108 [P] Update Bottle entity creation in src/image_processor/bottle_analyzer.py to set Bottle.vendor_reference_image path and Bottle.reference_links list from VendorCache results
-- [ ] T109 [P] Update PreviewGenerator.generate_bottle_markdown() in src/image_processor/preview_generator.py to include References section in markdown if Bottle.reference_links list is non-empty and has high confidence links (confidence >= 0.8)
+- [ ] ~~T100~~ **Superseded (2026-11-23) by the web-lookup design (see banner).** T100 [P] Create src/image_processor/vendor_cache.py module with VendorCache class
+- [ ] ~~T101~~ **Superseded (2026-11-23) by the web-lookup design (see banner).** T101 [P] Implement VendorCache.search_vendor_images() method in src/image_processor/vendor_cache.py that uses extracted Bottle metadata (name, distillery, proof, batch) as search query, queries web search API (DuckDuckGo or direct distillery site scraping)
+- [ ] ~~T102~~ **Superseded (2026-11-23) by the web-lookup design (see banner).** T102 [P] Implement VendorCache.verify_vendor_image_match() method in src/image_processor/vendor_cache.py that compares candidate vendor image to original Bottle.images using OpenCV feature matching, returns similarity score 0-1
+- [ ] ~~T103~~ **Superseded (2026-11-23) by the web-lookup design (see banner).** T103 [P] Implement VendorCache.download_and_cache_image() method in src/image_processor/vendor_cache.py that downloads verified vendor image (>85% similarity) to bottle sub-folder as vendor_ref.jpg
+- [ ] ~~T104~~ **Superseded (2026-11-23) by the web-lookup design (see banner).** T104 [P] Implement VendorCache.extract_reference_links() method in src/image_processor/vendor_cache.py that parses search results and extracts URLs pointing to product pages (distillery site, authorized retailers, bourbon databases)
+- [ ] ~~T105~~ **Superseded (2026-11-23) by the web-lookup design (see banner).** T105 [P] Implement VendorCache.validate_reference_link() method in src/image_processor/vendor_cache.py that checks HTTP status code, avoids broken URLs, assigns confidence score based on source type (DISTILLERY_SITE > AUTHORIZED_RETAILER > BOURBON_DATABASE > RETAIL_AGGREGATOR)
+- [ ] ~~T106~~ **Superseded (2026-11-23) by the web-lookup design (see banner).** T106 [P] Add VendorCache.handle_search_failure() method in src/image_processor/vendor_cache.py that logs failure gracefully, continues processing without vendor images/links (feature is non-blocking per FR-035)
+- [ ] ~~T107~~ **Superseded (2026-11-23) by the web-lookup design (see banner).** T107 [P] Update BottleAnalyzer.process_single_bottle() in src/image_processor/bottle_analyzer.py to call VendorCache.search_vendor_images() and VendorCache.extract_reference_links() if --include-vendor-images flag enabled
+- [ ] ~~T108~~ **Superseded (2026-11-23) by the web-lookup design (see banner).** T108 [P] Update Bottle entity creation in src/image_processor/bottle_analyzer.py to set Bottle.vendor_reference_image path and Bottle.reference_links list from VendorCache results
+- [ ] ~~T109~~ **Superseded (2026-11-23) by the web-lookup design (see banner).** T109 [P] Update PreviewGenerator.generate_bottle_markdown() in src/image_processor/preview_generator.py to include References section in markdown if Bottle.reference_links list is non-empty and has high confidence links (confidence >= 0.8)
 
 ---
 
@@ -237,7 +259,7 @@
 - [X] T128 [P] Create tests/unit/test_image_organizer.py test file to test ImageOrganizer methods (scan_images, group_by_bottle, detect_duplicates) with test fixture images
 - [X] T129 [P] Create tests/unit/test_preview_generator.py test file to test PreviewGenerator methods (generate_bottle_markdown, save_bottle_files, generate_batch_preview_report) with mock filesystem operations
 - [X] T130 [P] Create tests/unit/test_batch_processor.py test file to test BatchProcessor methods (slice_into_batches, apply_lookahead, vision_similarity_score, process_batch) with image queues
-- [X] T131 [P] Create tests/integration/test_full_pipeline.py test file to test end-to-end processing with real images from tests/fixtures/images/straightforward/ relying on Ollama service running
+- [X] T131 [P] **Superseded (2026-11-23):** the fixture image folders under tests/fixtures/images/ were never populated; tests/integration/test_full_pipeline.py uses fakes, and real photos are covered by the opt-in live tests (BOURBON_LIVE_TESTS=1). Original task: Create tests/integration/test_full_pipeline.py test file to test end-to-end processing with real images from tests/fixtures/images/straightforward/ relying on Ollama service running
 - [X] T132 [P] Create tests/integration/test_batch_workflow.py test file to test batch processing with lookahead, preview reports, and feedback loop using test fixture images
 - [X] T133 [P] Update pyproject.toml to include pytest as dev dependency and configure pytest with tests/ directory
 - [X] T134 [P] Run pytest —co to verify all test files discovered and no syntax/import errors

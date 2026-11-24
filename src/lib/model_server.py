@@ -5,8 +5,7 @@ the pipeline talks to. The only backend is :class:`OllamaServer`, which talks
 to Ollama's REST endpoints (``/api/version``, ``/api/tags``, ``/api/ps``,
 ``/api/generate``) and, if Ollama is not running on a local URL, can spawn
 ``ollama serve``. Ollama runs on macOS and Linux, and the lifecycle code here
-only uses POSIX facilities. Further backends plug in by subclassing
-:class:`BaseModelServer` and adding a :class:`ServerBackend` member.
+only uses POSIX facilities.
 
 Ownership rules (see :class:`Ownership`):
 
@@ -26,14 +25,15 @@ exact ``ollama pull`` command.
 
 Usage::
 
-    from lib.model_server import ModelServerManager, ServerBackend
+    from lib.model_server import ModelServerManager
 
-    manager = ModelServerManager(backend=ServerBackend.OLLAMA)
+    manager = ModelServerManager()
     if manager.ensure_running() and manager.ensure_model(
         "qwen3.6:35b-a3b", capability="vision", warm=True
     ):
         client = manager.get_client()
-        text = client.image_to_text(image_path, prompt, model="qwen3.6:35b-a3b")
+        result = client.chat_with_images(prompt, [image_path], model="qwen3.6:35b-a3b")
+        print(result.content)
     manager.close()  # stops the server only if this program started it
 """
 
@@ -87,11 +87,7 @@ DEFAULT_OLLAMA_URL = "http://localhost:11434"
 #: a full-resolution photo was measured at ~43s; a cold load adds minutes.
 DEFAULT_REQUEST_TIMEOUT = 600
 
-#: Backend names that were supported once; parsing them explains the removal.
-_REMOVED_BACKENDS = frozenset({"mtplx", "mpltx"})
-
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
-_ZERO_USAGE = {"memory_mb": 0.0, "gpu_percent": 0.0, "cpu_percent": 0.0}
 
 
 class ServerStartError(RuntimeError):
@@ -101,42 +97,6 @@ class ServerStartError(RuntimeError):
 # ---------------------------------------------------------------------------
 # Enumerations and state
 # ---------------------------------------------------------------------------
-
-class ServerBackend(Enum):
-    """Model serving backend.
-
-    Attributes:
-        OLLAMA: Ollama (the only backend; the default).
-    """
-
-    OLLAMA = "ollama"
-
-    @classmethod
-    def parse(cls, value: ServerBackend | str) -> ServerBackend:
-        """Coerce a CLI/config string or enum member into a ServerBackend.
-
-        Matching is case-insensitive and ignores surrounding whitespace.
-
-        Raises:
-            ValueError: If the value does not name a supported backend. A
-                backend whose support was removed gets a message saying so.
-        """
-        if isinstance(value, cls):
-            return value
-        if isinstance(value, str):
-            key = value.strip().lower()
-            try:
-                return cls(key)
-            except ValueError:
-                pass
-            if key in _REMOVED_BACKENDS:
-                raise ValueError(
-                    f"Backend {value!r} is no longer supported: MTPLX support was removed "
-                    "because it only runs on Apple Silicon. Use 'ollama'."
-                )
-        valid = ", ".join(repr(b.value) for b in cls)
-        raise ValueError(f"Unknown backend: {value!r} (expected one of: {valid})")
-
 
 class Ownership(Enum):
     """Who is responsible for a server process.
@@ -157,13 +117,11 @@ class ServerState:
     """Snapshot of the model server's status.
 
     Attributes:
-        backend: Serving backend in use.
         is_running: Whether the server answered its identity probe.
         base_url: HTTP URL for API requests.
         pid: Process ID if we own the server (0 otherwise).
         models_loaded: Models currently resident in memory.
         memory_usage_mb: Approximate (V)RAM used by loaded models (0 if unknown).
-        gpu_usage_percent: GPU utilization (0 if unknown).
         cold_start_seconds: Time the last start took (0 if adopted).
         uptime_seconds: Seconds since we started the server (0 if adopted).
         error_message: Last lifecycle error, if any.
@@ -172,13 +130,11 @@ class ServerState:
         log_path: Log file of an owned server ('' otherwise).
     """
 
-    backend: ServerBackend
     is_running: bool = False
     base_url: str = ""
     pid: int = 0
     models_loaded: list[str] = field(default_factory=list)
     memory_usage_mb: int = 0
-    gpu_usage_percent: float = 0.0
     cold_start_seconds: float = 0.0
     uptime_seconds: float = 0.0
     error_message: Optional[str] = None
@@ -192,9 +148,9 @@ class ServerState:
 # ---------------------------------------------------------------------------
 
 class BaseModelServer(ABC):
-    """Template for a model server backend.
+    """Template for the model server (lifecycle algorithm plus hooks).
 
-    :meth:`start` implements one algorithm for every backend: adopt a server
+    :meth:`start` implements one algorithm: adopt a server
     that already answers, otherwise (if allowed and the port is free) spawn
     one, wait for it to become ready and verify it. Subclasses provide the
     hooks (``_identity_probe``, ``_can_spawn``, ``_spawn_argv``,
@@ -230,7 +186,7 @@ class BaseModelServer(ABC):
         startup_timeout: float,
         stop_grace_seconds: float,
     ):
-        """Initialize lifecycle bookkeeping shared by all backends."""
+        """Initialize lifecycle bookkeeping."""
         self.host = host
         self.port = port
         self.base_url = base_url.rstrip("/")
@@ -248,11 +204,6 @@ class BaseModelServer(ABC):
         self._atexit_registered = False
 
     # -- identity ----------------------------------------------------------
-
-    @property
-    @abstractmethod
-    def backend(self) -> ServerBackend:
-        """Return the backend enum value."""
 
     @property
     def process(self) -> Optional[subprocess.Popen]:
@@ -367,7 +318,7 @@ class BaseModelServer(ABC):
             return False
 
         timestamp = time.strftime("%Y%m%d-%H%M%S")
-        log_path = default_log_dir() / f"{self.backend.value}-{self.port}-{timestamp}.log"
+        log_path = default_log_dir() / f"ollama-{self.port}-{timestamp}.log"
         proc = ManagedProcess(argv, log_path=log_path, env=self._spawn_env(), name=self._display_name)
         logger.info("Starting %s: %s", self._display_name, " ".join(argv))
         try:
@@ -501,7 +452,7 @@ class BaseModelServer(ABC):
     def list_models(self) -> list[str]:
         """List models available without downloading."""
 
-    # Non-abstract defaults: a backend that cannot answer these reports
+    # Non-abstract defaults: a server that cannot answer these reports
     # "unknown", which makes ModelServerManager refuse automatic pulls.
 
     def model_store_path(self) -> Optional[Path]:
@@ -512,11 +463,15 @@ class BaseModelServer(ABC):
         """Estimate how much pulling ``model_name`` would download (default: unknown)."""
         return PullEstimate(
             model_name,
-            error=f"size estimation is not supported by the {self.backend.value} backend",
+            error=f"size estimation is not supported by this {self._display_name}",
         )
 
     def get_capabilities(self, model_name: str) -> Optional[set[str]]:  # noqa: ARG002
         """Capabilities of an installed model (e.g. ``{'completion', 'vision'}``), or None if unknown."""
+        return None
+
+    def installed_model_size(self, model_name: str) -> Optional[int]:  # noqa: ARG002
+        """Size in bytes of an installed model, or None if unknown."""
         return None
 
     def list_vision_models(self) -> list[str]:
@@ -526,10 +481,6 @@ class BaseModelServer(ABC):
     def manual_pull_command(self, model_name: str) -> str:
         """Shell command a user can run to download ``model_name`` themselves."""
         return f"ollama pull {shlex.quote(model_name)}"
-
-    @abstractmethod
-    def get_resource_usage(self) -> dict[str, float]:
-        """Return ``memory_mb`` / ``gpu_percent`` / ``cpu_percent`` (zeros if unknown)."""
 
     @abstractmethod
     def load_model(self, model_name: str) -> bool:
@@ -606,11 +557,6 @@ class OllamaServer(BaseModelServer):
         self.keep_alive = keep_alive
         self.probe_timeout = probe_timeout
         self._binary: Optional[str] = None
-
-    @property
-    def backend(self) -> ServerBackend:
-        """Return the backend enum value."""
-        return ServerBackend.OLLAMA
 
     # -- lifecycle hooks ---------------------------------------------------
 
@@ -699,7 +645,6 @@ class OllamaServer(BaseModelServer):
     def get_state(self) -> ServerState:
         """Return a status snapshot; ``models_loaded`` comes from ``/api/ps``."""
         state = ServerState(
-            backend=self.backend,
             is_running=self.health_check(),
             base_url=self.base_url,
             pid=self.pid,
@@ -725,12 +670,6 @@ class OllamaServer(BaseModelServer):
             if isinstance(value, (int, float)):
                 total += value
         return total / 2**20
-
-    def get_resource_usage(self) -> dict[str, float]:
-        """Return VRAM used by resident models (from ``/api/ps``); zeros on error."""
-        usage = dict(_ZERO_USAGE)
-        usage["memory_mb"] = float(self._vram_mb(self._ps()))
-        return usage
 
     # -- models ------------------------------------------------------------
 
@@ -822,6 +761,22 @@ class OllamaServer(BaseModelServer):
         if caps is not None:
             return caps
         return self._show_capabilities(str(entry.get("name")) if entry and entry.get("name") else model_name)
+
+    def installed_model_size(self, model_name: str) -> Optional[int]:
+        """Size in bytes of an installed model (the ``/api/tags`` ``size``).
+
+        Args:
+            model_name: Model tag.
+
+        Returns:
+            The size, or None if the model is not installed, the server
+            cannot be asked, or it does not report a size.
+        """
+        entry = self._find_tag(model_name)
+        size = entry.get("size") if entry is not None else None
+        if isinstance(size, bool) or not isinstance(size, (int, float)) or size <= 0:
+            return None
+        return int(size)
 
     def list_vision_models(self) -> list[str]:
         """Installed models whose capabilities include ``vision``, in ``/api/tags`` order."""
@@ -1075,20 +1030,6 @@ class OllamaServer(BaseModelServer):
 # Manager facade
 # ---------------------------------------------------------------------------
 
-def _cfg_str(config: Any, name: str) -> Optional[str]:  # noqa: ANN401
-    """Return ``config.<name>`` if it is a non-empty string, else None (Mock-safe)."""
-    value = getattr(config, name, None)
-    return value.strip() if isinstance(value, str) and value.strip() else None
-
-
-def _cfg_num(config: Any, name: str) -> Optional[float]:  # noqa: ANN401
-    """Return ``config.<name>`` if it is a real number (not bool), else None (Mock-safe)."""
-    value = getattr(config, name, None)
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    return value
-
-
 class _InstalledHints:
     """Lazily computed "installed models" text for error messages.
 
@@ -1127,9 +1068,23 @@ class _InstalledHints:
         return f"Installed {self._kind}: {', '.join(self._list()) or '(none installed)'}"
 
     def choose_line(self) -> str:
-        """``Or choose an installed vision-capable model with -m: a, b``."""
+        """``Or choose an installed vision-capable model with -m: a, b``.
+
+        The text model (``completion``) is chosen with ``--text-model``.
+        """
         names = ", ".join(self._list()) or "(none installed)"
-        return f"Or choose an installed {self._kind[:-1]} with -m: {names}"
+        flag = "--text-model" if self._capability == "completion" else "-m"
+        return f"Or choose an installed {self._kind[:-1]} with {flag}: {names}"
+
+
+def _capability_text(capability: str) -> str:
+    """Human wording of a required capability (``'vision input'``, ``'text completion'``)."""
+    cap = capability.lower()
+    if cap == "vision":
+        return "vision input"
+    if cap == "completion":
+        return "text completion"
+    return f"the '{cap}' capability"
 
 
 def _size_line(estimate: PullEstimate, disk: Optional[DiskCheck], disk_error: Optional[str]) -> str:
@@ -1150,7 +1105,7 @@ def _size_line(estimate: PullEstimate, disk: Optional[DiskCheck], disk_error: Op
 
 
 class ModelServerManager:
-    """Pipeline-facing facade over one model server backend.
+    """Pipeline-facing facade over the Ollama model server.
 
     1. :meth:`ensure_running` adopts or starts the server.
     2. :meth:`ensure_models` checks (and, only if allowed, pulls / warms) models.
@@ -1161,54 +1116,19 @@ class ModelServerManager:
         keep_running: Detach instead of stopping an owned server on close.
     """
 
-    def __init__(
-        self,
-        backend: ServerBackend | str = ServerBackend.OLLAMA,
-        config: Any | None = None,  # noqa: ANN401
-        *,
-        keep_running: bool = False,
-        **kwargs: Any,
-    ):
+    def __init__(self, *, keep_running: bool = False, **kwargs: Any) -> None:  # noqa: ANN401
         """Initialize the manager (does not start anything).
 
         Args:
-            backend: Serving backend (Ollama by default).
-            config: Optional Config object to read settings from.
             keep_running: Leave an owned server running on close.
-            **kwargs: Backend constructor parameters (override config values).
+            **kwargs: :class:`OllamaServer` constructor parameters
+                (``base_url``, ``model``, ``timeout``, ``startup_timeout``,
+                ``auto_start``, ...).
         """
-        self._backend = ServerBackend.parse(backend)
         self.keep_running = keep_running
-        self._server: BaseModelServer | None = None
         self._client: Any = None
         self._closed = False
-
-        if config is not None:
-            self._init_from_config(config, **kwargs)
-        else:
-            self._init_default(**kwargs)
-
-    def _init_default(self, **kwargs: Any) -> None:
-        """Create the backend server from keyword arguments."""
-        if self._backend is ServerBackend.OLLAMA:
-            self._server = OllamaServer(**kwargs)
-        else:  # pragma: no cover - parse() guarantees a known backend
-            raise ValueError(f"Unknown backend: {self._backend}")
-
-    def _init_from_config(self, config: Any, **kwargs: Any) -> None:  # noqa: ANN401
-        """Create the backend server from a Config object.
-
-        Only real strings/numbers on ``config`` are used, so a partially
-        populated or mocked config falls back to defaults.
-        """
-        timeout = _cfg_num(config, "timeout")
-        params: dict[str, Any] = {
-            "base_url": _cfg_str(config, "ollama_url") or DEFAULT_OLLAMA_URL,
-            "model": _cfg_str(config, "model"),
-            "timeout": timeout if timeout else DEFAULT_REQUEST_TIMEOUT,
-        }
-        params.update(kwargs)
-        self._init_default(**params)
+        self._server: BaseModelServer | None = OllamaServer(**kwargs)
 
     # -- accessors ---------------------------------------------------------
 
@@ -1218,11 +1138,6 @@ class ModelServerManager:
         if self._server is None:
             raise RuntimeError("ModelServerManager not initialized")
         return self._server
-
-    @property
-    def backend(self) -> ServerBackend:
-        """The selected backend."""
-        return self._backend
 
     @property
     def state(self) -> ServerState:
@@ -1244,14 +1159,9 @@ class ModelServerManager:
             return self.server.get_state()
         except Exception as e:
             return ServerState(
-                backend=self._backend,
                 base_url=getattr(self._server, "base_url", ""),
                 error_message=str(e),
             )
-
-    def get_resource_usage(self) -> dict[str, float]:
-        """Return current resource usage."""
-        return self.server.get_resource_usage()
 
     def list_models(self) -> list[str]:
         """List models available on the server without downloading."""
@@ -1270,14 +1180,12 @@ class ModelServerManager:
             ok = server.start()
         except Exception as e:
             logger.debug("Unexpected error starting the model server", exc_info=True)
-            server.last_error = f"Unexpected error starting {self._backend.value}: {e}"
+            server.last_error = f"Unexpected error starting Ollama: {e}"
             ok = False
         if ok:
             self._closed = False
         else:
-            logger.debug(
-                "%s model server unavailable: %s", self._backend.value, server.last_error
-            )
+            logger.debug("Ollama model server unavailable: %s", server.last_error)
         return ok
 
     def require_running(self) -> None:
@@ -1288,7 +1196,7 @@ class ModelServerManager:
         """
         if not self.ensure_running():
             raise ModelServerError(
-                f"{self._backend.value} model server is not running",
+                "Ollama model server is not running",
                 details=self.last_error or "",
             )
 
@@ -1350,67 +1258,168 @@ class ModelServerManager:
 
     def ensure_models(
         self,
-        model_names: Iterable[str],
+        models: Iterable[str | tuple[str, Optional[str]]],
         *,
         allow_pull: bool = False,
         dry_run: bool = False,
         warm: bool = False,
         capability: Optional[str] = None,
         min_free_bytes: Optional[int] = None,
+        warm_models: Optional[Iterable[str]] = None,
     ) -> bool:
-        """Apply :meth:`ensure_model` to each distinct name (no short-circuit).
+        """Apply :meth:`ensure_model` to each distinct model (no short-circuit).
 
         The server is checked once; every model is then checked so all
         problems are reported in one run.
 
+        When pulls are allowed and more than one model is missing, their
+        download sizes are added up and checked against the free space on
+        the model store once, *before any pull*: if the total does not fit,
+        a per-model breakdown is logged and nothing is pulled (this avoids
+        downloading 23 GB only to find that the next 65 GB do not fit).
+
         Args:
-            model_names: Models to check; names that normalize to the same
-                model are checked once, and an empty list succeeds without
+            models: Model names, or ``(name, capability)`` pairs. A pair's
+                capability overrides ``capability`` (None in a pair falls
+                back to it). Names that normalize to the same model are
+                checked once; if their capabilities differ, ``'vision'``
+                (the stricter one) is kept. An empty list succeeds without
                 contacting the server.
             allow_pull: See :meth:`ensure_model`.
             dry_run: See :meth:`ensure_model`.
             warm: See :meth:`ensure_model`.
-            capability: See :meth:`ensure_model`.
+            capability: Default required capability; see :meth:`ensure_model`.
             min_free_bytes: See :meth:`ensure_model`.
+            warm_models: With ``warm``, only these models are loaded (e.g.
+                the vision model, so the text model does not sit beside it
+                during the vision phase). None warms every model.
 
         Returns:
             True if every model is available.
         """
-        names: list[str] = []
-        seen: set[str] = set()
-        for name in model_names:
+        specs: list[tuple[str, Optional[str]]] = []
+        index: dict[str, int] = {}
+        for item in models:
+            if isinstance(item, tuple):
+                name, item_cap = item[0], (item[1] if len(item) > 1 else None)
+            else:
+                name, item_cap = item, None
+            cap = item_cap if item_cap is not None else capability
             key = normalize_model_name(name)
-            if key not in seen:
-                seen.add(key)
-                names.append(name)
-        if not names:
+            if key not in index:
+                index[key] = len(specs)
+                specs.append((name, cap))
+            elif cap == "vision" or specs[index[key]][1] is None:
+                specs[index[key]] = (specs[index[key]][0], cap)
+        if not specs:
             return True
         if not self._ensure_reachable(dry_run):
             return False
-        hints = _InstalledHints(self.server, capability)
+
+        warm_set = (
+            None if warm_models is None else {normalize_model_name(n) for n in warm_models}
+        )
+        hints_by_cap: dict[Optional[str], _InstalledHints] = {}
+
+        def hints_for(cap: Optional[str]) -> _InstalledHints:
+            if cap not in hints_by_cap:
+                hints_by_cap[cap] = _InstalledHints(self.server, cap)
+            return hints_by_cap[cap]
+
         floor = DEFAULT_MIN_FREE_BYTES if min_free_bytes is None else int(min_free_bytes)
+        estimates: dict[str, PullEstimate] = {}
+        availability: dict[str, tuple[bool, bool]] = {}
+        if allow_pull and len(specs) > 1:
+            availability = {name: self._availability(name) for name, _ in specs}
+            fits, estimates = self._combined_disk_check(availability, floor, dry_run)
+            if not fits:
+                # Still report capability problems of the installed models,
+                # but pull and warm nothing.
+                for name, cap in specs:
+                    if availability[name][0]:
+                        self._check_capability(name, cap, hints_for(cap))
+                return False
+
         results = [
             self._ensure_one(
                 name,
                 allow_pull=allow_pull,
                 dry_run=dry_run,
-                warm=warm,
-                capability=capability,
+                warm=warm and (warm_set is None or normalize_model_name(name) in warm_set),
+                capability=cap,
                 min_free_bytes=floor,
-                hints=hints,
+                hints=hints_for(cap),
+                estimate=estimates.get(name),
+                availability=availability.get(name),
             )
-            for name in names
+            for name, cap in specs
         ]
         return all(results)
+
+    def _availability(self, name: str) -> tuple[bool, bool]:
+        """``(installed, listing_failed)`` for one model, from one ``/api/tags`` read."""
+        installed = bool(self.server.is_model_available(name))
+        return installed, getattr(self.server, "model_listing_failed", False) is True
+
+    def _combined_disk_check(
+        self, availability: dict[str, tuple[bool, bool]], min_free_bytes: int, dry_run: bool
+    ) -> tuple[bool, dict[str, PullEstimate]]:
+        """Check that all missing models fit on the model store together.
+
+        Only applies when more than one model is missing and the local store
+        can be measured; otherwise each model is checked on its own.
+        Models whose size is unknown are left to the per-model check (which
+        refuses to pull them).
+
+        Returns:
+            ``(fits, estimates)``: False if the combined download does not
+            fit (an error with the per-model breakdown is logged), and the
+            estimates already fetched, by model name, for reuse.
+        """
+        server = self.server
+        if any(listing_failed for _, listing_failed in availability.values()):
+            return True, {}
+        missing = [name for name, (installed, _) in availability.items() if not installed]
+        if len(missing) < 2:
+            return True, {}
+        estimates = {name: server.estimate_pull(name) for name in missing}
+        store = server.model_store_path()
+        if store is None:
+            return True, estimates
+        known = {n: e for n, e in estimates.items() if e.known and not e.not_found}
+        if len(known) < 2:
+            return True, estimates
+        total = sum(e.missing_bytes or 0 for e in known.values())
+        try:
+            disk = check_disk(store, total, min_free_bytes=min_free_bytes)
+        except OSError as e:
+            logger.debug("Combined disk check could not measure %s: %s", store, e)
+            return True, estimates
+        if disk.ok:
+            return True, estimates
+        breakdown = "\n".join(
+            f"    {name}: {format_gb(est.missing_bytes or 0)} (pull manually: "
+            f"{server.manual_pull_command(name)})"
+            for name, est in known.items()
+        )
+        logger.error(
+            "%sNot enough disk space to pull all missing models: need %s (%s download + %s "
+            "safety margin), %s free on %s. Nothing was pulled.\n"
+            "%s\n"
+            "  Free up at least %s, lower the margin with --min-free-gb, or pull the "
+            "models one at a time when there is room.",
+            "Dry run: " if dry_run else "",
+            format_gb(disk.required_bytes), format_gb(total), disk.margin_text,
+            format_gb(disk.free_bytes), disk.measured_path, breakdown,
+            format_gb(disk.shortfall_bytes),
+        )
+        return False, estimates
 
     def _ensure_reachable(self, dry_run: bool) -> bool:
         """Probe (dry run) or adopt/start (real run) the server."""
         if dry_run:
             if not self.server.health_check():
-                logger.error(
-                    "Dry run: the %s server at %s is not running",
-                    self._backend.value, self.server.base_url,
-                )
+                logger.error("Dry run: the Ollama server at %s is not running", self.server.base_url)
                 return False
             return True
         return self.ensure_running()
@@ -1425,31 +1434,39 @@ class ModelServerManager:
         capability: Optional[str],
         min_free_bytes: int,
         hints: _InstalledHints,
+        estimate: Optional[PullEstimate] = None,
+        availability: Optional[tuple[bool, bool]] = None,
     ) -> bool:
-        """Check (and, if allowed, pull / warm) one model; see :meth:`ensure_model`."""
+        """Check (and, if allowed, pull / warm) one model; see :meth:`ensure_model`.
+
+        ``estimate`` and ``availability`` (``(installed, listing_failed)``)
+        reuse what the combined disk check already asked the server.
+        """
         server = self.server
         prefix = "Dry run: " if dry_run else ""
 
-        if server.is_model_available(name):
+        installed, listing_failed = availability if availability is not None else self._availability(name)
+        if installed:
             if not self._check_capability(name, capability, hints):
                 return False
             if warm and not dry_run:
                 self._warm(name)
             logger.info("%sModel '%s' is installed", prefix, name)
             return True
-        if getattr(server, "model_listing_failed", False) is True:
+        if listing_failed:
             # The server stopped answering after the reachability check: do
             # not claim the model is missing or suggest downloading it.
             logger.error(
-                "%sCould not list the models installed on the %s server at %s "
+                "%sCould not list the models installed on the Ollama server at %s "
                 "(is it still running?); cannot check '%s'.",
-                prefix, self._backend.value, server.base_url, name,
+                prefix, server.base_url, name,
             )
             return False
 
         what = f"{capability.capitalize()} model" if capability else "Model"
         cmd = server.manual_pull_command(name)
-        estimate = server.estimate_pull(name)
+        if estimate is None:
+            estimate = server.estimate_pull(name)
         if estimate.not_found:
             logger.error(
                 "Model '%s' was not found in the registry (%s returned 404). "
@@ -1472,11 +1489,11 @@ class ModelServerManager:
 
         if not allow_pull:
             logger.error(
-                "%s '%s' is not installed on the %s server at %s.\n"
+                "%s '%s' is not installed on the Ollama server at %s.\n"
                 "  %s\n"
                 "  To download it, re-run with --pull, or run: %s\n"
                 "  %s",
-                what, name, self._backend.value, server.base_url,
+                what, name, server.base_url,
                 _size_line(estimate, disk, disk_error), cmd, hints.choose_line(),
             )
             return False
@@ -1554,18 +1571,51 @@ class ModelServerManager:
         caps = self.server.get_capabilities(name)
         if caps is None:
             logger.warning(
-                "Could not determine the capabilities of '%s'; assuming it supports %s input",
-                name, capability,
+                "Could not determine the capabilities of '%s'; assuming it supports %s",
+                name, _capability_text(capability),
             )
             return True
         if capability.lower() in caps:
             return True
         logger.error(
-            "Model '%s' is installed but does not support %s input (capabilities: %s).\n"
+            "Model '%s' is installed but does not support %s (capabilities: %s).\n"
             "  %s",
-            name, capability, ", ".join(sorted(caps)) or "none reported", hints.choose_line(),
+            name, _capability_text(capability), ", ".join(sorted(caps)) or "none reported",
+            hints.choose_line(),
         )
         return False
+
+    def unload_model(self, name: str) -> bool:
+        """Release a model from the server's memory now.
+
+        Sends ``keep_alive: 0`` for the model, which works on adopted
+        (external) servers as well as owned ones. Used between pipeline
+        phases so the vision and text models are not resident together.
+
+        Args:
+            name: Model to unload.
+
+        Returns:
+            True if the server reported success. A failure is only logged.
+        """
+        try:
+            ok = bool(self.server.unload_model(name))
+        except Exception as e:  # unloading is best-effort
+            logger.warning("Could not unload model '%s': %s", name, e)
+            return False
+        if ok:
+            logger.info("Unloaded model '%s'", name)
+        else:
+            logger.warning("Could not unload model '%s'; Ollama may keep it in memory", name)
+        return ok
+
+    def installed_model_size(self, name: str) -> Optional[int]:
+        """Size in bytes of an installed model, or None if unknown."""
+        try:
+            return self.server.installed_model_size(name)
+        except Exception as e:  # advisory only
+            logger.debug("Could not read the size of '%s': %s", name, e)
+            return None
 
     def _warm(self, name: str) -> None:
         """Load a model now; a failure is only a warning."""
@@ -1617,41 +1667,3 @@ class ModelServerManager:
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:  # noqa: ANN401
         """Context manager exit: :meth:`close`."""
         self.close()
-
-
-# ---------------------------------------------------------------------------
-# Convenience functions
-# ---------------------------------------------------------------------------
-
-def create_server_manager(
-    backend: ServerBackend | str = ServerBackend.OLLAMA,
-    **kwargs: Any,
-) -> ModelServerManager:
-    """Create a ModelServerManager (Ollama by default).
-
-    Args:
-        backend: Serving backend.
-        **kwargs: Backend-specific parameters.
-
-    Returns:
-        Configured ModelServerManager.
-    """
-    return ModelServerManager(backend=backend, **kwargs)
-
-
-def create_server_manager_from_config(
-    config: Any,  # noqa: ANN401
-    backend: ServerBackend | str = ServerBackend.OLLAMA,
-    **kwargs: Any,
-) -> ModelServerManager:
-    """Create a ModelServerManager from a Config object (Ollama by default).
-
-    Args:
-        config: Config object.
-        backend: Serving backend.
-        **kwargs: Backend-specific parameters.
-
-    Returns:
-        Configured ModelServerManager.
-    """
-    return ModelServerManager(backend=backend, config=config, **kwargs)

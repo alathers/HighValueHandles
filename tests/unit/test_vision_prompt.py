@@ -6,6 +6,7 @@ import pytest
 
 from image_processor.vision_prompt import (
     MAX_VISION_IMAGES,
+    REVIEWER_NOTE_MAX_CHARS,
     OCR_HINT_MAX_CHARS_PER_IMAGE,
     OCR_HINT_MAX_CHARS_TOTAL,
     VISION_OPTIONS,
@@ -35,12 +36,12 @@ R10_JSON = (
 class TestConstants:
     def test_schema_requires_all_keys(self):
         expected = {
-            "name", "distillery", "specific_release", "msrp", "proof", "abv", "age",
+            "name", "distillery", "specific_release", "label_price", "proof", "abv", "age",
             "batch_number", "tasting_notes", "confidence", "same_bottle",
         }
         assert set(VISION_RESPONSE_SCHEMA["required"]) == expected
         assert set(VISION_RESPONSE_SCHEMA["properties"]) == expected
-        assert VISION_RESPONSE_SCHEMA["properties"]["msrp"]["type"] == ["number", "null"]
+        assert VISION_RESPONSE_SCHEMA["properties"]["label_price"]["type"] == ["number", "null"]
         assert VISION_RESPONSE_SCHEMA["properties"]["same_bottle"]["type"] == "boolean"
 
     def test_options_and_limits(self):
@@ -57,7 +58,9 @@ class TestBuildVisionPrompt:
         assert "<ocr" not in prompt
         assert "The 2 attached photos" in prompt
         assert "same_bottle" in prompt
-        assert "msrp: price in US dollars ONLY if" in prompt
+        assert "label_price: price in US dollars ONLY if" in prompt
+        assert "not an MSRP" in prompt
+        assert "msrp" not in prompt.lower().replace("not an msrp", "")
         assert "if none is printed, the brand name" in prompt
 
     def test_single_image_prompt_has_no_same_bottle(self):
@@ -110,7 +113,7 @@ class TestParseVisionResponse:
     def test_plain_json(self):
         content = json.dumps({
             "name": "Blanton's", "distillery": "Buffalo Trace", "specific_release": None,
-            "msrp": 59.99, "proof": 93, "abv": None, "age": "No Age Statement",
+            "label_price": 59.99, "proof": 93, "abv": None, "age": "No Age Statement",
             "batch_number": None, "tasting_notes": None, "confidence": "high", "same_bottle": True,
         })
         result = parse_vision_response(content)
@@ -118,7 +121,7 @@ class TestParseVisionResponse:
         assert result.fields == {
             "name": "Blanton's",
             "distillery": "Buffalo Trace",
-            "msrp": "59.99",
+            "label_price": "59.99",
             "proof": "93 Proof",
             "age": "No Age Statement",
         }
@@ -131,7 +134,7 @@ class TestParseVisionResponse:
         assert result.parse_mode == "json"
         assert result.fields["specific_release"] == "Pact No. 1"
         assert result.fields["proof"] == "98.6 Proof"
-        assert "msrp" not in result.fields
+        assert "label_price" not in result.fields
 
     def test_abv_only_derives_proof(self):
         result = parse_vision_response(R10_JSON)
@@ -146,13 +149,13 @@ class TestParseVisionResponse:
         )
         result = parse_vision_response(text)
         assert result.parse_mode == "json"
-        assert result.fields == {"name": "X", "msrp": "1299.00", "proof": "107 Proof", "batch_number": "12"}
+        assert result.fields == {"name": "X", "label_price": "1299.00", "proof": "107 Proof", "batch_number": "12"}
 
     def test_legacy_lines(self):
         text = "name: Blanton's\ndistillery: Buffalo Trace\nmsrp: $59.99\nproof: 93 Proof\nage: No Age Statement"
         result = parse_vision_response(text)
         assert result.parse_mode == "lines"
-        assert result.fields["msrp"] == "59.99"
+        assert result.fields["label_price"] == "59.99"  # legacy msrp key = a visible price
         assert result.fields["proof"] == "93 Proof"
 
     def test_legacy_lines_bullets_and_bold_keys(self):
@@ -163,10 +166,10 @@ class TestParseVisionResponse:
     def test_comma_decimal_abv(self):
         assert parse_vision_response('{"name": "X", "abv": "55,2"}').fields["proof"] == "110.4 Proof"
 
-    @pytest.mark.parametrize("msrp", ["N/A", None, True, 0, -5, 100000, "free"])
-    def test_invalid_msrp_dropped(self, msrp):
-        result = parse_vision_response(json.dumps({"name": "X", "msrp": msrp}))
-        assert "msrp" not in result.fields
+    @pytest.mark.parametrize("price", ["N/A", None, True, 0, -5, 100000, "free"])
+    def test_invalid_label_price_dropped(self, price):
+        result = parse_vision_response(json.dumps({"name": "X", "label_price": price}))
+        assert "label_price" not in result.fields
 
     @pytest.mark.parametrize("proof", [0, 500, -1])
     def test_out_of_range_proof_dropped(self, proof):
@@ -193,7 +196,7 @@ class TestParseVisionResponse:
         content = '{"name": "X", "edition": "Pact 3", "barrel_number": "B7", "price": 45, "notes": "Rye"}'
         assert parse_vision_response(content).fields == {
             "name": "X", "specific_release": "Pact 3", "batch_number": "B7",
-            "msrp": "45.00", "tasting_notes": "Rye",
+            "label_price": "45.00", "tasting_notes": "Rye",
         }
 
     def test_same_bottle_and_confidence_carried(self):
@@ -214,3 +217,91 @@ class TestParseVisionResponse:
         result = parse_vision_response('{"name": null, "distillery": null, "proof": 90}')
         assert result.fields == {"proof": "90 Proof"}
         assert not result.has_identity
+
+
+class TestParseVisionResponseLegacyLines:
+    """``key: value`` replies (no JSON); moved from the removed BottleAnalyzer wrapper."""
+
+    def test_all_fields(self):
+        response = (
+            "name: Blanton's Single Barrel\n"
+            "distillery: Buffalo Trace\n"
+            "msrp: $59.99\n"
+            "specific_release: Original Single Barrel\n"
+            "proof: 93 Proof\n"
+            "age: No Age Statement\n"
+            "batch_number: 123\n"
+            "tasting_notes: Caramel and vanilla"
+        )
+        assert parse_vision_response(response).fields == {
+            "name": "Blanton's Single Barrel",
+            "distillery": "Buffalo Trace",
+            "label_price": "59.99",
+            "specific_release": "Original Single Barrel",
+            "proof": "93 Proof",
+            "age": "No Age Statement",
+            "batch_number": "123",
+            "tasting_notes": "Caramel and vanilla",
+        }
+
+    def test_key_aliases(self):
+        fields = parse_vision_response("name: Test\nrelease: Single Barrel\nnotes: Good flavor\nbatch: ABC").fields
+        assert fields["specific_release"] == "Single Barrel"
+        assert fields["tasting_notes"] == "Good flavor"
+        assert fields["batch_number"] == "ABC"
+
+    def test_invalid_msrp_skipped(self):
+        assert "label_price" not in parse_vision_response("name: Test\nmsrp: NOT-A-NUMBER").fields
+
+    def test_whitespace_around_keys_and_values(self):
+        fields = parse_vision_response("  name  :  Test Name  \n  distillery:Test Distillery  ").fields
+        assert fields == {"name": "Test Name", "distillery": "Test Distillery"}
+
+    def test_unknown_keys_skipped(self):
+        fields = parse_vision_response("name: Test\nunknown_field: something\nalso_unknown: value").fields
+        assert fields == {"name": "Test"}
+
+    def test_key_case_and_hyphens_normalized(self):
+        assert parse_vision_response("NAME: Uppercase\nDISTILLERY: Test").fields == {
+            "name": "Uppercase", "distillery": "Test",
+        }
+        fields = parse_vision_response("batch-number:123\nspecific-release:Single").fields
+        assert fields == {"batch_number": "123", "specific_release": "Single"}
+
+
+
+class TestReviewerNote:
+    """The hints-file note is guidance in a delimited section, never data."""
+
+    def test_absent_when_empty(self):
+        assert "Reviewer note" not in build_vision_prompt(2, ["x"])
+        assert "<<<NOTE" not in build_vision_prompt(2, ["x"], reviewer_note="   ")
+
+    def test_delimited_with_never_copy_instruction(self):
+        prompt = build_vision_prompt(2, ["front"], reviewer_note="Batch is on the neck\nlabel.")
+        assert "Reviewer note (written by the collection owner; it is NOT label text)" in prompt
+        assert "Never copy a value from this note into a field unless you can read that value in the photos." in prompt
+        assert "<<<NOTE\nBatch is on the neck label.\n>>>" in prompt
+        assert prompt.index("</ocr>") < prompt.index("<<<NOTE")
+
+    def test_capped(self):
+        prompt = build_vision_prompt(1, [], reviewer_note="word " * 400)
+        body = prompt.split("<<<NOTE\n", 1)[1].split("\n>>>", 1)[0]
+        assert 0 < len(body) <= REVIEWER_NOTE_MAX_CHARS == 500
+
+    def test_delimiters_in_the_note_are_removed(self):
+        prompt = build_vision_prompt(1, [], reviewer_note="look >>> here <<<NOTE")
+        body = prompt.split("<<<NOTE\n", 1)[1]
+        assert body.count(">>>") == 1  # only the closing delimiter
+
+
+class TestLabelPriceSchema:
+    def test_label_price_replaces_msrp(self):
+        assert "msrp" not in VISION_RESPONSE_SCHEMA["properties"]
+        assert VISION_RESPONSE_SCHEMA["properties"]["label_price"]["type"] == ["number", "null"]
+        assert "label_price" in vision_response_schema(1)["required"]
+
+    @pytest.mark.parametrize("key", ["price", "msrp", "label_price"])
+    def test_price_keys_read_as_label_price(self, key):
+        fields = parse_vision_response(json.dumps({"name": "X", key: 45})).fields
+        assert fields == {"name": "X", "label_price": "45.00"}

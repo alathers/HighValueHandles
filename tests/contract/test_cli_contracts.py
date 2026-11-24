@@ -2,35 +2,21 @@
 
 Tests ensure the CLI implementation matches the specification defined in
 specs/001-bourbon-image-processor/contracts/cli-interface.md.
+
+Every test (and every CLI subprocess it starts) runs from its own
+``tmp_path`` (see the autouse ``_isolate_environment`` fixture in
+``tests/conftest.py``), so the ``process`` defaults ``-f .`` and
+``-o processed`` never touch the repo.
 """
 
 import json
 import os
-import shlex
 import shutil
 import subprocess
 import sys
-import tempfile
-from pathlib import Path
-from unittest.mock import Mock, patch
 
 import pytest
-
-# Import CLI commands for direct invocation
-from cli.commands import process_command, retry_command, feedback_command
-from lib.exceptions import OllamaConnectionError
-
-
-@pytest.fixture(autouse=True)
-def _run_in_tmp_cwd(tmp_path, monkeypatch):
-    """Run every test (and the CLI subprocesses it starts) from ``tmp_path``.
-
-    Many tests invoke ``process`` without ``-f``/``-o``; the defaults ``.``
-    and ``processed`` are relative to the working directory, so without this
-    the suite would scan the repo and write ``processed/.bourbon_output``
-    into it.
-    """
-    monkeypatch.chdir(tmp_path)
+from PIL import Image as PILImage
 
 
 #: A closed local port: CLI subprocesses that get as far as probing the model
@@ -76,21 +62,6 @@ def get_python_executable() -> str:
 class TestCLIProcessCommand:
     """Test the `process` command interface."""
 
-    def test_process_command_basic_invocation(self):
-        """Test basic `process` command can be invoked.
-
-        Contract: Process command has no required arguments, supports optional arguments
-        and defaults.
-        """
-        with tempfile.TemporaryDirectory() as tmpdir:
-            result = subprocess.run(
-                [get_python_executable(), "-m", "cli.commands", "process", "--help"],
-                capture_output=True,
-                text=True,
-            )
-            assert result.returncode == 0
-            assert "process" in result.stdout.lower()
-
     def test_process_help_text_generation(self):
         """Test `--help` generates valid help text.
 
@@ -122,7 +93,8 @@ class TestCLIProcessCommand:
             text=True,
         )
         assert result.returncode == 1
-        assert "invalid" in result.stdout.lower() or "error" in result.stdout.lower()
+        assert "configuration error" in result.stderr
+        assert "batch_size=-1 (from flag -b/--batch-size)" in result.stderr
 
     def test_process_batch_size_validation(self):
         """Test --batch-size validation: integer >= 1 OR literal 'all'.
@@ -156,7 +128,7 @@ class TestCLIProcessCommand:
         )
         assert_clean(result, 3)
 
-    def test_process_image_folder_validation(self):
+    def test_process_image_folder_validation(self, tmp_path):
         """Test --image-folder validation: must exist, be directory, be readable.
 
         Contract: See Validation Rules > Option Validation (line 392).
@@ -170,19 +142,14 @@ class TestCLIProcessCommand:
         assert result.returncode != 0  # Should fail
 
         # File instead of directory
-        with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
-            f.write("test")
-            fpath = f.name
-
-        try:
-            result = subprocess.run(
-                [get_python_executable(), "-m", "cli.commands", "process", "--image-folder", fpath],
-                capture_output=True,
-                text=True,
-            )
-            assert result.returncode != 0  # Should fail
-        finally:
-            Path(fpath).unlink()
+        fpath = tmp_path / "not_a_dir.txt"
+        fpath.write_text("test")
+        result = subprocess.run(
+            [get_python_executable(), "-m", "cli.commands", "process", "--image-folder", str(fpath)],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode != 0  # Should fail
 
     def test_process_ollama_url_invalid(self):
         """Test --ollama-url validation: must be valid URL.
@@ -195,40 +162,6 @@ class TestCLIProcessCommand:
             text=True,
         )
         assert result.returncode != 0
-
-    def test_process_lookahead_validation(self):
-        """Test --lookahead validation: integer 0-10 (deprecated and ignored, still range-checked).
-
-        Contract: See Validation Rules > Option Validation (line 397).
-        """
-        # Valid range
-        for value in ["0", "5", "10"]:
-            result = subprocess.run(
-                [get_python_executable(), "-m", "cli.commands", "process", "--lookahead", value, "--dry-run",
-                 *NO_SERVER],
-                capture_output=True,
-                text=True,
-            )
-            assert_clean(result, 3)
-
-        # Deprecated: accepted, ignored, and says so
-        assert "--lookahead is deprecated and ignored" in result.stdout + result.stderr
-
-        # Invalid: negative
-        result = subprocess.run(
-            [get_python_executable(), "-m", "cli.commands", "process", "--lookahead", "-1"],
-            capture_output=True,
-            text=True,
-        )
-        assert result.returncode == 1
-
-        # Invalid: > 10
-        result = subprocess.run(
-            [get_python_executable(), "-m", "cli.commands", "process", "--lookahead", "11"],
-            capture_output=True,
-            text=True,
-        )
-        assert result.returncode == 1
 
     def test_process_concurrency_validation(self):
         """Test --concurrency validation: integer 1-10.
@@ -261,62 +194,61 @@ class TestCLIProcessCommand:
         )
         assert result.returncode == 1
 
-    def test_process_dry_run_flag(self):
+    def test_process_dry_run_flag(self, tmp_path):
         """Test --dry-run shows what would be processed without actual processing.
 
         Contract: See Options table (line 42).
         """
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Create test images
-            test_file = Path(tmpdir) / "IMG_0001.jpg"
-            test_file.write_bytes(b"\xff\xd8\xff\xe0\x00\x10JFIF")  # JPEG header
+        photos = tmp_path / "photos"
+        photos.mkdir()
+        (photos / "IMG_0001.jpg").write_bytes(b"\xff\xd8\xff\xe0\x00\x10JFIF")  # JPEG header
 
-            out = Path(tmpdir) / "out"
-            result = subprocess.run(
-                [
-                    get_python_executable(), "-m", "cli.commands", "process", "--image-folder", tmpdir,
-                    "-o", str(out), "--dry-run", *NO_SERVER,
-                ],
-                capture_output=True,
-                text=True,
-            )
+        out = tmp_path / "out"
+        result = subprocess.run(
+            [
+                get_python_executable(), "-m", "cli.commands", "process", "--image-folder", str(photos),
+                "-o", str(out), "--dry-run", *NO_SERVER,
+            ],
+            capture_output=True,
+            text=True,
+        )
 
-            assert_clean(result, expected_dry_run_exit())
-            assert not out.exists()  # a dry run writes nothing
-            if result.returncode == 0:
-                assert "Dry-run mode" in result.stdout
-                assert "IMG_0001" in result.stdout
+        assert_clean(result, expected_dry_run_exit())
+        assert not out.exists()  # a dry run writes nothing
+        if result.returncode == 0:
+            assert "Dry-run mode" in result.stdout
+            assert "IMG_0001" in result.stdout
 
-    def test_process_debug_flag(self):
+    def test_process_debug_flag(self, tmp_path):
         """Test --debug enables verbose logging.
 
         Contract: See Options table (line 41).
         Contract: See Output Conventions > Debug Messages (line 294).
         """
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Create test images
-            test_file = Path(tmpdir) / "IMG_0001.jpg"
-            test_file.write_bytes(b"\xff\xd8\xff\xe0\x00\x10JFIF")  # JPEG header
+        photos = tmp_path / "photos"
+        photos.mkdir()
+        (photos / "IMG_0001.jpg").write_bytes(b"\xff\xd8\xff\xe0\x00\x10JFIF")  # JPEG header
 
-            # --dry-run and a closed server port keep this a pure flag test.
-            result = subprocess.run(
-                [
-                    get_python_executable(), "-m", "cli.commands", "process",
-                    "--image-folder", tmpdir, "--debug", "--dry-run", *NO_SERVER,
-                ],
-                capture_output=True,
-                text=True,
-            )
-            assert_clean(result, expected_dry_run_exit())
-            assert " - DEBUG - " in result.stdout
-            assert "TiffImagePlugin" not in result.stdout  # PIL debug noise is silenced
+        # --dry-run and a closed server port keep this a pure flag test.
+        result = subprocess.run(
+            [
+                get_python_executable(), "-m", "cli.commands", "process",
+                "--image-folder", str(photos), "-o", str(tmp_path / "out"), "--debug", "--dry-run",
+                *NO_SERVER,
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert_clean(result, expected_dry_run_exit())
+        assert " DEBUG [-] " in result.stdout
+        assert "TiffImagePlugin" not in result.stdout  # PIL debug noise is silenced
 
     def test_process_interactive_flag(self):
         """Test --interactive enables interactive CLI prompts.
 
         Contract: See Options table (line 34).
         """
-        # The autouse fixture runs this in an empty tmp_path: no images, exit 3
+        # The conftest runs this in an empty tmp_path: no images, exit 3
         # before any server contact or interactive prompt.
         result = subprocess.run(
             [
@@ -333,7 +265,7 @@ class TestCLIProcessCommand:
 
         Contract: See Options table (line 35).
         """
-        # Runs in an empty tmp_path (autouse fixture): no images, exit 3.
+        # Runs in an empty tmp_path (conftest): no images, exit 3.
         result = subprocess.run(
             [
                 get_python_executable(), "-m", "cli.commands", "process",
@@ -376,96 +308,41 @@ class TestRetryFromReportCommand:
 
 
 class TestFeedbackCommand:
-    """Test the `feedback` command interface."""
+    """Test the `feedback` command interface (run in an empty tmp_path)."""
 
-    def test_feedback_required_option(self):
-        """Test --batch option is required.
-
-        Contract: See Required Options table (line 200-202).
-        """
+    def test_feedback_without_any_batch_exits_2(self):
+        """No --batch and no batch preview in the output directory: batch not found."""
         result = subprocess.run(
             [get_python_executable(), "-m", "cli.commands", "feedback"],
             capture_output=True,
             text=True,
         )
-        assert result.returncode != 0  # Should fail without --batch
+        assert_clean(result, 2)
 
-    def test_feedback_corrections_file(self):
-        """Test --corrections option loads JSON corrections file.
+    def test_feedback_corrections_file_batch_not_found_exits_2(self, tmp_path):
+        """--corrections is accepted; a missing batch still exits 2 (checked first)."""
+        fpath = tmp_path / "corrections.json"
+        fpath.write_text(json.dumps([]))
+        result = subprocess.run(
+            [
+                get_python_executable(), "-m", "cli.commands", "feedback",
+                "--batch", "batch_001", "--corrections", str(fpath),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert_clean(result, 2)
+        assert "batch_001 not found" in result.stdout
 
-        Contract: See Optional Options table (line 208).
-        """
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            json.dump({"batch_id": "batch_001", "corrections": []}, f)
-            fpath = f.name
-
-        try:
-            result = subprocess.run(
-                [get_python_executable(), "-m", "cli.commands", "feedback", "--batch", "batch_001", "--corrections", fpath],
-                capture_output=True,
-                text=True,
-            )
-            # Should not exit with argument error
-            # May fail if batch not found (exit code 20)
-        finally:
-            Path(fpath).unlink()
-
-    def test_feedback_interactive_flag(self):
-        """Test --interactive enables interactive prompts.
-
-        Contract: See Optional Options table (line 209).
-        """
+    def test_feedback_interactive_batch_not_found_exits_2(self):
+        """--interactive is accepted; a missing batch exits 2 before any prompt."""
         result = subprocess.run(
             [get_python_executable(), "-m", "cli.commands", "feedback", "--batch", "batch_001", "--interactive"],
             capture_output=True,
             text=True,
+            stdin=subprocess.DEVNULL,
         )
-        # Should not exit with argument error
-        # May fail if batch not found (exit code 20)
-
-
-class TestEnvironmentVariables:
-    """Test CLI configuration via environment variables.
-
-    Contract: See Environment Variables (line 261-279).
-    """
-
-    def test_env_var_bourbon_image_model(self):
-        """Test BORBON_IMAGE_MODEL environment variable."""
-        env = {**os.environ, "BORBON_IMAGE_MODEL": "qwen2-vl:7b"}
-        result = subprocess.run(
-            [get_python_executable(), "-m", "cli.commands", "process", "--dry-run", *NO_SERVER],
-            capture_output=True,
-            text=True,
-            env=env,
-        )
-        assert_clean(result, 3)
-
-    def test_env_var_olllama_url(self):
-        """Test OLLLAMA_URL environment variable."""
-        env = {**os.environ, "OLLLAMA_URL": "http://localhost:11435"}
-        result = subprocess.run(
-            [get_python_executable(), "-m", "cli.commands", "process", "--dry-run", *NO_SERVER],
-            capture_output=True,
-            text=True,
-            env=env,
-        )
-        assert_clean(result, 3)
-
-    def test_env_var_always_uppercase(self):
-        """Verify CLI arguments override environment variables.
-
-        Contract: See Precedence Order (line 275-279).
-        """
-        env = {**os.environ, "BORBON_IMAGE_MODEL": "qwen2-vl:7b"}
-        result = subprocess.run(
-            [get_python_executable(), "-m", "cli.commands", "process", "--model", "qwen3-vl:32b", "--dry-run",
-             *NO_SERVER],
-            capture_output=True,
-            text=True,
-            env=env,
-        )
-        assert_clean(result, 3)
+        assert_clean(result, 2)
 
 
 class TestExitCodes:
@@ -474,194 +351,160 @@ class TestExitCodes:
     Contract: See Exit Codes (line 90-99).
     """
 
-    def test_exit_code_2_ollama_connection_failed(self):
-        """Test exit code 2 when Ollama connection fails.
+    def test_exit_code_1_invalid_ollama_port(self, tmp_path):
+        """An --ollama-url whose port is out of range is a configuration error (exit 1)."""
+        result = subprocess.run(
+            [
+                get_python_executable(), "-m", "cli.commands", "process",
+                "--image-folder", str(tmp_path), "--ollama-url", "http://localhost:99999",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert_clean(result, 1)  # rejected before any connection attempt
+        assert "ollama_url='http://localhost:99999' (from flag -u/--ollama-url)" in result.stderr
 
-        Contract: See Exit Codes (line 96).
-        Contract: See Error Handling > Ollama Connection Errors (line 438).
-        """
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Force Ollama connection to fail
-            result = subprocess.run(
-                [
-                    get_python_executable(),
-                    "-m",
-                    "cli.commands",
-                    "process",
-                    "--image-folder",
-                    tmpdir,
-                    "--ollama-url",
-                    "http://localhost:99999",  # Invalid port
-                ],
-                capture_output=True,
-                text=True,
-            )
-            assert_clean(result, 2)  # rejected before any connection attempt
-
-    def test_exit_code_3_no_valid_images(self):
+    def test_exit_code_3_no_valid_images(self, tmp_path):
         """Test exit code 3 when no valid images found.
 
         Contract: See Exit Codes (line 97).
         """
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Empty directory
-            result = subprocess.run(
-                [get_python_executable(), "-m", "cli.commands", "process", "--image-folder", tmpdir, *NO_SERVER],
-                capture_output=True,
-                text=True,
-            )
-            assert_clean(result, 3)
+        result = subprocess.run(
+            [get_python_executable(), "-m", "cli.commands", "process", "--image-folder", str(tmp_path), *NO_SERVER],
+            capture_output=True,
+            text=True,
+        )
+        assert_clean(result, 3)  # before any model server contact
 
+    def test_unreachable_ollama_exits_2(self, tmp_path):
+        """A valid --ollama-url with nothing listening, and no autostart: exit 2.
 
-class TestOutputMessages:
-    """Test CLI output messages follow conventions.
-
-    Contract: See Output Conventions (line 283-319).
-    """
-
-    def test_progress_messages_format(self):
-        """Test progress messages follow specified format.
-
-        Contract: See Output Conventions > Progress Messages (line 286-293).
+        Contract: See Pre-flight Check 2 (line 404) and Error Handling >
+        Ollama Connection Errors (line 438). Exit 1 instead when Tesseract is
+        missing (checked before the model server).
         """
-        # This would require actual processing, which is integration testing
-        # For contract tests, we verify the format strings exist in code
-        pass
-
-    def test_error_messages_format(self):
-        """Test error messages follow specified format.
-
-        Contract: See Output Conventions > Error Messages (line 302-308).
-        """
-        # Verify error message formats exist in exceptions
-        pass
-
-
-class TestPreFlightChecks:
-    """Test pre-flight checks fail before processing.
-
-    Contract: See Validation Rules > Pre-flight Checks (line 400-407).
-    """
-
-    def test_preflight_input_folder_has_images(self):
-        """Test pre-flight check verifies input folder has images.
-
-        Contract: See Pre-flight Check 1 (line 403).
-        """
-        with tempfile.TemporaryDirectory() as tmpdir:
-            result = subprocess.run(
-                [get_python_executable(), "-m", "cli.commands", "process", "--image-folder", tmpdir, *NO_SERVER],
-                capture_output=True,
-                text=True,
-            )
-            assert_clean(result, 3)  # before any model server contact
-
-    def test_preflight_ollama_reachable(self):
-        """Test pre-flight check verifies Ollama is reachable.
-
-        Contract: See Pre-flight Check 2 (line 404).
-        """
-        with tempfile.TemporaryDirectory() as tmpdir:
-            test_file = Path(tmpdir) / "IMG_0001.jpg"
-            test_file.write_bytes(b"\xff\xd8\xff\xe0\x00\x10JFIF")  # JPEG header
-
-            result = subprocess.run(
-                [
-                    get_python_executable(),
-                    "-m",
-                    "cli.commands",
-                    "process",
-                    "--image-folder",
-                    tmpdir,
-                    "--ollama-url",
-                    "http://localhost:99999",  # Invalid port
-                ],
-                capture_output=True,
-                text=True,
-            )
-            assert_clean(result, 2)
+        photos = tmp_path / "photos"
+        photos.mkdir()
+        PILImage.new("RGB", (32, 32), "white").save(photos / "IMG_0001.jpg", "JPEG")
+        result = subprocess.run(
+            [
+                get_python_executable(), "-m", "cli.commands", "process",
+                "--image-folder", str(photos), "-o", str(tmp_path / "out"),
+                *NO_SERVER, "--no-server-autostart",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert_clean(result, 1 if shutil.which("tesseract") is None else 2)
 
 
-class TestNonFatalErrorsContinue:
-    """Test individual bottle failures do not stop processing.
-
-    Contract: See Error Handling > Processing Errors (Non-Fatal) (line 449-458).
-    """
-
-    def test_individual_bottle_failure_continues(self):
-        """Test non-fatal errors allow continuation.
-
-        Contract: See Contract Tests (line 504).
-        """
-        # This requires integration testing with real images that will fail
-        pass
+def run_cli(*argv, env=None, cwd=None):
+    """Run the CLI in a subprocess (the scrubbed test environment plus ``env``)."""
+    return subprocess.run(
+        [get_python_executable(), "-m", "cli.commands", *argv],
+        capture_output=True,
+        text=True,
+        env={**os.environ, **(env or {})},
+        cwd=cwd,
+    )
 
 
-class TestMarkdownPreviewReports:
-    """Test markdown preview reports are generated.
+class TestConfiguration:
+    """Config files, environment and flags resolve to one validated Settings (exit 1 on error)."""
 
-    Contract: See Contract Tests (line 507).
-    """
+    def test_bad_project_file_value_exits_1_naming_file_and_key(self, tmp_path):
+        (tmp_path / "bourbon.toml").write_text('[processing]\nbatch_size = "abc"\n')
+        result = run_cli("process", "--dry-run", *NO_SERVER)
+        assert_clean(result, 1)
+        assert "configuration error" in result.stderr
+        assert "batch_size='abc'" in result.stderr
+        assert str(tmp_path / "bourbon.toml") in result.stderr
 
-    def test_preview_reports_generated_without_all_batch_size(self):
-        """Test preview reports generated when not using --batch-size all.
+    def test_no_config_ignores_the_file(self, tmp_path):
+        (tmp_path / "bourbon.toml").write_text('[processing]\nbatch_size = "abc"\n')
+        result = run_cli("--no-config", "process", "--dry-run", *NO_SERVER)
+        assert_clean(result, 3)  # past configuration; the empty folder has no images
 
-        Contract: Contract test (line 507).
-        """
-        # This requires integration testing with real images
-        pass
+    def test_unknown_key_in_file_exits_1(self, tmp_path):
+        (tmp_path / "bourbon.toml").write_text("[processing]\nlookahead = 3\n")
+        result = run_cli("process", "--dry-run", *NO_SERVER)
+        assert_clean(result, 1)
+        assert "unknown key 'lookahead'" in result.stderr
 
+    def test_config_show_json_lists_sources(self, tmp_path):
+        (tmp_path / "bourbon.toml").write_text("[processing]\nconcurrency = 4\n")
+        result = run_cli("config", "show", "--json", env={"BOURBON_BATCH_SIZE": "all"})
+        assert_clean(result, 0)
+        data = json.loads(result.stdout)
+        assert data["values"]["processing.concurrency"] == 4
+        assert data["sources"]["processing.concurrency"] == f"file:{tmp_path / 'bourbon.toml'}"
+        assert data["sources"]["processing.batch_size"] == "env:BOURBON_BATCH_SIZE"
+        assert data["sources"]["model.vision_model"] == "default"
+        assert data["web_provider"]["resolved"] == "duckduckgo"
 
-class TestVendorImageCaching:
-    """Test vendor image caching functionality.
+    def test_config_show_never_prints_key_values(self):
+        result = run_cli("config", "show", env={"BRAVE_API_KEY": "sekrit-xyz"})
+        assert_clean(result, 0)
+        assert "sekrit-xyz" not in result.stdout + result.stderr
+        assert "BRAVE_API_KEY set" in result.stdout
+        assert "Web search provider: brave" in result.stdout
 
-    Contract: See Contract Tests (line 508).
-    """
+    def test_config_template_parses_as_toml(self):
+        import tomllib
 
-    def test_vendor_image_caching_enabled(self):
-        """Test vendor image caching works when --include-vendor-images enabled.
+        from lib.settings import template_defaults
 
-        Contract: Contract test (line 508).
-        """
-        # This requires integration testing with real images
-        pass
+        result = run_cli("config", "template")
+        assert_clean(result, 0)
+        assert tomllib.loads(result.stdout) == template_defaults()
 
+    def test_env_concurrency_0_exits_1_naming_the_variable(self):
+        result = run_cli("process", "--dry-run", *NO_SERVER, env={"BOURBON_CONCURRENCY": "0"})
+        assert_clean(result, 1)
+        assert "concurrency=0 (from env BOURBON_CONCURRENCY): must be between 1 and 10" in result.stderr
 
-class TestConfigurationFileSupport:
-    """Test configuration file support.
+    def test_concurrency_11_exits_1(self):
+        result = run_cli("process", "--concurrency", "11", "--dry-run", *NO_SERVER)
+        assert_clean(result, 1)
+        assert "concurrency=11 (from flag --concurrency)" in result.stderr
 
-    Contract: See Configuration File Format (line 357-384).
-    """
+    def test_vendor_images_without_web_exits_1(self):
+        result = run_cli("process", "-v", "--no-web", "--dry-run", *NO_SERVER)
+        assert_clean(result, 1)
+        assert "need web lookups" in result.stderr
 
-    def test_specify_config_toml_support(self):
-        """Test CLI loads configuration from .specify_config.toml.
+    def test_brave_without_key_exits_1_naming_the_variable(self, tmp_path):
+        photos = tmp_path / "photos"
+        photos.mkdir()
+        (photos / "IMG_0001.jpg").write_bytes(b"\xff\xd8\xff\xe0\x00\x10JFIF")
+        result = run_cli("process", "-f", str(photos), "--web-provider", "brave", "--dry-run", *NO_SERVER)
+        assert_clean(result, 1)
+        assert "BRAVE_API_KEY" in result.stderr
 
-        Contract: Configuration file at project root (line 359).
-        """
-        # Create a temporary config file
-        with tempfile.TemporaryDirectory() as tmpdir:
-            config_file = Path(tmpdir) / ".specify_config.toml"
-            config_file.write_text(
-                """
-[processing]
-default_batch_size = 5
-lookahead_images = 3
+    def test_all_errors_reported_together(self):
+        result = run_cli(
+            "process", "--concurrency", "0", "--retry-attempts", "9", "--dry-run", *NO_SERVER,
+            env={"BOURBON_INTERACTIVE": "maybe"},
+        )
+        assert_clean(result, 1)
+        assert result.stderr.count("\n  - ") == 3
 
-[ollama]
-url = "http://localhost:11434"
-model = "qwen3-vl:32b"
-"""
-            )
+    def test_dry_run_reports_stages_and_provider(self, tmp_path):
+        photos = tmp_path / "photos"
+        photos.mkdir()
+        (photos / "IMG_0001.jpg").write_bytes(b"\xff\xd8\xff\xe0\x00\x10JFIF")
+        result = run_cli("process", "-f", str(photos), "-o", str(tmp_path / "out"), "--dry-run", *NO_SERVER)
+        assert_clean(result, expected_dry_run_exit())
+        if result.returncode == 0:
+            assert "Dry run: active stages: METADATA_GENERATION, VISION_ANALYSIS" in result.stdout
+            assert "Dry run: text model: gpt-oss:120b (fact check on)" in result.stdout
+            assert "Dry run: web search provider: duckduckgo" in result.stdout
 
-            # In real implementation, CLI would load this file
-            # For contract test, we verify the file format is valid TOML
-
-            import tomli
-
-            with open(config_file, "rb") as f:
-                config = tomli.load(f)
-                assert "processing" in config
-                assert "ollama" in config
+    @pytest.mark.parametrize("flag", [["--lookahead", "3"], ["--server-backend", "ollama"], ["--pull-missing"]])
+    def test_removed_flags_exit_2(self, flag):
+        result = run_cli("process", *flag)
+        assert result.returncode == 2
+        assert "unrecognized arguments" in result.stderr
 
 
 class TestEntryPoint:
@@ -721,19 +564,20 @@ class TestPipelineEdgeCases:
     """_run_pipeline after pre-flight passed."""
 
     def test_scan_finding_no_images_exits_3_without_using_the_model(self, tmp_path):
-        import argparse
         from unittest.mock import MagicMock
 
-        from cli.commands import _run_pipeline
+        from cli.commands import RunContext, _run_pipeline
+        from tests.helpers import make_settings
 
         folder = tmp_path / "photos"
         (folder / "old").mkdir(parents=True)
         (folder / "old" / ".bourbon_output").touch()
         (folder / "old" / "a.jpg").write_bytes(b"x")
-        args = argparse.Namespace(
-            image_folder=folder, output_dir=tmp_path / "out", dry_run=False, batch_size="5",
-            lookahead=3, interactive=False, model=None,
-        )
         manager = MagicMock()
-        assert _run_pipeline(args, manager, MagicMock()) == 3
+        ctx = RunContext(
+            make_settings(image_folder=folder, output_dir=tmp_path / "out"),
+            server_manager=manager,
+            model_selector=MagicMock(),
+        )
+        assert _run_pipeline(ctx) == 3
         manager.get_client.assert_not_called()

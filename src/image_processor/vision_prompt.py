@@ -5,8 +5,10 @@ one bottle and turns the model's reply into ``ExtractedMetadata`` field
 values. The request itself is made by ``OllamaClient.chat_with_images``.
 
 The prompt forbids outside knowledge (a vision model asked for an MSRP will
-otherwise invent one) and the parser accepts plain JSON, fenced JSON, JSON
-embedded in prose and, as a last resort, legacy ``key: value`` lines.
+otherwise invent one). A price visible in a photo is recorded as
+``label_price`` (a shop or retail price), never as an MSRP. The parser
+accepts plain JSON, fenced JSON, JSON embedded in prose and, as a last
+resort, legacy ``key: value`` lines.
 """
 
 from __future__ import annotations
@@ -29,7 +31,7 @@ VISION_RESPONSE_SCHEMA: dict[str, Any] = {
         "name": {"type": ["string", "null"]},
         "distillery": {"type": ["string", "null"]},
         "specific_release": {"type": ["string", "null"]},
-        "msrp": {"type": ["number", "null"]},
+        "label_price": {"type": ["number", "null"]},
         "proof": {"type": ["number", "null"]},
         "abv": {"type": ["number", "null"]},
         "age": {"type": ["string", "null"]},
@@ -42,7 +44,7 @@ VISION_RESPONSE_SCHEMA: dict[str, Any] = {
         "name",
         "distillery",
         "specific_release",
-        "msrp",
+        "label_price",
         "proof",
         "abv",
         "age",
@@ -102,7 +104,9 @@ _KEY_ALIASES = {
     "batch": "batch_number",
     "barrel_number": "batch_number",
     "notes": "tasting_notes",
-    "price": "msrp",
+    "price": "label_price",
+    "msrp": "label_price",
+    "retail_price": "label_price",
     "brand": "distillery",
 }
 _NULL_STRINGS = frozenset({"", "null", "none", "n/a", "na", "unknown", "not visible", "not shown", "-"})
@@ -110,7 +114,9 @@ _CONFIDENCE_LEVELS = frozenset({"high", "medium", "low"})
 _FENCE = re.compile(r"^\s*```(?:json|JSON)?\s*\n?(.*?)\n?\s*```\s*$", re.DOTALL)
 _NUMBER = re.compile(r"-?\d+(?:\.\d+)?")
 _THOUSANDS_COMMA = re.compile(r"(?<=\d),(?=\d{3}(?!\d))")
-_MAX_MSRP = 100000
+_MAX_PRICE = 100000
+#: Longest reviewer note included in the prompt (characters).
+REVIEWER_NOTE_MAX_CHARS = 500
 _MAX_PROOF = 200
 _MAX_ABV = 100
 
@@ -121,7 +127,7 @@ class VisionExtraction:
 
     Attributes:
         fields: ExtractedMetadata field values as strings (absent when not
-            visible): name, distillery, specific_release, msrp ('NNN.NN'),
+            visible): name, distillery, specific_release, label_price ('NNN.NN'),
             proof ('<n> Proof'), abv ('<n>%'), age, batch_number, tasting_notes.
         confidence: 'high', 'medium' or 'low' as reported, or None.
         same_bottle: False if the model saw a different product in a photo.
@@ -149,7 +155,7 @@ def _truncate(text: str, max_chars: int) -> str:
     return text[:cut].rstrip() if cut > 0 else text[:max_chars]
 
 
-def build_vision_prompt(n_images: int, ocr_hints: Sequence[str] = ()) -> str:
+def build_vision_prompt(n_images: int, ocr_hints: Sequence[str] = (), reviewer_note: str = "") -> str:
     """Build the user message for one bottle's photos.
 
     Args:
@@ -159,6 +165,10 @@ def build_vision_prompt(n_images: int, ocr_hints: Sequence[str] = ()) -> str:
             ``OCR_HINT_MAX_CHARS_PER_IMAGE`` and all hints together to
             ``OCR_HINT_MAX_CHARS_TOTAL``; with no non-empty hint the OCR section
             is omitted.
+        reviewer_note: The collection owner's "where to look" note (from the
+            hints file). Added in a delimited section the model is told never
+            to copy values from; whitespace-collapsed and capped at
+            ``REVIEWER_NOTE_MAX_CHARS``. Omitted when empty.
 
     Returns:
         Prompt text.
@@ -187,7 +197,10 @@ def build_vision_prompt(n_images: int, ocr_hints: Sequence[str] = ()) -> str:
             '"Bottled-in-Bond, Spring 2021", "Barrel Proof, Unfiltered". Leave out generic class words '
             'such as "Kentucky Straight Bourbon Whiskey"; null if none.'
         ),
-        "- msrp: price in US dollars ONLY if a price tag or printed price is visible; otherwise null.",
+        (
+            "- label_price: price in US dollars ONLY if a price tag or printed price is visible; otherwise null. "
+            "This is the price shown on the photo, not an MSRP."
+        ),
         "- proof: proof as a number, e.g. 110.4; null if only ABV is shown.",
         "- abv: alcohol by volume percent as a number, e.g. 55.2; null if not shown.",
         '- age: age statement as printed, e.g. "9 years 10 months"; null if none.',
@@ -225,7 +238,31 @@ def build_vision_prompt(n_images: int, ocr_hints: Sequence[str] = ()) -> str:
             ),
             *blocks,
         ]
+    note = _reviewer_note_text(reviewer_note)
+    if note:
+        lines += [
+            "",
+            REVIEWER_NOTE_INTRO,
+            REVIEWER_NOTE_RULE,
+            f"<<<NOTE\n{note}\n>>>",
+        ]
     return "\n".join(lines)
+
+
+#: First lines of the reviewer-note section of the prompt.
+REVIEWER_NOTE_INTRO = (
+    "Reviewer note (written by the collection owner; it is NOT label text). Use it only to know where to look."
+)
+REVIEWER_NOTE_RULE = (
+    "Never copy a value from this note into a field unless you can read that value in the photos."
+)
+
+
+def _reviewer_note_text(note: str) -> str:
+    """The note as one line, capped, with the section delimiters removed."""
+    text = " ".join(str(note or "").split())
+    text = text.replace("<<<", "").replace(">>>", "")
+    return _truncate(text, REVIEWER_NOTE_MAX_CHARS).strip()
 
 
 def _extract_json_object(text: str) -> dict[str, Any] | None:
@@ -309,7 +346,8 @@ def normalize_fields(raw: Mapping[Any, Any]) -> dict[str, str]:
     """Convert raw reply values to ExtractedMetadata's string fields.
 
     - Text fields are whitespace-collapsed; null-like strings are dropped.
-    - msrp is kept only when 0 < msrp < 100000, as 'NNN.NN'.
+    - label_price (a visible price; ``price``/``msrp`` keys are read as it) is
+      kept only when 0 < price < 100000, as 'NNN.NN'.
     - proof is derived as round(abv * 2, 1) when only ABV is given, kept only
       when 0 < proof <= 200, and formatted '<n> Proof'.
     - abv is kept when 0 < abv <= 100, formatted '<n>%'.
@@ -328,10 +366,10 @@ def normalize_fields(raw: Mapping[Any, Any]) -> dict[str, str]:
         if text:
             out[name] = text
 
-    msrp = _number(data.get("msrp"))
-    if msrp is not None and 0 < msrp < _MAX_MSRP:
+    price = _number(data.get("label_price"))
+    if price is not None and 0 < price < _MAX_PRICE:
         with contextlib.suppress(InvalidOperation):
-            out["msrp"] = str(Decimal(str(msrp)).quantize(Decimal("0.01")))
+            out["label_price"] = str(Decimal(str(price)).quantize(Decimal("0.01")))
 
     proof = _number(data.get("proof"))
     abv = _number(data.get("abv"))

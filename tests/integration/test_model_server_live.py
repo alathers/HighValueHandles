@@ -19,7 +19,7 @@ import shutil
 import pytest
 import requests
 
-from lib.model_server import ModelServerManager, Ownership, ServerBackend
+from lib.model_server import ModelServerManager, Ownership
 from lib.process_supervisor import port_in_use
 
 pytestmark = [
@@ -27,6 +27,7 @@ pytestmark = [
         os.environ.get("BOURBON_LIVE_TESTS") != "1", reason="set BOURBON_LIVE_TESTS=1 to run"
     ),
     pytest.mark.allow_model_server,
+    pytest.mark.live,
 ]
 
 
@@ -40,7 +41,7 @@ def _answers(url: str) -> bool:
 def test_ollama_adopted_as_external_and_left_running():
     if not _answers("http://localhost:11434/api/version"):
         pytest.skip("Ollama is not running on localhost:11434")
-    manager = ModelServerManager(backend=ServerBackend.OLLAMA)
+    manager = ModelServerManager()
     assert manager.ensure_running() is True
     assert manager.server.ownership is Ownership.EXTERNAL
     manager.close()
@@ -56,7 +57,7 @@ def test_owned_ollama_serve_starts_and_stops(tmp_path, monkeypatch):
     if port_in_use("127.0.0.1", 11500):
         pytest.skip("port 11500 is busy")
     monkeypatch.setenv("BOURBON_LOG_DIR", str(tmp_path))
-    manager = ModelServerManager(backend=ServerBackend.OLLAMA, base_url="http://127.0.0.1:11500")
+    manager = ModelServerManager(base_url="http://127.0.0.1:11500")
     try:
         assert manager.ensure_running() is True, manager.last_error
         assert manager.server.ownership is Ownership.OWNED

@@ -149,8 +149,3 @@ def identity_conflicts(a: Any, b: Any) -> list[str]:
     if age_a is not None and age_b is not None and abs(age_a - age_b) > 0.01:  # noqa: PLR2004
         conflicts.append("age")
     return conflicts
-
-
-def same_identity(a: Any, b: Any) -> bool:
-    """True unless a field read on both sides disagrees (see :func:`identity_conflicts`)."""
-    return not identity_conflicts(a, b)

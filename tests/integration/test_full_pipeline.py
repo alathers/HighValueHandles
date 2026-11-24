@@ -1,11 +1,10 @@
 """Integration tests for full end-to-end processing pipeline.
 
 Tests verify the complete workflow from image input to processed bottle metadata.
-Uses pytest.mark.integration to mark these tests as requiring external services.
+The vision model and OCR are mocked; nothing here talks to a model server.
 """
 
 import json
-import tempfile
 from pathlib import Path
 from unittest.mock import Mock, patch
 from PIL import Image as PILImage
@@ -16,32 +15,24 @@ from image_processor.bottle_analyzer import BottleAnalyzer
 from image_processor.batch_processor import BatchProcessor
 from image_processor.image_organizer import ImageOrganizer
 from lib.exceptions import VisionAnalysisError
-from lib.ollama_client import VisionChatResult
+from lib.ollama_client import ChatResult
 from models.bottle import Bottle, ExtractedMetadata
 from models.image import Image
 
 
-def _vision_reply(**fields) -> VisionChatResult:
+def _vision_reply(**fields) -> ChatResult:
     """A schema-shaped JSON vision reply (unset keys are null)."""
-    keys = ("name", "distillery", "specific_release", "msrp", "proof", "abv", "age",
+    keys = ("name", "distillery", "specific_release", "label_price", "proof", "abv", "age",
             "batch_number", "tasting_notes")
     body = {k: None for k in keys}
     body.update({"confidence": "high", "same_bottle": True})
     body.update(fields)
-    return VisionChatResult(content=json.dumps(body), done_reason="stop")
-
-
-# Marker for integration tests that require Ollama
-has_ollama = pytest.mark.skipif(
-    not pytest.importorskip("requests", reason="requests not available"),
-    reason="requests library required for Ollama calls"
-)
+    return ChatResult(content=json.dumps(body), done_reason="stop")
 
 
 class TestFullPipelineEndToEnd:
     """Test complete pipeline from images to bottle models."""
 
-    @has_ollama
     def test_single_bottle_basic_extraction(self, tmp_path):
         """Test extraction of bottle metadata from single image.
 
@@ -64,7 +55,7 @@ class TestFullPipelineEndToEnd:
             mock_vision.return_value = _vision_reply(
                 name="Test Bourbon",
                 distillery="Test Distillery",
-                msrp=50.00,
+                label_price=50.00,
                 proof=90,
                 age="12 Years",
             )
@@ -75,14 +66,15 @@ class TestFullPipelineEndToEnd:
             # Verify
             assert bottle_dict["name"] == "Test Bourbon"
             assert bottle_dict["distillery"] == "Test Distillery"
-            assert bottle_dict["msrp"] == "50.00"
+            assert bottle_dict["msrp"] is None  # a visible price is not an MSRP
+            assert bottle_dict["label_price"] == "50.00"
+            assert metadata.vision_attempts == 1
             assert bottle_dict["proof"] == "90 Proof"
             assert bottle_dict["age"] == "12 Years"
             assert bottle_dict["confidence"] == "HIGH"
             assert isinstance(metadata, ExtractedMetadata)
             assert mock_vision.call_args.kwargs["image_paths"] == [img_path]
 
-    @has_ollama
     def test_multi_angle_bottle_processing(self, tmp_path):
         """Test processing multiple angles of the same bottle.
 
@@ -109,7 +101,7 @@ class TestFullPipelineEndToEnd:
         with patch.object(analyzer.ollama_client, 'chat_with_images') as mock_vision, \
              patch.object(analyzer.text_extractor, 'extract_with_retry') as mock_ocr:
             mock_vision.return_value = _vision_reply(
-                name="Multi Angle Bourbon", distillery="Test Distillery", msrp=75.00
+                name="Multi Angle Bourbon", distillery="Test Distillery", label_price=75.00
             )
             mock_ocr.side_effect = [
                 "Front label text",
@@ -235,18 +227,15 @@ class TestPipelineErrorHandling:
                 with pytest.raises(VisionAnalysisError, match="Vision model exploded"):
                     analyzer.process_single_bottle([test_image])
 
-    def test_invalid_image_handling(self, tmp_path):
-        """Test handling of non-image files in input."""
-        # Create invalid file
-        invalid_path = tmp_path / "not_an_image.txt"
-        invalid_path.write_text("This is text, not an image")
+    def test_scan_skips_non_image_files(self, tmp_path):
+        """The scan returns supported images only; other files are skipped."""
+        (tmp_path / "not_an_image.txt").write_text("This is text, not an image")
+        image_path = tmp_path / "IMG_0001.jpg"
+        _create_test_image(image_path, "Bottle")
 
-        # Organizer should filter out invalid files
-        organizer = ImageOrganizer()
+        images = ImageOrganizer().scan_images(tmp_path)
 
-        # Process should handle invalid files by skipping them
-        # (This would verify the filtering logic in ImageOrganizer)
-        assert True  # Placeholder - organizer implementation handles this
+        assert [Path(img.path).name for img in images] == ["IMG_0001.jpg"]
 
 
 # Helper functions

@@ -9,7 +9,8 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
-from .image import Image
+from models.evidence import WebResearch
+from models.facts import FactSheet
 
 _MONEY_PATTERN = re.compile(r"-?\d+(?:\.\d+)?")
 _CENTS = Decimal("0.01")
@@ -80,7 +81,8 @@ class ExtractedMetadata:
     Attributes:
         name: Bottle name extracted from images.
         distillery: Distillery name extracted from images.
-        msrp: MSRP price extracted.
+        label_price: A price visible in the photos (price tag or printed
+            price), as 'NNN.NN'. A shop or retail price, never an MSRP.
         specific_release: Specific release information.
         proof: Proof statement.
         abv: Alcohol by volume as printed, e.g. '55.2%'.
@@ -97,11 +99,13 @@ class ExtractedMetadata:
         same_bottle: The vision model's verdict on whether all photos sent
             together show one product (False = mixed); None when unknown or
             when only one photo was sent.
+        vision_attempts: Vision requests made for this reading (1 = first try).
+        ocr_by_image: Cleaned OCR text per photo, keyed by file name.
     """
 
     name: Optional[str] = None
     distillery: Optional[str] = None
-    msrp: Optional[str] = None
+    label_price: Optional[str] = None
     specific_release: Optional[str] = None
     proof: Optional[str] = None
     age: Optional[str] = None
@@ -116,6 +120,8 @@ class ExtractedMetadata:
     vision_confidence: Optional[str] = None
     warnings: List[str] = field(default_factory=list)
     same_bottle: Optional[bool] = None
+    vision_attempts: int = 1
+    ocr_by_image: Dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization.
@@ -126,7 +132,7 @@ class ExtractedMetadata:
         return {
             "name": self.name,
             "distillery": self.distillery,
-            "msrp": self.msrp,
+            "label_price": self.label_price,
             "specific_release": self.specific_release,
             "proof": self.proof,
             "abv": self.abv,
@@ -140,6 +146,8 @@ class ExtractedMetadata:
             "vision_confidence": self.vision_confidence,
             "warnings": list(self.warnings),
             "same_bottle": self.same_bottle,
+            "vision_attempts": self.vision_attempts,
+            "ocr_by_image": dict(self.ocr_by_image),
         }
 
     @classmethod
@@ -147,7 +155,10 @@ class ExtractedMetadata:
         """Create ExtractedMetadata from dictionary.
 
         Keys added later (abv, vision_model, vision_confidence, warnings,
-        same_bottle) are optional, so metadata saved by older versions still loads.
+        same_bottle, vision_attempts, ocr_by_image) are optional, so metadata
+        saved by older versions still loads. Older files call the visible
+        price ``msrp``; it was always a price read from the photos, so it is
+        loaded as ``label_price``.
 
         Args:
             data: Dictionary representation of metadata.
@@ -158,7 +169,7 @@ class ExtractedMetadata:
         return cls(
             name=data.get("name"),
             distillery=data.get("distillery"),
-            msrp=data.get("msrp"),
+            label_price=data.get("label_price", data.get("msrp")),
             specific_release=data.get("specific_release"),
             proof=data.get("proof"),
             abv=data.get("abv"),
@@ -172,32 +183,46 @@ class ExtractedMetadata:
             vision_confidence=data.get("vision_confidence"),
             warnings=list(data.get("warnings") or []),
             same_bottle=data.get("same_bottle"),
+            vision_attempts=int(data.get("vision_attempts") or 1),
+            ocr_by_image={str(k): str(v) for k, v in (data.get("ocr_by_image") or {}).items()},
         )
 
 
 @dataclass
 class ReferenceLink:
-    """Reference link for vendor documentation.
+    """A web page consulted for the bottle, as published in ``reference_links``.
 
     Attributes:
-        url: URL to vendor or review page.
-        label: Descriptive label for the link.
+        url: The fetched page URL.
+        label: Page title, else its domain.
+        source_class: ``official``, ``retailer`` or ``reference`` (None if unknown).
+        retrieved_at: ISO-8601 UTC fetch time (None if unknown).
+        used_as_evidence: A supported or user fact cites this page.
     """
 
     url: str
     label: str
+    source_class: Optional[str] = None
+    retrieved_at: Optional[str] = None
+    used_as_evidence: bool = False
 
-    def to_dict(self) -> Dict[str, str]:
+    def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization.
 
         Returns:
             Dictionary representation.
         """
-        return {"url": self.url, "label": self.label}
+        return {
+            "url": self.url,
+            "label": self.label,
+            "source_class": self.source_class,
+            "retrieved_at": self.retrieved_at,
+            "used_as_evidence": self.used_as_evidence,
+        }
 
     @classmethod
-    def from_dict(cls, data: Dict[str, str]) -> "ReferenceLink":
-        """Create ReferenceLink from dictionary.
+    def from_dict(cls, data: Dict[str, Any]) -> "ReferenceLink":
+        """Create ReferenceLink from dictionary (the newer keys are optional).
 
         Args:
             data: Dictionary representation.
@@ -205,7 +230,81 @@ class ReferenceLink:
         Returns:
             ReferenceLink instance.
         """
-        return cls(url=data["url"], label=data["label"])
+        return cls(
+            url=data["url"],
+            label=data["label"],
+            source_class=data.get("source_class"),
+            retrieved_at=data.get("retrieved_at"),
+            used_as_evidence=bool(data.get("used_as_evidence", False)),
+        )
+
+
+def _cited_web_ids(facts: Optional[FactSheet]) -> set:
+    """Web source ids cited by a supported or user field."""
+    if facts is None:
+        return set()
+    out = set()
+    for fact in facts.fields.values():
+        if fact.status in ("supported", "user") and fact.value is not None:
+            out.update(c.source_id for c in fact.citations if c.source_id.startswith("W"))
+    return out
+
+
+def build_reference_links(
+    web_research: Optional[WebResearch], facts: Optional[FactSheet]
+) -> List[ReferenceLink]:
+    """Reference links from the web evidence: pages cited by a supported fact first, then the rest.
+
+    Only fetched pages (the evidence excerpts) are listed; every other
+    consulted URL is in ``web_research.pages`` (the research log).
+    """
+    if web_research is None:
+        return []
+    cited = _cited_web_ids(facts)
+    ordered = [e for e in web_research.evidence if e.source_id in cited] + [
+        e for e in web_research.evidence if e.source_id not in cited
+    ]
+    return [
+        ReferenceLink(
+            url=e.url,
+            label=(e.title or "").strip() or e.domain,
+            source_class=e.tier,
+            retrieved_at=e.fetched_at,
+            used_as_evidence=e.source_id in cited,
+        )
+        for e in ordered
+    ]
+
+
+def _person_msrp(bottle_dict: Dict[str, Any], corrections: Any) -> Optional[Decimal]:
+    """A bottle without facts: its ``msrp`` only if a person's correction set it to that value.
+
+    Anything else in ``bottle_dict['msrp']`` (a label or shop price) is not
+    an MSRP and is ignored.
+    """
+    current = parse_money(bottle_dict.get("msrp"))
+    if current is None:
+        return None
+    items = list(corrections or []) + list(bottle_dict.get("corrections") or [])
+    for item in items:
+        get = item.get if isinstance(item, dict) else (lambda key, _i=item: getattr(_i, key, None))
+        source = str(get("source") or "interactive")
+        if get("field_name") == "msrp" and (source == "interactive" or source.startswith(("feedback:", "hint:"))):
+            if parse_money(get("corrected_value")) == current:
+                return current
+    return None
+
+
+def _facts_from(value: Any) -> Optional[FactSheet]:
+    if value is None or isinstance(value, FactSheet):
+        return value
+    return FactSheet.from_dict(value)
+
+
+def _research_from(value: Any) -> Optional[WebResearch]:
+    if value is None or isinstance(value, WebResearch):
+        return value
+    return WebResearch.from_dict(value)
 
 
 @dataclass
@@ -213,7 +312,8 @@ class Quantity:
     """Quantity and valuation information.
 
     Scenarios:
-    - Single bottle crawled image: quantity=1, price=msrp, source="extracted"
+    - Analyzed bottle: price=msrp, which comes only from a verified MSRP
+      fact; None (unknown, never $0) until one exists
     - Price not visible on the label: price=None (unknown, not $0)
     - User purchased case: quantity=12, price=0, source="manual"
 
@@ -262,10 +362,17 @@ class Bottle:
     """Bottle model for storing bourbon inventory data.
 
     Core fields (required):
-    - name: Bottle name from user/naming tool.
+    - name: Bottle name as read from the label.
     - distillery: Distillery name.
-    - msrp: Recommended MSRP price; None when no price is visible (unknown).
+    - msrp: Recommended MSRP; None when unknown. A price seen in a photo is a
+      shop price (``label_price``), never an MSRP.
     - specific_release: Specific release information/style.
+
+    Schema v2: an analyzed bottle carries its ``facts`` (every value with its
+    provenance, conflicts, prices, verification, copy and publish gate), its
+    ``web_research`` (every page consulted), an optional ``vendor_image``
+    (reference only) and the ``run_id``. The flat fields above are derived
+    from the facts (see ``image_processor.enrichment.apply_fact_values``).
 
     Optional fields:
     - proof: Proof statement.
@@ -274,25 +381,30 @@ class Bottle:
 
     Derived fields:
     - quantity: Quantity and valuation info (extracted or manual).
-    - ohr: Estimated cost history value (decaying over time).
-    - total_value: quantity * price (if price > 0, else ohr); None if unknown.
+    - total_value: quantity * price; None when the price is unknown.
     - metadata: OCR-extracted text from images.
 
     Attributes:
         name: Bottle name (required).
         distillery: Distillery name (required).
         specific_release: Specific release info/style (required).
-        msrp: Recommended MSRP price (required argument; None = unknown).
+        msrp: Recommended MSRP (required argument; None = unknown).
         proof: Proof statement.
         age: Age statement (e.g., "9 years").
         tasting_notes: Tasting notes.
         metadata: OCR-extracted text.
         quantity: Quantity and valuation info (extracted or manual).
-        ohr: Estimated cost history value (decays over time).
         reference_links: List of vendor links (optional, non-blocking).
         corrections: List of user corrections.
         extracted_at: Timestamp of data extraction (timezone-aware UTC).
         abv: Alcohol by volume as printed, e.g. '55.2%'.
+        label_price: A price visible on the label or a price tag (retail,
+            never an MSRP); None if none was seen.
+        facts: The fact sheet, or None for a bottle that was not fact-checked.
+        web_research: The web research record, or None.
+        vendor_image: Accepted vendor reference image record (not for
+            publication), or None.
+        run_id: The ``process`` run that produced the bottle.
     """
 
     name: str
@@ -304,11 +416,29 @@ class Bottle:
     tasting_notes: Optional[str] = None
     metadata: Optional[ExtractedMetadata] = None
     quantity: Quantity = field(default_factory=Quantity)
-    ohr: Optional[Decimal] = None
     reference_links: List[ReferenceLink] = field(default_factory=list)
     corrections: List["Correction"] = field(default_factory=list)
     extracted_at: datetime = field(default_factory=utc_now)
     abv: Optional[str] = None
+    label_price: Optional[Decimal] = None
+    facts: Optional[FactSheet] = None
+    web_research: Optional[WebResearch] = None
+    vendor_image: Optional[Dict[str, Any]] = None
+    run_id: Optional[str] = None
+
+    @property
+    def review_required(self) -> bool:
+        """True when a person must look: an unresolved conflict or a stale description."""
+        if self.facts is None:
+            return False
+        if any(not c.resolved for c in self.facts.conflicts):
+            return True
+        return bool(self.facts.copy is not None and self.facts.copy.stale)
+
+    @property
+    def publish_ready(self) -> bool:
+        """The fact sheet's publish gate (False without facts)."""
+        return bool(self.facts is not None and self.facts.publish.get("ready"))
 
     @classmethod
     def from_analysis(
@@ -321,16 +451,17 @@ class Bottle:
         """Build a Bottle from analyzer output.
 
         This is the one supported way to turn a ``bottle_dict`` (from
-        ``BottleAnalyzer.process_single_bottle`` or a batch JSON) into a
-        Bottle. It parses the MSRP, prices the quantity at the MSRP, always
-        attaches metadata and lists every source image of the bottle.
+        ``BottleAnalyzer.process_single_bottle`` plus the enrichment phase,
+        or a batch JSON) into a Bottle. The MSRP comes only from the facts
+        (``facts.msrp`` supported or user-stated); a ``bottle_dict['msrp']``
+        without facts behind it is ignored. The quantity is priced at that
+        MSRP, metadata is always attached and every source image is listed.
 
         Args:
             bottle_dict: Bottle fields: name, distillery, specific_release,
-                msrp (any '$1,299.00' style, number or None; unparseable or
-                missing means unknown), proof, abv, age, tasting_notes,
-                batch_number, images (all photo paths, primary first) and
-                quantity.
+                proof, abv, age, tasting_notes, batch_number, label_price,
+                images (all photo paths, primary first), quantity, and the
+                schema-v2 keys facts, web_research, vendor_image and run_id.
             metadata: Extracted metadata; copied, never modified.
             quantity: Bottle count or a ready Quantity (used as-is). Default:
                 ``bottle_dict['quantity']``, else 1.
@@ -340,7 +471,13 @@ class Bottle:
             Bottle with ``metadata.source_images`` = metadata's images followed
             by any other ``bottle_dict['images']`` (order kept, no duplicates).
         """
-        msrp = parse_money(bottle_dict.get("msrp"))  # None = unknown, never $0
+        facts = _facts_from(bottle_dict.get("facts"))
+        web_research = _research_from(bottle_dict.get("web_research"))
+        # None = unknown, never $0; only a verified (or user-stated) MSRP fact counts.
+        if facts is not None:
+            msrp = parse_money(facts.flat_values().get("msrp"))
+        else:
+            msrp = _person_msrp(bottle_dict, corrections)
 
         if isinstance(quantity, Quantity):
             bottle_quantity = quantity
@@ -363,6 +500,11 @@ class Bottle:
         bottle_metadata.warnings = list(bottle_metadata.warnings)
         if not bottle_metadata.batch_number:
             bottle_metadata.batch_number = _clean_str(bottle_dict.get("batch_number"))
+        label_price = parse_money(
+            bottle_dict.get("label_price") if bottle_dict.get("label_price") not in (None, "")
+            else bottle_metadata.label_price
+        )
+        vendor_image = bottle_dict.get("vendor_image")
 
         return cls(
             name=_clean_str(bottle_dict.get("name")) or "Unknown Bottle",
@@ -378,35 +520,25 @@ class Bottle:
             corrections=[
                 Correction.from_dict(c) if isinstance(c, dict) else c for c in (corrections or [])
             ],
+            reference_links=build_reference_links(web_research, facts),
+            label_price=label_price if label_price is not None and label_price > 0 else None,
+            facts=facts,
+            web_research=web_research,
+            vendor_image=dict(vendor_image) if isinstance(vendor_image, dict) else None,
+            run_id=_clean_str(bottle_dict.get("run_id")),
         )
 
     @property
     def total_value(self) -> Optional[Decimal]:
-        """Calculate total bottle value based on quantity/price.
+        """Total value: ``quantity.count * quantity.price``.
 
         Returns:
-            Total value = quantity * price (or ohr if price = 0), or None
-            when the price is unknown and there is no ohr estimate.
-
-        Scenario 1: Single bottle from crawled images
-        - quantity.count = 1
-        - quantity.price = msrp from extracted data
-        - Total = 1 * msrp
-
-        Scenario 2: User purchased a case (manual quantity)
-        - quantity.count = 12
-        - quantity.price = 0 (no extracted price)
-        - ohr = decaying estimated value
-        - Total = 12 * ohr
+            The total, or None when the price is unknown (never a guess).
         """
         price = self.quantity.price
-        if price is not None and price > 0:
-            return Decimal(self.quantity.count) * price
-        if self.ohr:
-            return Decimal(self.quantity.count) * self.ohr
         if price is None:
             return None
-        return Decimal("0.00")
+        return Decimal(self.quantity.count) * price
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization.
@@ -423,19 +555,20 @@ class Bottle:
             "abv": self.abv,
             "age": self.age,
             "tasting_notes": self.tasting_notes,
+            "label_price": str(self.label_price) if self.label_price is not None else None,
             "quantity": self.quantity.to_dict(),
-            "ohr": str(self.ohr) if self.ohr else None,
             "extracted_at": self.extracted_at.isoformat(),
+            "run_id": self.run_id,
+            "reference_links": [link.to_dict() for link in self.reference_links],
+            "corrections": [correction.to_dict() for correction in self.corrections],
+            "facts": self.facts.to_dict() if self.facts is not None else None,
+            "web_research": self.web_research.to_dict() if self.web_research is not None else None,
+            "vendor_image": dict(self.vendor_image) if self.vendor_image is not None else None,
+            "review_required": self.review_required,
         }
 
         if self.metadata:
             data["metadata"] = self.metadata.to_dict()
-
-        if self.reference_links:
-            data["reference_links"] = [link.to_dict() for link in self.reference_links]
-
-        if self.corrections:
-            data["corrections"] = [correction.to_dict() for correction in self.corrections]
 
         return data
 
@@ -455,13 +588,8 @@ class Bottle:
 
         quantity = Quantity.from_dict(data.get("quantity", {}))
 
-        reference_links = []
-        if "reference_links" in data:
-            reference_links = [ReferenceLink.from_dict(item) for item in data["reference_links"]]
-
-        corrections = []
-        if "corrections" in data:
-            corrections = [Correction.from_dict(item) for item in data["corrections"]]
+        reference_links = [ReferenceLink.from_dict(item) for item in data.get("reference_links") or []]
+        corrections = [Correction.from_dict(item) for item in data.get("corrections") or []]
 
         extracted_at = utc_now()
         if data.get("extracted_at"):
@@ -478,10 +606,14 @@ class Bottle:
             tasting_notes=data.get("tasting_notes"),
             metadata=metadata,
             quantity=quantity,
-            ohr=Decimal(data["ohr"]) if data.get("ohr") else None,
             reference_links=reference_links,
             corrections=corrections,
             extracted_at=extracted_at,
+            label_price=parse_money(data.get("label_price")),
+            facts=_facts_from(data.get("facts")),
+            web_research=_research_from(data.get("web_research")),
+            vendor_image=dict(data["vendor_image"]) if isinstance(data.get("vendor_image"), dict) else None,
+            run_id=data.get("run_id"),
         )
 
     def to_json(self, indent: int = 2) -> str:
@@ -512,71 +644,71 @@ class Bottle:
         return cls.from_dict(data)
 
     def to_markdown(self) -> str:
-        """Convert to Markdown for website publication.
+        """The bottle document in Markdown (same as ``PreviewGenerator.generate_bottle_markdown``).
 
         Returns:
             Markdown formatted string.
         """
-        lines = [f"# {self.name}", ""]
-        lines.append(f"**Distillery:** {self.distillery}")
-        lines.append("")
-        lines.append(f"**MSRP:** {format_money(self.msrp)}")
+        from image_processor.preview_generator import render_bottle_markdown
 
-        if self.proof:
-            lines.append(f"**Proof:** {self.proof}")
+        return render_bottle_markdown(self)
 
-        if self.abv:
-            lines.append(f"**ABV:** {self.abv}")
 
-        if self.age:
-            lines.append(f"**Age:** {self.age}")
-
-        lines.append("")
-        lines.append("## Release Information")
-        lines.append(self.specific_release)
-        lines.append("")
-
-        if self.tasting_notes:
-            lines.append("## Tasting Notes")
-            lines.append(self.tasting_notes)
-            lines.append("")
-
-        if self.quantity.count > 1 or self.quantity.source == "manual":
-            lines.append("## Quantity")
-            lines.append(f"**Count:** {self.quantity.count}")
-            if self.quantity.price is not None and self.quantity.price > 0:
-                lines.append(f"**Price:** ${self.quantity.price}/bottle")
-            lines.append(f"**Total Value:** {format_money(self.total_value)}")
-            lines.append("")
-            lines.append(f"*Source: {self.quantity.source}*")
-            lines.append("")
-
-        if self.reference_links:
-            lines.append("## References")
-            for link in self.reference_links:
-                lines.append(f"- [{link.label}]({link.url})")
-            lines.append("")
-
-        return "\n".join(lines)
+#: Allowed ``Correction.source`` forms (see :class:`Correction`).
+CORRECTION_SOURCE_INTERACTIVE = "interactive"
+CORRECTION_SOURCE_PREFIXES = ("feedback:", "hint:")
 
 
 @dataclass
 class Correction:
-    """User correction for extracted bottle data.
+    """A human correction to one field of one bottle.
 
-    Used in retry-from-report workflow to incorporate manual corrections.
+    A correction is always aimed at a single bottle by its ``bottle_id`` (the
+    run-assigned ID, see ``PreviewGenerator.bottle_id_for``); it is never
+    matched to a bottle by field value, so an edit can never land on another
+    bottle. ``original_value`` is the value the person saw; a correction is
+    applied only while the bottle still holds that value
+    (:func:`image_processor.corrections.apply_corrections`).
 
     Attributes:
         field_name: Name of field to correct.
-        original_value: Original extracted value.
+        original_value: The value the person saw when correcting.
         corrected_value: User-provided corrected value.
+        bottle_id: The bottle the correction is for (required).
         corrected_at: Timestamp of correction.
+        source: Where the correction came from: ``'interactive'``
+            (interactive review), ``'feedback:<file>'`` (a corrections file
+            or a retry report) or ``'hint:<file>#<id>: <text>'`` (a hint file).
     """
 
     field_name: str
     original_value: str
     corrected_value: str
+    bottle_id: str
     corrected_at: datetime = field(default_factory=utc_now)
+    source: str = CORRECTION_SOURCE_INTERACTIVE
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.bottle_id, str) or not self.bottle_id.strip():
+            raise ValueError("Correction.bottle_id must be a non-empty string")
+        if not isinstance(self.field_name, str) or not self.field_name.strip():
+            raise ValueError("Correction.field_name must be a non-empty string")
+        if self.corrected_value is None:
+            # str(None) would otherwise publish the literal text "None".
+            raise ValueError(
+                f"Correction of {self.field_name!r} for {self.bottle_id} has no corrected_value"
+            )
+        if not isinstance(self.source, str) or not (
+            self.source == CORRECTION_SOURCE_INTERACTIVE
+            or (
+                self.source.startswith(CORRECTION_SOURCE_PREFIXES)
+                and len(self.source.split(":", 1)[1].strip()) > 0
+            )
+        ):
+            raise ValueError(
+                "Correction.source must be 'interactive', 'feedback:<file>' or "
+                f"'hint:<file>#<id>: <text>', got {self.source!r}"
+            )
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization.
@@ -585,10 +717,12 @@ class Correction:
             Dictionary representation of correction.
         """
         return {
+            "bottle_id": self.bottle_id,
             "field_name": self.field_name,
             "original_value": self.original_value,
             "corrected_value": self.corrected_value,
             "corrected_at": self.corrected_at.isoformat(),
+            "source": self.source,
         }
 
     @classmethod
@@ -600,7 +734,16 @@ class Correction:
 
         Returns:
             Correction instance.
+
+        Raises:
+            ValueError: If ``bottle_id`` is missing or empty, or ``source``
+                is not an allowed form.
         """
+        if not data.get("bottle_id"):
+            raise ValueError(
+                f"Correction for field {data.get('field_name')!r} has no bottle_id; "
+                "every correction must name the bottle it is for"
+            )
         corrected_at = utc_now()
         if data.get("corrected_at"):
             corrected_at = parse_timestamp(data["corrected_at"])
@@ -609,68 +752,7 @@ class Correction:
             field_name=data["field_name"],
             original_value=data["original_value"],
             corrected_value=data["corrected_value"],
+            bottle_id=str(data["bottle_id"]),
             corrected_at=corrected_at,
+            source=data.get("source") or CORRECTION_SOURCE_INTERACTIVE,
         )
-
-
-@dataclass
-class BatchPreviewReport:
-    """Preview report for a processed batch of bottles.
-
-    Contains markdown summary, grouping information, and instructions
-    for user feedback in interactive processing mode.
-
-    Attributes:
-        report_id: Unique identifier for this report.
-        batch_id: Identifier for the batch this report summarizes.
-        generated_timestamp: When the report was generated.
-        markdown_content: Full markdown content of the report.
-        report_path: Filesystem path where the report is saved.
-    """
-
-    report_id: str
-    batch_id: str
-    generated_timestamp: datetime = field(default_factory=utc_now)
-    markdown_content: str = ""
-    report_path: Optional[Path] = None
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for serialization.
-
-        Returns:
-            Dictionary representation of batch preview report.
-        """
-        return {
-            "report_id": self.report_id,
-            "batch_id": self.batch_id,
-            "generated_timestamp": self.generated_timestamp.isoformat(),
-            "markdown_content": self.markdown_content,
-            "report_path": str(self.report_path) if self.report_path else None,
-        }
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "BatchPreviewReport":
-        """Create BatchPreviewReport from dictionary.
-
-        Args:
-            data: Dictionary representation of batch preview report.
-
-        Returns:
-            BatchPreviewReport instance.
-        """
-        generated_timestamp = utc_now()
-        if data.get("generated_timestamp"):
-            generated_timestamp = parse_timestamp(data["generated_timestamp"])
-
-        report_path = None
-        if "report_path" in data and data["report_path"]:
-            report_path = Path(data["report_path"])
-
-        return cls(
-            report_id=data["report_id"],
-            batch_id=data["batch_id"],
-            generated_timestamp=generated_timestamp,
-            markdown_content=data.get("markdown_content", ""),
-            report_path=report_path,
-        )
-

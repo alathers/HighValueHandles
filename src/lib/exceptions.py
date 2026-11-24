@@ -81,12 +81,62 @@ class VisionTimeoutError(VisionAnalysisError):
     pass
 
 
+class VisionTransientError(VisionAnalysisError):
+    """A vision call failed in a way that may succeed when repeated.
+
+    Raised for HTTP 5xx, 408 and 429 answers and for request failures other
+    than connect errors and timeouts. Retry policies may repeat the call.
+    """
+
+    pass
+
+
 class VisionModelUnavailableError(AIModelError):
     """The vision model cannot be used at all on this server.
 
     Raised when the model is not installed, is incompatible with the running
     server version, or lacks the ``vision`` capability. Fatal for the run:
     every bottle would fail the same way.
+    """
+
+    pass
+
+
+class TextAnalysisError(AIModelError):
+    """A text-model (fact-check) call failed for one bottle.
+
+    Raised for HTTP 4xx answers (other than 404) and non-JSON bodies. Never
+    fatal for the run: the bottle's fact check is recorded as failed.
+    """
+
+    pass
+
+
+class TextResponseError(TextAnalysisError):
+    """The text model answered, but the output was unusable (empty, truncated, unparseable)."""
+
+    pass
+
+
+class TextTimeoutError(TextAnalysisError):
+    """The text model did not respond within the read timeout."""
+
+    pass
+
+
+class TextTransientError(TextAnalysisError):
+    """A text call failed in a way that may succeed when repeated (HTTP 5xx/408/429, request error)."""
+
+    pass
+
+
+class TextModelUnavailableError(AIModelError):
+    """The text model cannot be used on this server.
+
+    Raised when the model is not installed, is incompatible with the running
+    server version, or lacks the ``completion`` capability. Not listed in
+    :data:`FATAL_MODEL_ERRORS`: the fact-check stage reports it per bottle
+    and the label-only results are still saved.
     """
 
     pass
@@ -117,23 +167,6 @@ class ValidationError(BourbonException):
     """Error during data validation or schema validation."""
 
     pass
-
-
-class DuplicateImageError(FileSystemError):
-    """Error when duplicate image detected."""
-
-    def __init__(self, image_path: str, existing_path: str):
-        """Initialize duplicate image error.
-
-        Args:
-            image_path: Path of duplicate image.
-            existing_path: Path of existing image.
-        """
-        message = f"Duplicate image detected: {image_path}"
-        details = f"Existing image at: {existing_path}"
-        super().__init__(message, details)
-        self.image_path = image_path
-        self.existing_path = existing_path
 
 
 class RetryExhaustedError(BourbonException):

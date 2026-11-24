@@ -9,7 +9,9 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from image_processor.bottle_analyzer import MIXED_GROUP_WARNING, BottleAnalyzer
+import threading
+
+from image_processor.bottle_analyzer import LATE_ANSWER_WARNING, MIXED_GROUP_WARNING, BottleAnalyzer
 from image_processor.text_extractor import TextExtractor
 from image_processor.vision_prompt import (
     VISION_MAX_IMAGE_EDGE,
@@ -17,9 +19,8 @@ from image_processor.vision_prompt import (
     VISION_RESPONSE_SCHEMA,
     VISION_SYSTEM_PROMPT,
 )
-from lib.config import DEFAULT_VISION_MODEL
+from lib.constants import DEFAULT_VISION_MODEL
 from lib.duplicates import DuplicateDetector
-from lib.error_handling import RetryManager
 from lib.exceptions import (
     AIModelError,
     ModelServerError,
@@ -30,23 +31,24 @@ from lib.exceptions import (
     VisionTimeoutError,
 )
 from lib.model_selector import ModelStage
-from lib.ollama_client import OllamaClient, VisionChatResult
+from lib.ollama_client import OllamaClient, ChatResult
+from lib.retry import RetryPolicy
 from models.bottle import ExtractedMetadata
 from models.image import Image, ImageCategory
 
 
-def _reply(content=None, done_reason="stop", **fields) -> VisionChatResult:
+def _reply(content=None, done_reason="stop", **fields) -> ChatResult:
     """A vision reply: raw ``content``, or a schema-shaped JSON object from ``fields``."""
     if content is None:
         body = {
             k: None
-            for k in ("name", "distillery", "specific_release", "msrp", "proof", "abv", "age",
+            for k in ("name", "distillery", "specific_release", "label_price", "proof", "abv", "age",
                       "batch_number", "tasting_notes")
         }
         body.update({"confidence": "high", "same_bottle": True})
         body.update(fields)
         content = json.dumps(body)
-    return VisionChatResult(content=content, done_reason=done_reason, prompt_eval_count=10, eval_count=5)
+    return ChatResult(content=content, done_reason=done_reason, prompt_eval_count=10, eval_count=5)
 
 
 def _vision_analyzer(**kwargs) -> tuple[BottleAnalyzer, Mock]:
@@ -54,10 +56,10 @@ def _vision_analyzer(**kwargs) -> tuple[BottleAnalyzer, Mock]:
     client = Mock(spec=OllamaClient)
     extractor = Mock(spec=TextExtractor)
     extractor.extract_with_retry.return_value = ""
+    kwargs.setdefault("sleep", lambda _seconds: None)
     analyzer = BottleAnalyzer(
         text_extractor=kwargs.pop("text_extractor", extractor),
         ollama_client=client,
-        image_organizer=Mock(),
         **kwargs,
     )
     return analyzer, client
@@ -68,55 +70,42 @@ class TestBottleAnalyzerInitialization:
 
     @patch("image_processor.bottle_analyzer.TextExtractor")
     @patch("image_processor.bottle_analyzer.OllamaClient")
-    @patch("image_processor.bottle_analyzer.RetryManager")
-    @patch("image_processor.bottle_analyzer.ImageOrganizer")
-    def test_analyzer_default_initialization(self, mock_organizer, mock_retry, mock_ollama, mock_extractor):
-        """Test analyzer initializes with default dependencies."""
+    def test_analyzer_default_initialization(self, mock_ollama, mock_extractor):
+        """Defaults: own OCR extractor and client, a 3-attempt retry policy."""
         mock_extractor.return_value = Mock(spec=TextExtractor)
         mock_ollama.return_value = Mock(spec=OllamaClient)
-        mock_retry.return_value = Mock(spec=RetryManager)
-        mock_organizer.return_value = Mock()
 
         analyzer = BottleAnalyzer()
 
         assert analyzer.text_extractor is not None
         assert analyzer.ollama_client is not None
-        assert analyzer.retry_manager is not None
-        assert analyzer.image_organizer is not None
-
-        # Verify dependencies were created
-        mock_extractor.assert_called_once()
+        assert analyzer.retry_policy == RetryPolicy()
+        assert not hasattr(analyzer, "retry_manager")
+        assert not hasattr(analyzer, "image_organizer")
+        mock_extractor.assert_called_once_with(analyzer.retry_policy)
         mock_ollama.assert_called_once()
-        mock_retry.assert_called_once()
-        mock_organizer.assert_called_once()
 
-    @patch("image_processor.bottle_analyzer.ImageOrganizer")
-    def test_analyzer_custom_dependencies(self, mock_organizer):
+    def test_analyzer_custom_dependencies(self):
         """Test analyzer uses provided custom dependencies."""
         mock_text_extractor = Mock(spec=TextExtractor)
         mock_ollama_client = Mock(spec=OllamaClient)
-        mock_retry_manager = Mock(spec=RetryManager)
-        mock_organizer.return_value = Mock()
 
         analyzer = BottleAnalyzer(
             text_extractor=mock_text_extractor,
             ollama_client=mock_ollama_client,
-            retry_manager=mock_retry_manager,
-            image_organizer=mock_organizer.return_value,
+            retry_policy=RetryPolicy.DISABLED,
         )
 
         assert analyzer.text_extractor is mock_text_extractor
         assert analyzer.ollama_client is mock_ollama_client
-        assert analyzer.retry_manager is mock_retry_manager
-        assert analyzer.image_organizer is mock_organizer.return_value
+        assert analyzer.retry_policy is RetryPolicy.DISABLED
 
 
 class TestBottleAnalyzerProcessSingleBottle:
     """Test process_single_bottle method."""
 
     @patch("image_processor.bottle_analyzer.OllamaClient")
-    @patch("image_processor.bottle_analyzer.ImageOrganizer")
-    def test_process_single_bottle_success(self, mock_organizer, mock_ollama):
+    def test_process_single_bottle_success(self, mock_ollama):
         """Test successful processing of single bottle images."""
         # Setup mocks
         mock_text_extractor = Mock(spec=TextExtractor)
@@ -126,14 +115,13 @@ class TestBottleAnalyzerProcessSingleBottle:
         analyzer = BottleAnalyzer(
             text_extractor=mock_text_extractor,
             ollama_client=mock_ollama.return_value,
-            image_organizer=Mock(),
         )
 
         # Mock analyze_with_vision_model
         mock_metadata = ExtractedMetadata(
             name="Test Bottle",
             distillery="Test Distillery",
-            msrp="49.99",
+            label_price="49.99",
             specific_release="Single Barrel",
             full_text="Test OCR text",
             selected_text="Test OCR text",
@@ -153,14 +141,14 @@ class TestBottleAnalyzerProcessSingleBottle:
             # Verify results
             assert bottle_dict["name"] == "Test Bottle"
             assert bottle_dict["distillery"] == "Test Distillery"
-            assert bottle_dict["msrp"] == "49.99"
+            assert bottle_dict["label_price"] == "49.99"
+            assert bottle_dict["msrp"] is None  # a visible price is never an MSRP
             assert bottle_dict["specific_release"] == "Single Barrel"
             assert len(bottle_dict["images"]) == 2
             assert metadata.name == "Test Bottle"
 
     @patch("image_processor.bottle_analyzer.OllamaClient")
-    @patch("image_processor.bottle_analyzer.ImageOrganizer")
-    def test_process_single_bottle_with_bill_images(self, mock_organizer, mock_ollama):
+    def test_process_single_bottle_with_bill_images(self, mock_ollama):
         """Test processing preferentially skips BILL category images."""
         mock_text_extractor = Mock(spec=TextExtractor)
         mock_text_extractor.extract_with_retry.return_value = "OCR text"
@@ -169,13 +157,12 @@ class TestBottleAnalyzerProcessSingleBottle:
         analyzer = BottleAnalyzer(
             text_extractor=mock_text_extractor,
             ollama_client=mock_ollama.return_value,
-            image_organizer=Mock(),
         )
 
         mock_metadata = ExtractedMetadata(
             name="Test",
             distillery="Test",
-            msrp="29.99",
+            label_price="29.99",
             specific_release="Test",
             full_text="OCR",
             selected_text="OCR",
@@ -195,8 +182,7 @@ class TestBottleAnalyzerProcessSingleBottle:
             assert bottle_dict["name"] == "Test"
 
     @patch("image_processor.bottle_analyzer.OllamaClient")
-    @patch("image_processor.bottle_analyzer.ImageOrganizer")
-    def test_process_single_bottle_ocr_extraction_error_continues(self, mock_organizer, mock_ollama):
+    def test_process_single_bottle_ocr_extraction_error_continues(self, mock_ollama):
         """Test OCR extraction errors are caught and logged, processing continues."""
         mock_text_extractor = Mock(spec=TextExtractor)
         # First image raises error, second succeeds
@@ -209,13 +195,12 @@ class TestBottleAnalyzerProcessSingleBottle:
         analyzer = BottleAnalyzer(
             text_extractor=mock_text_extractor,
             ollama_client=mock_ollama.return_value,
-            image_organizer=Mock(),
         )
 
         mock_metadata = ExtractedMetadata(
             name="Test",
             distillery="Test",
-            msrp="29.99",
+            label_price="29.99",
             full_text="Success text",
             selected_text="Success text",
             source_images=["/path.jpg"],
@@ -232,8 +217,7 @@ class TestBottleAnalyzerProcessSingleBottle:
             assert metadata.full_text == "Success text"
 
     @patch("image_processor.bottle_analyzer.OllamaClient")
-    @patch("image_processor.bottle_analyzer.ImageOrganizer")
-    def test_process_single_bottle_all_ocr_fails_uses_vision_only(self, mock_organizer, mock_ollama):
+    def test_process_single_bottle_all_ocr_fails_uses_vision_only(self, mock_ollama):
         """Test when all OCR fails, uses vision model response only."""
         mock_text_extractor = Mock(spec=TextExtractor)
         mock_text_extractor.extract_with_retry.side_effect = [Exception("Failed"), Exception("Failed")]
@@ -242,13 +226,12 @@ class TestBottleAnalyzerProcessSingleBottle:
         analyzer = BottleAnalyzer(
             text_extractor=mock_text_extractor,
             ollama_client=mock_ollama.return_value,
-            image_organizer=Mock(),
         )
 
         mock_metadata = ExtractedMetadata(
             name="Vision Only",
             distillery="Distillery",
-            msrp="39.99",
+            label_price="39.99",
             full_text="",  # No OCR text
             selected_text="",
             source_images=["/path.jpg"],
@@ -261,8 +244,7 @@ class TestBottleAnalyzerProcessSingleBottle:
             assert bottle_dict["name"] == "Vision Only"
 
     @patch("image_processor.bottle_analyzer.OllamaClient")
-    @patch("image_processor.bottle_analyzer.ImageOrganizer")
-    def test_process_single_bottle_no_primary_image(self, mock_organizer, mock_ollama):
+    def test_process_single_bottle_no_primary_image(self, mock_ollama):
         """Test behavior when no primary image is available."""
         mock_text_extractor = Mock(spec=TextExtractor)
         mock_text_extractor.extract_with_retry.return_value = "OCR text"
@@ -271,7 +253,6 @@ class TestBottleAnalyzerProcessSingleBottle:
         analyzer = BottleAnalyzer(
             text_extractor=mock_text_extractor,
             ollama_client=mock_ollama.return_value,
-            image_organizer=Mock(),
         )
 
         # No primary image set
@@ -286,7 +267,7 @@ class TestBottleAnalyzerProcessSingleBottle:
             mock_analyze.return_value = ExtractedMetadata(
                 name="Fallback",
                 distillery="Test",
-                msrp="29.99",
+                label_price="29.99",
                 full_text="OCR text",
                 selected_text="OCR text",
                 source_images=["/img1.jpg"],
@@ -298,8 +279,7 @@ class TestBottleAnalyzerProcessSingleBottle:
             mock_analyze.assert_called_once()
 
     @patch("image_processor.bottle_analyzer.OllamaClient")
-    @patch("image_processor.bottle_analyzer.ImageOrganizer")
-    def test_process_single_bottle_empty_images(self, mock_organizer, mock_ollama):
+    def test_process_single_bottle_empty_images(self, mock_ollama):
         """Test processing with empty image list."""
         mock_text_extractor = Mock(spec=TextExtractor)
         mock_ollama.return_value = Mock(spec=OllamaClient)
@@ -307,7 +287,6 @@ class TestBottleAnalyzerProcessSingleBottle:
         analyzer = BottleAnalyzer(
             text_extractor=mock_text_extractor,
             ollama_client=mock_ollama.return_value,
-            image_organizer=Mock(),
         )
 
         images = []
@@ -315,7 +294,7 @@ class TestBottleAnalyzerProcessSingleBottle:
         mock_metadata = ExtractedMetadata(
             name="Empty",
             distillery="Test",
-            msrp="0.00",
+            label_price="0.00",
             full_text="",
             selected_text="",
             source_images=[],
@@ -326,54 +305,6 @@ class TestBottleAnalyzerProcessSingleBottle:
             # Should still produce a bottle dict with unknown name
             assert bottle_dict["name"] == "Empty"
             assert len(bottle_dict["images"]) == 0
-
-
-class TestBottleAnalyzerGroupImagesByBottle:
-    """Test group_images_by_bottle method."""
-
-    @patch("image_processor.bottle_analyzer.ImageOrganizer")
-    def test_group_images_delegates_to_organizer(self, mock_organizer):
-        """Test grouping delegates to ImageOrganizer."""
-        mock_group_method = Mock(return_value=[[Mock()], [Mock()]])
-        mock_organizer.return_value.group_by_bottle = mock_group_method
-
-        analyzer = BottleAnalyzer(image_organizer=mock_organizer.return_value)
-
-        images = [
-            Image(path="/img1.jpg", category="BOTTLE"),
-            Image(path="/img2.jpg", category="BOTTLE"),
-            Image(path="/img3.jpg", category="BOTTLE"),
-        ]
-
-        groups = analyzer.group_images_by_bottle(images, similarity_threshold=0.8)
-
-        # Verify delegation
-        mock_group_method.assert_called_once_with(images, 0.8)
-        assert len(groups) == 2
-
-    @patch("image_processor.bottle_analyzer.ImageOrganizer")
-    def test_group_images_custom_threshold(self, mock_organizer):
-        """Test custom similarity threshold is passed through."""
-        mock_group_method = Mock(return_value=[[Mock()]])
-        mock_organizer.return_value.group_by_bottle = mock_group_method
-
-        analyzer = BottleAnalyzer(image_organizer=mock_organizer.return_value)
-
-        groups = analyzer.group_images_by_bottle([], similarity_threshold=0.9)
-
-        mock_group_method.assert_called_once_with([], 0.9)
-
-    @patch("image_processor.bottle_analyzer.ImageOrganizer")
-    def test_group_images_empty_list(self, mock_organizer):
-        """Test grouping empty image list."""
-        mock_group_method = Mock(return_value=[])
-        mock_organizer.return_value.group_by_bottle = mock_group_method
-
-        analyzer = BottleAnalyzer(image_organizer=mock_organizer.return_value)
-
-        groups = analyzer.group_images_by_bottle([])
-
-        assert groups == []
 
 
 class TestBottleAnalyzerDetectQuantity:
@@ -390,9 +321,9 @@ class TestBottleAnalyzerDetectQuantity:
         analyzer = BottleAnalyzer()
         images = [Image(path="/img.jpg", category="BOTTLE")]
 
-        with patch.object(analyzer, "_estimate_quantity_from_images", return_value=1):
-            quantity = analyzer.detect_quantity(images)
-            assert quantity == 1
+        mock_detector = Mock(spec=DuplicateDetector)
+        mock_detector.generate_hash.return_value = "hash1"
+        assert analyzer.detect_quantity(images, duplicate_detector=mock_detector) == 1
 
     def test_detect_quantity_duplicate_images_returns_count(self):
         """Test duplicate hashes detected correctly."""
@@ -427,9 +358,8 @@ class TestBottleAnalyzerDetectQuantity:
             Image(path="/img3.jpg", category="BOTTLE"),
         ]
 
-        with patch.object(analyzer, "_estimate_quantity_from_images", return_value=1):
-            quantity = analyzer.detect_quantity(images, duplicate_detector=mock_detector)
-            assert quantity == 1
+        quantity = analyzer.detect_quantity(images, duplicate_detector=mock_detector)
+        assert quantity == 1
 
     def test_detect_quantity_hash_generation_error_logs_warning(self):
         """Test hash generation errors are logged and don't crash."""
@@ -446,23 +376,15 @@ class TestBottleAnalyzerDetectQuantity:
         quantity = analyzer.detect_quantity(images, duplicate_detector=mock_detector)
         assert quantity == 1  # Only one successful hash
 
-    def test_detect_quantity_visual_estimation_used(self):
-        """Test visual estimation is used when image count differs from hash count."""
+    def test_detect_quantity_is_largest_identical_set(self):
+        """Quantity is the largest set of byte-identical photos (no visual heuristic)."""
         analyzer = BottleAnalyzer()
         mock_detector = Mock(spec=DuplicateDetector)
-
-        # 6 images, 2 unique hashes (suggests 3 images each)
-        mock_detector.generate_hash.side_effect = [
-            "hashA", "hashA", "hashA",  # 6 images with 2 unique hashes
-            "hashB", "hashB", "hashB",
-        ]
-
+        mock_detector.generate_hash.side_effect = ["hashA", "hashA", "hashA", "hashB", "hashB", "hashB"]
         images = [Image(path=f"/img{i}.jpg", category="BOTTLE") for i in range(6)]
 
-        with patch.object(analyzer, "_estimate_quantity_from_images", return_value=2):
-            quantity = analyzer.detect_quantity(images, duplicate_detector=mock_detector)
-            # Should return max(3, 2) = 3
-            assert quantity == 3
+        assert analyzer.detect_quantity(images, duplicate_detector=mock_detector) == 3
+        assert not hasattr(BottleAnalyzer, "_estimate_quantity_from_images")
 
 
 class TestBottleAnalyzerCalculateConfidence:
@@ -475,7 +397,7 @@ class TestBottleAnalyzerCalculateConfidence:
         metadata = ExtractedMetadata(
             name="Test",
             distillery="Distillery",
-            msrp="49.99",
+            label_price="49.99",
             specific_release="Release",
             proof="90 Proof",
             age="10 Years",
@@ -494,7 +416,7 @@ class TestBottleAnalyzerCalculateConfidence:
         metadata = ExtractedMetadata(
             name="Test",
             distillery="Distillery",
-            msrp="49.99",
+            label_price="49.99",
             specific_release="",  # Empty
             proof="90 Proof",
             age="",  # Empty
@@ -513,7 +435,7 @@ class TestBottleAnalyzerCalculateConfidence:
         metadata = ExtractedMetadata(
             name="",  # Empty
             distillery="",  # Empty
-            msrp="",
+            label_price="",
             specific_release="",  # Empty
             proof="",  # Empty
             age="5 Years",  # Only one field
@@ -550,7 +472,7 @@ class TestBottleAnalyzerAnalyzeWithVisionModel:
         client.chat_with_images.return_value = _reply(
             name="Blanton's",
             distillery="Buffalo Trace",
-            msrp=59.99,
+            label_price=59.99,
             proof=93,
             age="No Age Statement",
         )
@@ -561,7 +483,7 @@ class TestBottleAnalyzerAnalyzeWithVisionModel:
 
         assert metadata.name == "Blanton's"
         assert metadata.distillery == "Buffalo Trace"
-        assert metadata.msrp == "59.99"
+        assert metadata.label_price == "59.99"
         assert metadata.proof == "93 Proof"
         assert metadata.age == "No Age Statement"
         assert metadata.full_text == "OCR text"
@@ -598,7 +520,7 @@ class TestBottleAnalyzerAnalyzeWithVisionModel:
             content=(
                 "name: Blanton's\n"
                 "distillery: Buffalo Trace\n"
-                "msrp: $59.99\n"
+                "price: $59.99\n"
                 "proof: 93 Proof\n"
                 "age: No Age Statement"
             )
@@ -607,7 +529,7 @@ class TestBottleAnalyzerAnalyzeWithVisionModel:
         metadata = analyzer.analyze_with_vision_model(Path("/test.jpg"), "OCR text", model="m")
 
         assert metadata.name == "Blanton's"
-        assert metadata.msrp == "59.99"
+        assert metadata.label_price == "59.99"
         assert metadata.proof == "93 Proof"
         assert metadata.full_text == "OCR text"
 
@@ -634,11 +556,10 @@ class TestBottleAnalyzerAnalyzeWithVisionModel:
         "error",
         [
             VisionModelUnavailableError("model 'm' not found"),
-            OllamaConnectionError("Cannot reach Ollama"),
             ModelServerError("not running"),
         ],
     )
-    def test_fatal_errors_propagate_unchanged(self, error):
+    def test_unusable_model_errors_propagate_unchanged(self, error):
         analyzer, client = _vision_analyzer()
         client.chat_with_images.side_effect = error
 
@@ -648,19 +569,33 @@ class TestBottleAnalyzerAnalyzeWithVisionModel:
         assert exc_info.value is error
         client.chat_with_images.assert_called_once()  # never retried
 
-    def test_timeout_propagates_without_retry(self):
+    def test_connection_error_retried_then_propagates_unchanged(self):
+        """A refused connection may pass; after the policy's attempts it is still fatal."""
+        error = OllamaConnectionError("Cannot reach Ollama")
         analyzer, client = _vision_analyzer()
-        client.chat_with_images.side_effect = VisionTimeoutError("too slow")
+        client.chat_with_images.side_effect = error
 
-        with pytest.raises(VisionTimeoutError):
+        with pytest.raises(OllamaConnectionError) as exc_info:
             analyzer.analyze_with_vision_model([Path("/a.jpg")], "", model="m")
 
-        client.chat_with_images.assert_called_once()
+        assert exc_info.value is error
+        assert exc_info.value.attempts == 3
+        assert client.chat_with_images.call_count == 3
 
-    def test_empty_content_retried_once_then_raises(self):
-        """Empty content (e.g. thinking used the whole budget) is retried once."""
-        analyzer, client = _vision_analyzer()
-        client.chat_with_images.return_value = VisionChatResult(
+    def test_timeout_retried_once_only(self):
+        analyzer, client = _vision_analyzer(retry_policy=RetryPolicy(max_attempts=5))
+        client.chat_with_images.side_effect = VisionTimeoutError("too slow")
+
+        with pytest.raises(VisionTimeoutError) as excinfo:
+            analyzer.analyze_with_vision_model([Path("/a.jpg")], "", model="m")
+
+        assert client.chat_with_images.call_count == 2
+        assert excinfo.value.attempts == 2
+
+    def test_empty_content_retried_then_raises(self):
+        """Empty content (e.g. thinking used the whole budget) is retried up to the policy."""
+        analyzer, client = _vision_analyzer(retry_policy=RetryPolicy(max_attempts=2))
+        client.chat_with_images.return_value = ChatResult(
             content="", thinking="hmm" * 100, done_reason="length"
         )
 
@@ -677,6 +612,8 @@ class TestBottleAnalyzerAnalyzeWithVisionModel:
 
         assert metadata.name == "Second Try"
         assert client.chat_with_images.call_count == 2
+        assert metadata.vision_attempts == 2
+        assert LATE_ANSWER_WARNING.format(attempt=2) in metadata.warnings
 
     def test_all_null_reply_raises(self):
         """A reply without name, distillery or release is unusable."""
@@ -686,7 +623,7 @@ class TestBottleAnalyzerAnalyzeWithVisionModel:
         with pytest.raises(VisionResponseError, match="no identifying fields"):
             analyzer.analyze_with_vision_model([Path("/a.jpg")], "", model="m")
 
-        assert client.chat_with_images.call_count == 2
+        assert client.chat_with_images.call_count == 3  # the default policy
 
     def test_truncated_non_json_reply_raises(self):
         analyzer, client = _vision_analyzer()
@@ -880,7 +817,7 @@ class TestBottleAnalyzerVisionSelection:
         assert kwargs["error"] is None
         assert kwargs["input_tokens"] == 10
         assert kwargs["output_tokens"] == 5
-        assert kwargs["fallback_used"] is False
+        assert "fallback_used" not in kwargs
 
     def test_explicit_model_beats_selector(self):
         selector = Mock()
@@ -917,72 +854,6 @@ class TestBottleAnalyzerVisionSelection:
         assert analyzer._resolve_vision_model(None) == DEFAULT_VISION_MODEL
 
 
-class TestBottleAnalyzerEstimateQuantityFromImages:
-    """Test _estimate_quantity_from_images method."""
-
-    def test_estimate_quantity_single_hash_returns_one(self):
-        """Test single hash group returns quantity 1."""
-        analyzer = BottleAnalyzer()
-        mock_detector = Mock(spec=DuplicateDetector)
-        mock_detector.generate_hash.return_value = "hash123"
-
-        images = [Image(path=f"/img{i}.jpg", category="BOTTLE") for i in range(3)]
-
-        with patch("image_processor.bottle_analyzer.DuplicateDetector", return_value=mock_detector):
-            quantity = analyzer._estimate_quantity_from_images(images)
-            assert quantity == 1
-
-    def test_estimate_quantity_duplicate_hashes_high_count(self):
-        """Test many duplicate hashes suggests multiple bottles."""
-        analyzer = BottleAnalyzer()
-        mock_detector = Mock(spec=DuplicateDetector)
-
-        # 6 identical hashes (more than MAX_ANGLES_PER_BOTTLE = 4)
-        mock_detector.generate_hash.return_value = "hash123"
-
-        images = [Image(path=f"/img{i}.jpg", category="BOTTLE") for i in range(6)]
-
-        # Mock DuplicateDetector inside the method
-        with patch("image_processor.bottle_analyzer.DuplicateDetector", return_value=mock_detector):
-            quantity = analyzer._estimate_quantity_from_images(images)
-            # 6 // 4 + 1 = 2 bottles
-            assert quantity == 2
-
-    def test_estimate_quantity_hash_error_returns_one(self):
-        """Test hash generation errors return quantity 1."""
-        analyzer = BottleAnalyzer()
-        mock_detector = Mock(spec=DuplicateDetector)
-        mock_detector.generate_hash.side_effect = Exception("Hash error")
-
-        images = [Image(path="/img.jpg", category="BOTTLE")]
-
-        with patch("image_processor.bottle_analyzer.DuplicateDetector", return_value=mock_detector):
-            quantity = analyzer._estimate_quantity_from_images(images)
-            assert quantity == 1
-
-    def test_estimate_quantity_empty_images_returns_one(self):
-        """Test empty image list returns quantity 1."""
-        analyzer = BottleAnalyzer()
-
-        quantity = analyzer._estimate_quantity_from_images([])
-        assert quantity == 1
-
-    def test_estimate_quantity_mixed_hashes(self):
-        """Test mixed hash patterns."""
-        analyzer = BottleAnalyzer()
-        mock_detector = Mock(spec=DuplicateDetector)
-
-        # 2 images with hash A, 2 with hash B (within max angles)
-        mock_detector.generate_hash.side_effect = ["hashA", "hashA", "hashB", "hashB"]
-
-        images = [Image(path=f"/img{i}.jpg", category="BOTTLE") for i in range(4)]
-
-        with patch("image_processor.bottle_analyzer.DuplicateDetector", return_value=mock_detector):
-            quantity = analyzer._estimate_quantity_from_images(images)
-            # Max count is 2, within limit, returns 1
-            assert quantity == 1
-
-
 class TestBottleAnalyzerBuildBottleDict:
     """Test _build_bottle_dict method."""
 
@@ -993,7 +864,7 @@ class TestBottleAnalyzerBuildBottleDict:
         metadata = ExtractedMetadata(
             name="Blanton's",
             distillery="Buffalo Trace",
-            msrp="59.99",
+            label_price="59.99",
             specific_release="Single Barrel",
             proof="93 Proof",
             age="No Age Statement",
@@ -1010,7 +881,8 @@ class TestBottleAnalyzerBuildBottleDict:
 
         assert bottle_dict["name"] == "Blanton's"
         assert bottle_dict["distillery"] == "Buffalo Trace"
-        assert bottle_dict["msrp"] == "59.99"
+        assert bottle_dict["label_price"] == "59.99"
+        assert bottle_dict["msrp"] is None
         assert bottle_dict["specific_release"] == "Single Barrel"
         assert bottle_dict["proof"] == "93 Proof"
         assert bottle_dict["age"] == "No Age Statement"
@@ -1026,7 +898,7 @@ class TestBottleAnalyzerBuildBottleDict:
         metadata = ExtractedMetadata(
             name="",  # Empty
             distillery="Buffalo Trace",
-            msrp="59.99",
+            label_price="59.99",
             specific_release="Single Barrel",
             full_text="",
             selected_text="",
@@ -1046,7 +918,7 @@ class TestBottleAnalyzerBuildBottleDict:
         metadata = ExtractedMetadata(
             name="",  # Empty
             distillery="",  # Empty
-            msrp="",
+            label_price="",
             specific_release="",  # Empty
             full_text="",
             selected_text="",
@@ -1066,7 +938,7 @@ class TestBottleAnalyzerBuildBottleDict:
         metadata = ExtractedMetadata(
             name="",  # Empty
             distillery="Test Distillery",
-            msrp="29.99",
+            label_price="29.99",
             specific_release="",  # Empty
             full_text="",
             selected_text="",
@@ -1096,6 +968,7 @@ class TestBottleAnalyzerBuildBottleDict:
         assert bottle_dict["name"] == "Unknown Bottle"
         assert bottle_dict["distillery"] == "Unknown Distillery"
         assert bottle_dict["msrp"] is None  # unknown, not $0.00
+        assert bottle_dict["label_price"] is None
         assert bottle_dict["specific_release"] == ""
         assert bottle_dict["quantity"] == 1
 
@@ -1106,7 +979,7 @@ class TestBottleAnalyzerBuildBottleDict:
         metadata = ExtractedMetadata(
             name="Test",
             distillery="Test",
-            msrp="49.99",
+            label_price="49.99",
             specific_release="Test",
             proof="",  # Empty
             age=None,  # None
@@ -1128,122 +1001,6 @@ class TestBottleAnalyzerBuildBottleDict:
         assert "tasting_notes" not in bottle_dict
 
 
-class TestBottleAnalyzerParseVisionResponse:
-    """Test _parse_vision_response method."""
-
-    def test_parse_vision_response_complete_fields(self):
-        """Test parsing complete vision model response."""
-        analyzer = BottleAnalyzer()
-
-        response = (
-            "name: Blanton's Single Barrel\n"
-            "distillery: Buffalo Trace\n"
-            "msrp: $59.99\n"
-            "specific_release: Original Single Barrel\n"
-            "proof: 93 Proof\n"
-            "age: No Age Statement\n"
-            "batch_number: 123\n"
-            "tasting_notes: Caramel and vanilla"
-        )
-
-        metadata = analyzer._parse_vision_response(response)
-
-        assert metadata["name"] == "Blanton's Single Barrel"
-        assert metadata["distillery"] == "Buffalo Trace"
-        assert metadata["msrp"] == "59.99"
-        assert metadata["specific_release"] == "Original Single Barrel"
-        assert metadata["proof"] == "93 Proof"
-        assert metadata["age"] == "No Age Statement"
-        assert metadata["batch_number"] == "123"
-        assert metadata["tasting_notes"] == "Caramel and vanilla"
-
-    def test_parse_vision_response_simplifies_field_names(self):
-        """Test field name normalization and simplification."""
-        analyzer = BottleAnalyzer()
-
-        response = "name: Test\nrelease: Single Barrel\nnotes: Good flavor\nbatch: ABC"
-
-        metadata = analyzer._parse_vision_response(response)
-
-        assert metadata["name"] == "Test"
-        assert metadata["specific_release"] == "Single Barrel"  # "release" → "specific_release"
-        assert metadata["tasting_notes"] == "Good flavor"  # "notes" → "tasting_notes"
-        assert metadata["batch_number"] == "ABC"  # "batch" → "batch_number"
-
-    def test_parse_vision_response_strips_dollar_signs(self):
-        """Test dollar signs are stripped from MSRP."""
-        analyzer = BottleAnalyzer()
-
-        response = "name: Test\nmsrp: $49.99"
-
-        metadata = analyzer._parse_vision_response(response)
-
-        assert metadata["msrp"] == "49.99"
-
-    def test_parse_vision_response_invalid_msrp_skipped(self):
-        """Test invalid MSRP values are skipped."""
-        analyzer = BottleAnalyzer()
-
-        response = "name: Test\nmsrp: NOT-A-NUMBER"
-
-        metadata = analyzer._parse_vision_response(response)
-
-        assert "msrp" not in metadata
-
-    def test_parse_vision_response_normalizes_whitespace(self):
-        """Test whitespace is normalized."""
-        analyzer = BottleAnalyzer()
-
-        response = "  name  :  Test Name  \n  distillery:Test Distillery  "
-
-        metadata = analyzer._parse_vision_response(response)
-
-        assert metadata["name"] == "Test Name"
-        assert metadata["distillery"] == "Test Distillery"
-
-    def test_parse_vision_response_empty_response(self):
-        """Test empty response returns empty dict."""
-        analyzer = BottleAnalyzer()
-
-        metadata = analyzer._parse_vision_response("")
-
-        assert metadata == {}
-
-    def test_parse_vision_response_unknown_fields_skipped(self):
-        """Test unknown fields are not included."""
-        analyzer = BottleAnalyzer()
-
-        response = "name: Test\nunknown_field: something\nalso_unknown: value"
-
-        metadata = analyzer._parse_vision_response(response)
-
-        assert metadata["name"] == "Test"
-        assert "unknown_field" not in metadata
-        assert "also_unknown" not in metadata
-
-    def test_parse_vision_response_field_casing_normalized(self):
-        """Test field names are normalized to lowercase."""
-        analyzer = BottleAnalyzer()
-
-        response = "NAME: Uppercase\nDISTILLERY: Test"
-
-        metadata = analyzer._parse_vision_response(response)
-
-        assert metadata["name"] == "Uppercase"
-        assert metadata["distillery"] == "Test"
-
-    def test_parse_vision_response_hyphen_normalized(self):
-        """Test hyphens in field names are converted to underscores."""
-        analyzer = BottleAnalyzer()
-
-        response = "batch-number:123\nspecific-release:Single"
-
-        metadata = analyzer._parse_vision_response(response)
-
-        assert metadata["batch_number"] == "123"
-        assert metadata["specific_release"] == "Single"
-
-
 class TestBottleAnalyzerOcrSemantics:
     """OCR call contract between BottleAnalyzer and TextExtractor (B5)."""
 
@@ -1252,12 +1009,11 @@ class TestBottleAnalyzerOcrSemantics:
         analyzer = BottleAnalyzer(
             text_extractor=text_extractor,
             ollama_client=Mock(spec=OllamaClient),
-            image_organizer=Mock(),
         )
         metadata = ExtractedMetadata(
             name="Test",
             distillery="Test",
-            msrp="29.99",
+            label_price="29.99",
             full_text="",
             selected_text="",
             source_images=["/a.jpg"],
@@ -1265,13 +1021,11 @@ class TestBottleAnalyzerOcrSemantics:
         return analyzer, metadata
 
     @patch("image_processor.bottle_analyzer.OllamaClient")
-    @patch("image_processor.bottle_analyzer.ImageOrganizer")
-    def test_default_text_extractor_uses_own_retry_policy(self, mock_organizer, mock_ollama):
-        """The analyzer's generic retry manager must not be handed to OCR."""
-        shared_retry = Mock(spec=RetryManager)
+    def test_default_text_extractor_gets_the_retry_policy(self, mock_ollama):
+        """OCR learns only whether retry is on (it keeps its own fixed 2 attempts)."""
         with patch("image_processor.bottle_analyzer.TextExtractor") as mock_extractor:
-            BottleAnalyzer(retry_manager=shared_retry)
-        mock_extractor.assert_called_once_with()
+            BottleAnalyzer(retry_policy=RetryPolicy.DISABLED)
+        mock_extractor.assert_called_once_with(RetryPolicy.DISABLED)
 
     def test_ocr_called_with_path_only(self):
         """is_primary is not an orientation hint; OCR decides rotation itself."""
@@ -1327,3 +1081,105 @@ class TestBottleAnalyzerOcrSemantics:
         assert extractor.extract_with_retry.call_count == 2
         assert any("OCR failed for /a.jpg: OSError: broken" in r.message for r in caplog.records)
         assert vision.call_args.args[1] == ["", "KENTUCKY"]
+
+
+class TestBottleAnalyzerRetryPolicy:
+    """The vision request runs under the run's RetryPolicy; OCR runs once per bottle."""
+
+    @staticmethod
+    def _images():
+        return [Image(path="/p/a.jpg", category="BOTTLE", is_primary=True), Image(path="/p/b.jpg", category="BOTTLE")]
+
+    def test_two_unusable_answers_then_success_with_policy_of_3(self):
+        analyzer, client = _vision_analyzer(retry_policy=RetryPolicy(max_attempts=3))
+        client.chat_with_images.side_effect = [
+            _reply(content=""), _reply(proof=90), _reply(name="Third Time", same_bottle=True),
+        ]
+
+        bottle_dict, metadata = analyzer.process_single_bottle(self._images(), vision_model="m")
+
+        assert client.chat_with_images.call_count == 3
+        assert metadata.vision_attempts == 3
+        assert "Vision answer was usable only on attempt 3; review the fields" in metadata.warnings
+        assert bottle_dict["name"] == "Third Time"
+        assert metadata.to_dict()["vision_attempts"] == 3
+
+    def test_no_retry_makes_one_call_then_raises(self):
+        analyzer, client = _vision_analyzer(retry_policy=RetryPolicy.DISABLED)
+        client.chat_with_images.side_effect = [_reply(content=""), _reply(name="never reached")]
+
+        with pytest.raises(VisionResponseError) as excinfo:
+            analyzer.process_single_bottle(self._images(), vision_model="m")
+
+        assert client.chat_with_images.call_count == 1
+        assert excinfo.value.attempts == 1
+
+    def test_ocr_runs_once_across_vision_retries(self):
+        extractor = Mock(spec=TextExtractor)
+        extractor.extract_with_retry.side_effect = lambda path: f"OCR {Path(path).name}"
+        analyzer, client = _vision_analyzer(text_extractor=extractor, retry_policy=RetryPolicy(max_attempts=3))
+        client.chat_with_images.side_effect = [_reply(content=""), _reply(content=""), _reply(name="X")]
+
+        _, metadata = analyzer.process_single_bottle(self._images(), vision_model="m")
+
+        assert extractor.extract_with_retry.call_count == 2  # once per photo, not per attempt
+        prompts = [c.kwargs["prompt"] for c in client.chat_with_images.call_args_list]
+        assert len(prompts) == 3 and len(set(prompts)) == 1  # the same OCR hints every time
+        assert "OCR a.jpg" in prompts[0]
+        assert metadata.ocr_by_image == {"a.jpg": "OCR a.jpg", "b.jpg": "OCR b.jpg"}
+
+    def test_reviewer_note_reaches_the_prompt(self):
+        analyzer, client = _vision_analyzer()
+        client.chat_with_images.return_value = _reply(name="X")
+
+        analyzer.process_single_bottle(self._images(), vision_model="m", reviewer_note="Batch is on the neck tag")
+
+        prompt = client.chat_with_images.call_args.kwargs["prompt"]
+        assert "Reviewer note" in prompt
+        assert "Batch is on the neck tag" in prompt
+
+    def test_no_note_section_without_a_note(self):
+        analyzer, client = _vision_analyzer()
+        client.chat_with_images.return_value = _reply(name="X")
+        analyzer.process_single_bottle(self._images(), vision_model="m")
+        assert "Reviewer note" not in client.chat_with_images.call_args.kwargs["prompt"]
+
+    def test_label_price_kept_and_msrp_unknown(self):
+        analyzer, client = _vision_analyzer()
+        client.chat_with_images.return_value = _reply(name="X", label_price=59.99)
+
+        bottle_dict, metadata = analyzer.process_single_bottle(self._images(), vision_model="m")
+
+        assert metadata.label_price == "59.99"
+        assert bottle_dict["label_price"] == "59.99"
+        assert bottle_dict["msrp"] is None
+
+    def test_cancelled_run_starts_no_vision_request(self):
+        from image_processor.bottle_analyzer import AnalysisCancelledError
+
+        analyzer, client = _vision_analyzer()
+        cancel = threading.Event()
+        cancel.set()
+        with pytest.raises(AnalysisCancelledError):
+            analyzer.process_single_bottle(self._images(), vision_model="m", cancel=cancel)
+        client.chat_with_images.assert_not_called()
+
+    def test_last_vision_result_is_per_thread(self):
+        analyzer, _ = _vision_analyzer()
+        analyzer.last_vision_result = "main"
+        seen = {}
+        set_in_worker = threading.Event()
+
+        def worker():
+            seen["before"] = analyzer.last_vision_result
+            analyzer.last_vision_result = "worker"
+            seen["after"] = analyzer.last_vision_result
+            set_in_worker.set()
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        thread.join()
+
+        assert set_in_worker.is_set()
+        assert seen == {"before": None, "after": "worker"}
+        assert analyzer.last_vision_result == "main"

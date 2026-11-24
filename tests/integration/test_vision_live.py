@@ -19,7 +19,7 @@ import pytest
 import requests
 
 from image_processor.bottle_analyzer import MIXED_GROUP_WARNING, BottleAnalyzer
-from lib.config import DEFAULT_VISION_MODEL
+from lib.constants import DEFAULT_VISION_MODEL
 from lib.ollama_client import OllamaClient
 
 PHOTO_DIR = Path(__file__).resolve().parents[2] / "HighValueRoom"
